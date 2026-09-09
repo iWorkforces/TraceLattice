@@ -26,7 +26,7 @@ import type { IMetrics } from '../contracts/interfaces.js';
  */
 export interface CacheEntry<T> {
 	/** The cached data array. */
-	data: T[];
+	data: readonly T[];
 
 	/** Unix timestamp (milliseconds) when the entry was created/last accessed. */
 	timestamp: number;
@@ -224,7 +224,7 @@ export class DiscoveryCache<T> {
 		this._cache.set(key, entry);
 		this._metrics?.counter('cache_hit_total', 1, {}, 'Total discovery cache hits');
 
-		return entry.data;
+		return [...entry.data];
 	}
 
 	/**
@@ -243,7 +243,7 @@ export class DiscoveryCache<T> {
 	 * cache.set('/usr/local/tools', discoveredTools);
 	 * ```
 	 */
-	set(key: string, data: T[]): void {
+	set(key: string, data: readonly T[]): void {
 		// Enforce max size with LRU eviction
 		if (this._cache.size >= this._maxSize && !this._cache.has(key)) {
 			// Remove least recently used (first entry)
@@ -260,7 +260,7 @@ export class DiscoveryCache<T> {
 		}
 
 		this._cache.set(key, {
-			data,
+			data: [...data],
 			timestamp: Date.now(),
 			accessCount: 0,
 		});
