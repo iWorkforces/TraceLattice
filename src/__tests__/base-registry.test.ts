@@ -140,6 +140,18 @@ describe('BaseRegistry', () => {
 			it('returns empty array when registry is empty', () => {
 				expect(registry.getAll()).toEqual([]);
 			});
+
+			it('returns a caller-owned array when results are cached', () => {
+				// Given
+				registry.add(makeItem('stable', 1));
+				const firstRead = registry.getAll();
+
+				// When
+				firstRead.length = 0;
+
+				// Then
+				expect(registry.getAll()).toEqual([makeItem('stable', 1)]);
+			});
 		});
 
 		describe('has()', () => {
@@ -377,6 +389,78 @@ describe('BaseRegistry', () => {
 			expect(count).toBe(1);
 			expect(mockReaddir).toHaveBeenCalledTimes(1);
 			cache.dispose();
+		});
+
+		it('publishes a refreshed snapshot only after the scan completes', async () => {
+			// Given
+			registry = createRegistry({ searchDirs: ['/test/dir'] });
+			registry.setParseFrontmatter((content) => ({
+				name: 'item',
+				value: content === 'updated' ? 2 : 1,
+			}));
+			mockExistsSync.mockReturnValue(true);
+			mockReaddir.mockResolvedValue([{ name: 'x.test.md', isFile: () => true }] as never);
+			mockReadFile.mockResolvedValueOnce('initial' as never);
+			await registry.discoverAsync();
+			let releaseRead: ((content: string) => void) | undefined;
+			let markReadStarted: (() => void) | undefined;
+			const readStarted = new Promise<void>((resolve) => {
+				markReadStarted = resolve;
+			});
+			mockReadFile.mockImplementationOnce(
+				() =>
+					new Promise<string>((resolve) => {
+						markReadStarted?.();
+						releaseRead = resolve;
+					}) as never
+			);
+
+			// When
+			const refreshing = registry.refreshAsync();
+			await readStarted;
+			const duringRefresh = registry.getAll();
+			releaseRead?.('updated');
+			await refreshing;
+
+			// Then
+			expect(duringRefresh).toEqual([makeItem('item', 1)]);
+			expect(registry.getAll()).toEqual([makeItem('item', 2)]);
+		});
+
+		it('coalesces refresh requests that arrive during an active scan', async () => {
+			// Given
+			registry = createRegistry({ searchDirs: ['/test/dir'] });
+			registry.setParseFrontmatter(() => ({ name: 'item', value: 1 }));
+			mockExistsSync.mockReturnValue(true);
+			mockReaddir.mockResolvedValue([{ name: 'x.test.md', isFile: () => true }] as never);
+			mockReadFile.mockResolvedValueOnce('initial' as never);
+			await registry.discoverAsync();
+			let releaseRead: (() => void) | undefined;
+			let markReadStarted: (() => void) | undefined;
+			const readStarted = new Promise<void>((resolve) => {
+				markReadStarted = resolve;
+			});
+			mockReadFile
+				.mockImplementationOnce(
+					() =>
+						new Promise<string>((resolve) => {
+							markReadStarted?.();
+							releaseRead = () => resolve('updated');
+						}) as never
+				)
+				.mockResolvedValue('updated' as never);
+
+			// When
+			const first = registry.refreshAsync();
+			await readStarted;
+			const second = registry.refreshAsync();
+			const third = registry.refreshAsync();
+			releaseRead?.();
+			await Promise.all([first, second, third]);
+
+			// Then
+			expect(mockReaddir).toHaveBeenCalledTimes(3);
+			expect(registry.size()).toBe(1);
 		});
 
 		it('handles empty directories', async () => {
@@ -665,7 +749,6 @@ describe('BaseRegistry', () => {
 			registry.add = (item: TestItem) => {
 				callCount++;
 				if (callCount === 2) {
-					 
 					throw 'non-error string';
 				}
 				origAdd(item);
