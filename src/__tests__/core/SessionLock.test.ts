@@ -3,7 +3,7 @@
  * ThoughtProcessor.process() calls.
  */
 
-import { asSessionId } from '../../contracts/ids.js';
+import { asSessionId, GLOBAL_SESSION_ID } from '../../contracts/ids.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SessionLock } from '../../core/SessionLock.js';
 import { LockTimeoutError } from '../../errors.js';
@@ -16,6 +16,31 @@ describe('SessionLock', () => {
 	});
 
 	describe('serialization', () => {
+		it('preserves FIFO order for ordinary same-session callers', async () => {
+			const holderEntered = Promise.withResolvers<void>();
+			const releaseHolder = Promise.withResolvers<void>();
+			const events: string[] = [];
+
+			const first = lock.withLock(asSessionId('s1'), async () => {
+				events.push('first-enter');
+				holderEntered.resolve();
+				await releaseHolder.promise;
+				events.push('first-exit');
+			});
+			const second = lock.withLock(asSessionId('s1'), async () => {
+				events.push('second');
+			});
+			const third = lock.withLock(asSessionId('s1'), async () => {
+				events.push('third');
+			});
+
+			await holderEntered.promise;
+			expect(events).toEqual(['first-enter']);
+			releaseHolder.resolve();
+			await Promise.all([first, second, third]);
+			expect(events).toEqual(['first-enter', 'first-exit', 'second', 'third']);
+		});
+
 		it('serializes 100 concurrent calls on the same session', async () => {
 			const order: number[] = [];
 			const inFlight = { value: 0, peak: 0 };
@@ -24,15 +49,14 @@ describe('SessionLock', () => {
 				lock.withLock(asSessionId('s1'), async () => {
 					inFlight.value++;
 					inFlight.peak = Math.max(inFlight.peak, inFlight.value);
-					await new Promise((r) => setTimeout(r, 0));
+					await Promise.resolve();
 					order.push(i);
 					inFlight.value--;
-				}),
+				})
 			);
 
 			await Promise.all(tasks);
 
-			expect(order).toHaveLength(100);
 			expect(inFlight.peak).toBe(1); // only one critical section runs at a time
 			expect(order).toEqual(Array.from({ length: 100 }, (_, i) => i)); // FIFO
 		});
@@ -42,47 +66,31 @@ describe('SessionLock', () => {
 
 			const tasks: Promise<void>[] = [];
 			for (let i = 0; i < 20; i++) {
-				if (i % 2 === 0) {
-					tasks.push(
-						lock.withLock(asSessionId('s1'), async () => {
-							events.push(`add-start-${i}`);
-							await new Promise((r) => setTimeout(r, 0));
-							events.push(`add-end-${i}`);
-						}),
-					);
-				} else {
-					tasks.push(
-						lock.withLock(asSessionId('s1'), async () => {
-							events.push(`clear-start-${i}`);
-							await new Promise((r) => setTimeout(r, 0));
-							events.push(`clear-end-${i}`);
-						}),
-					);
-				}
+				const operation = i % 2 === 0 ? 'add' : 'clear';
+				tasks.push(
+					lock.withLock(asSessionId('s1'), async () => {
+						events.push(`${operation}-start-${i}`);
+						await Promise.resolve();
+						events.push(`${operation}-end-${i}`);
+					})
+				);
 			}
 
 			await Promise.all(tasks);
 
 			// Every start must be immediately followed by its matching end.
-			for (let i = 0; i < events.length; i += 2) {
-				const start = events[i]!;
-				const end = events[i + 1]!;
-				const startSuffix = start.replace(/-start-/, '-end-');
-				expect(end).toBe(startSuffix);
+			for (const [index, start] of events.filter((_, index) => index % 2 === 0).entries()) {
+				expect(events[index * 2 + 1]).toBe(start.replace(/-start-/, '-end-'));
 			}
 		});
 	});
 
 	describe('per-session isolation', () => {
 		it('different session ids do NOT block each other', async () => {
-			let aResolve!: () => void;
-			const aGate = new Promise<void>((r) => {
-				aResolve = r;
-			});
-
+			const releaseA = Promise.withResolvers<void>();
 			let bRan = false;
 			const a = lock.withLock(asSessionId('session-a'), async () => {
-				await aGate;
+				await releaseA.promise;
 			});
 			const b = lock.withLock(asSessionId('session-b'), async () => {
 				bRan = true;
@@ -91,23 +99,20 @@ describe('SessionLock', () => {
 			await b;
 			expect(bRan).toBe(true);
 
-			aResolve();
+			releaseA.resolve();
 			await a;
 		});
 
-		it('undefined and empty session ids share the global slot', async () => {
+		it('undefined and the global session id share the global slot', async () => {
 			const order: string[] = [];
-			let aResolve!: () => void;
-			const aGate = new Promise<void>((r) => {
-				aResolve = r;
-			});
+			const releaseA = Promise.withResolvers<void>();
 
 			const a = lock.withLock(undefined, async () => {
 				order.push('a-start');
-				await aGate;
+				await releaseA.promise;
 				order.push('a-end');
 			});
-			const b = lock.withLock('' as unknown as Parameters<typeof lock.withLock>[0], async () => {
+			const b = lock.withLock(GLOBAL_SESSION_ID, async () => {
 				order.push('b');
 			});
 
@@ -115,7 +120,7 @@ describe('SessionLock', () => {
 			await Promise.resolve();
 			expect(order).toEqual(['a-start']);
 
-			aResolve();
+			releaseA.resolve();
 			await Promise.all([a, b]);
 			expect(order).toEqual(['a-start', 'a-end', 'b']);
 		});
@@ -130,58 +135,130 @@ describe('SessionLock', () => {
 		});
 
 		it('throws LockTimeoutError when previous holder never releases', async () => {
-			let _stuckResolve!: () => void;
-			const stuck = lock.withLock(asSessionId('s1'), () =>
-				new Promise<void>((r) => {
-					_stuckResolve = r;
-				}),
-			);
+			const releaseStuck = Promise.withResolvers<void>();
+			const stuck = lock.withLock(asSessionId('s1'), () => releaseStuck.promise);
 
 			const waiter = lock.withLock(asSessionId('s1'), async () => 'never', 1000);
-			// Attach a no-op rejection handler synchronously to prevent the
-			// PromiseRejectionHandledWarning that fires when vitest's `rejects`
-			// matcher attaches its handler in a later microtask.
-			waiter.catch(() => {});
-
-			await vi.advanceTimersByTimeAsync(1001);
-
-			await expect(waiter).rejects.toBeInstanceOf(LockTimeoutError);
-			await expect(waiter).rejects.toMatchObject({
+			const timeoutAssertion = expect(waiter).rejects.toMatchObject({
 				code: 'LOCK_TIMEOUT',
 				sessionId: 's1',
 				timeoutMs: 1000,
 			});
 
+			await vi.advanceTimersByTimeAsync(1001);
+			await timeoutAssertion;
+
 			// Cleanup: release the stuck handler so the promise settles.
-			_stuckResolve();
+			releaseStuck.resolve();
 			await stuck;
+			await vi.advanceTimersByTimeAsync(0);
+			expect(lock.size).toBe(0);
+		});
+
+		it('keeps a later caller behind the active holder after a waiter times out', async () => {
+			const holderEntered = Promise.withResolvers<void>();
+			const releaseHolder = Promise.withResolvers<void>();
+			const events: string[] = [];
+			let active = 0;
+			let peak = 0;
+
+			const holder = lock.withLock(asSessionId('s1'), async () => {
+				peak = Math.max(peak, ++active);
+				events.push('A-enter');
+				holderEntered.resolve();
+				await releaseHolder.promise;
+				events.push('A-exit');
+				active--;
+			});
+			await holderEntered.promise;
+			const timedOutCallback = vi.fn(async () => undefined);
+			const waiter = lock.withLock(asSessionId('s1'), timedOutCallback, 10);
+			const timeoutAssertion = expect(waiter).rejects.toBeInstanceOf(LockTimeoutError);
+
+			await vi.advanceTimersByTimeAsync(10);
+			await timeoutAssertion;
+			const later = lock.withLock(asSessionId('s1'), async () => {
+				peak = Math.max(peak, ++active);
+				events.push('C-enter', 'C-exit');
+				active--;
+			});
+			await vi.advanceTimersByTimeAsync(0);
+			const peakBeforeRelease = peak;
+			const eventsBeforeRelease = [...events];
+
+			releaseHolder.resolve();
+			await Promise.all([holder, later]);
+			expect(peakBeforeRelease).toBe(1);
+			expect(eventsBeforeRelease).toEqual(['A-enter']);
+			expect(timedOutCallback).not.toHaveBeenCalled();
+			expect(events).toEqual(['A-enter', 'A-exit', 'C-enter', 'C-exit']);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(lock.size).toBe(0);
+		});
+
+		it('retains multiple timed-out waiters until the chain settles', async () => {
+			const holderEntered = Promise.withResolvers<void>();
+			const releaseHolder = Promise.withResolvers<void>();
+			const events: string[] = [];
+			let active = 0;
+			let peak = 0;
+			const holderCallback = vi.fn(async () => {
+				peak = Math.max(peak, ++active);
+				events.push('A-enter');
+				holderEntered.resolve();
+				await releaseHolder.promise;
+				events.push('A-exit');
+				active--;
+			});
+			const holder = lock.withLock(asSessionId('s1'), holderCallback);
+			await holderEntered.promise;
+
+			const timedOutCallbacks = [vi.fn(async () => undefined), vi.fn(async () => undefined)];
+			const waiters = timedOutCallbacks.map((callback) =>
+				lock.withLock(asSessionId('s1'), callback, 10)
+			);
+			const timeoutAssertions = Promise.all(
+				waiters.map((waiter) => expect(waiter).rejects.toBeInstanceOf(LockTimeoutError))
+			);
+			await vi.advanceTimersByTimeAsync(10);
+			await timeoutAssertions;
+
+			const laterCallback = vi.fn(async () => {
+				peak = Math.max(peak, ++active);
+				events.push('D-enter', 'D-exit');
+				active--;
+			});
+			const later = lock.withLock(asSessionId('s1'), laterCallback);
+			await vi.advanceTimersByTimeAsync(0);
+			const eventsBeforeRelease = [...events];
+			releaseHolder.resolve();
+			await Promise.all([holder, later]);
+			await vi.advanceTimersByTimeAsync(0);
+
+			expect(eventsBeforeRelease).toEqual(['A-enter']);
+			expect(peak).toBe(1);
+			expect(timedOutCallbacks.every((callback) => callback.mock.calls.length === 0)).toBe(true);
+			expect([holderCallback.mock.calls.length, laterCallback.mock.calls.length]).toEqual([1, 1]);
+			expect(events).toEqual(['A-enter', 'A-exit', 'D-enter', 'D-exit']);
+			expect(lock.size).toBe(0);
 		});
 	});
 
 	describe('error handling', () => {
-		it('releases the lock when fn throws', async () => {
-			await expect(
-				lock.withLock(asSessionId('s1'), async () => {
-					throw new Error('boom');
-				}),
-			).rejects.toThrow('boom');
-
-			// A subsequent call should immediately acquire.
-			let ran = false;
-			await lock.withLock(asSessionId('s1'), async () => {
-				ran = true;
-			});
-			expect(ran).toBe(true);
-		});
-
-		it('does not poison the chain when an earlier holder rejects', async () => {
-			const failing = lock.withLock(asSessionId('s1'), async () => {
+		it('runs a queued caller once after the first holder rejects', async () => {
+			const firstCallback = vi.fn(async () => {
 				throw new Error('first failed');
 			});
-			const ok = lock.withLock(asSessionId('s1'), async () => 'second-ok');
+			const secondCallback = vi.fn(async () => 'second-ok');
+			const failing = lock.withLock(asSessionId('s1'), firstCallback);
+			const ok = lock.withLock(asSessionId('s1'), secondCallback);
 
 			await expect(failing).rejects.toThrow('first failed');
 			await expect(ok).resolves.toBe('second-ok');
+			expect(firstCallback).toHaveBeenCalledOnce();
+			expect(secondCallback).toHaveBeenCalledOnce();
+			await Promise.resolve();
+			expect(lock.size).toBe(0);
 		});
 	});
 
@@ -202,8 +279,8 @@ describe('SessionLock', () => {
 				Array.from({ length: 50 }, (_, i) =>
 					lock.withLock(asSessionId(`s-${i}`), async () => {
 						/* noop */
-					}),
-				),
+					})
+				)
 			);
 			await Promise.resolve();
 			await Promise.resolve();
