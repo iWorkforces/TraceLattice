@@ -58,6 +58,10 @@ export const ERROR_CODES = {
 	UNKNOWN_TOOL: 'UNKNOWN_TOOL',
 	LOCK_TIMEOUT: 'LOCK_TIMEOUT',
 	SESSION_ACCESS_DENIED: 'SESSION_ACCESS_DENIED',
+	PERSISTENCE_OWNERSHIP: 'PERSISTENCE_OWNERSHIP',
+	PERSISTENCE_CORRUPTION: 'PERSISTENCE_CORRUPTION',
+	PERSISTENCE_PUBLICATION: 'PERSISTENCE_PUBLICATION',
+	PERSISTENCE_CLOSED: 'PERSISTENCE_CLOSED',
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
@@ -798,6 +802,66 @@ export class SessionAccessDeniedError extends SequentialThinkingError {
 	}
 }
 
+export class PersistenceOwnershipError extends SequentialThinkingError {
+	public readonly canonicalDataDir: string;
+	public readonly lockPath: string;
+	public override readonly cause: unknown;
+
+	constructor(canonicalDataDir: string, lockPath: string, cause: unknown) {
+		super(
+			`Persistence directory '${canonicalDataDir}' already has an active writer`,
+			ERROR_CODES.PERSISTENCE_OWNERSHIP
+		);
+		this.name = 'PersistenceOwnershipError';
+		this.canonicalDataDir = canonicalDataDir;
+		this.lockPath = lockPath;
+		this.cause = cause;
+	}
+}
+
+export class PersistenceCorruptionError extends SequentialThinkingError {
+	public readonly path: string;
+	public override readonly cause: unknown;
+
+	constructor(path: string, cause: unknown) {
+		super(
+			`Persisted data at '${path}' is corrupt or incompatible`,
+			ERROR_CODES.PERSISTENCE_CORRUPTION
+		);
+		this.name = 'PersistenceCorruptionError';
+		this.path = path;
+		this.cause = cause;
+	}
+}
+
+export type PersistencePublicationStage = 'temporary-write' | 'atomic-replacement' | 'cleanup';
+
+export class PersistencePublicationError extends SequentialThinkingError {
+	public readonly path: string;
+	public readonly stage: PersistencePublicationStage;
+	public override readonly cause: unknown;
+
+	constructor(path: string, stage: PersistencePublicationStage, cause: unknown) {
+		super(
+			`Failed persistence publication for '${path}' during ${stage}`,
+			ERROR_CODES.PERSISTENCE_PUBLICATION
+		);
+		this.name = 'PersistencePublicationError';
+		this.path = path;
+		this.stage = stage;
+		this.cause = cause;
+	}
+}
+
+export class PersistenceClosedError extends SequentialThinkingError {
+	public readonly dataDir: string;
+
+	constructor(dataDir: string) {
+		super(`Persistence writer for '${dataDir}' is closed`, ERROR_CODES.PERSISTENCE_CLOSED);
+		this.name = 'PersistenceClosedError';
+		this.dataDir = dataDir;
+	}
+}
 
 /**
  * Type guard to check if an error has a specific error code.
