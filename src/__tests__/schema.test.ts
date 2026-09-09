@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+	JsonRpcRequestSchema,
 	SequentialThinkingSchema,
 	ToolRecommendationSchema,
 	StepRecommendationSchema,
@@ -8,6 +9,100 @@ import {
 	SkillRecommendationSchema,
 } from '../schema.js';
 import { safeParse } from 'valibot';
+
+describe('JsonRpcRequestSchema envelope contract', () => {
+	it.each([
+		['string', 'request-42'],
+		['number', 42],
+		['null', null],
+		['omitted', undefined],
+	])('accepts a valid %s request ID', (_kind, id) => {
+		const request = {
+			jsonrpc: '2.0',
+			method: 'tools/list',
+			...(id === undefined ? {} : { id }),
+		};
+
+		const result = safeParse(JsonRpcRequestSchema, request);
+
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect(result.output.id).toBe(id);
+		}
+	});
+
+	it.each([
+		['missing jsonrpc', { id: 1, method: 'tools/list' }],
+		['wrong jsonrpc version', { jsonrpc: '1.0', id: 1, method: 'tools/list' }],
+		['missing method', { jsonrpc: '2.0', id: 1 }],
+		['empty method', { jsonrpc: '2.0', id: 1, method: '' }],
+		['boolean ID', { jsonrpc: '2.0', id: true, method: 'tools/list' }],
+		['object ID', { jsonrpc: '2.0', id: { value: 1 }, method: 'tools/list' }],
+		['scalar params', { jsonrpc: '2.0', id: 1, method: 'tools/list', params: 'invalid' }],
+	])('rejects an envelope with %s', (_case, request) => {
+		const result = safeParse(JsonRpcRequestSchema, request);
+
+		expect(result.success).toBe(false);
+	});
+
+	it('drops unknown envelope fields while retaining known fields', () => {
+		const result = safeParse(JsonRpcRequestSchema, {
+			jsonrpc: '2.0',
+			id: 'known-fields',
+			method: 'tools/list',
+			params: {},
+			unknownEnvelopeField: 'not-protocol-data',
+		});
+
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect(result.output).toEqual({
+				jsonrpc: '2.0',
+				id: 'known-fields',
+				method: 'tools/list',
+				params: {},
+			});
+		}
+	});
+
+	it('preserves object params including nested objects and arrays', () => {
+		const params = {
+			name: 'echo',
+			arguments: {
+				value: 'expected',
+				nested: { enabled: true, values: [1, 'two', null] },
+			},
+		};
+
+		const result = safeParse(JsonRpcRequestSchema, {
+			jsonrpc: '2.0',
+			id: 'nested-request',
+			method: 'tools/call',
+			params,
+		});
+
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect(result.output.params).toEqual(params);
+		}
+	});
+
+	it('preserves positional array params including nested JSON values', () => {
+		const params = ['echo', { nested: [1, true, null] }];
+
+		const result = safeParse(JsonRpcRequestSchema, {
+			jsonrpc: '2.0',
+			id: 'positional-request',
+			method: 'tools/call',
+			params,
+		});
+
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect(result.output.params).toEqual(params);
+		}
+	});
+});
 
 describe('SequentialThinkingSchema', () => {
 	const validInput = {
