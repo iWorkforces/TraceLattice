@@ -168,7 +168,7 @@ build_project() {
 
 	# Install dependencies
 	log_info "Installing dependencies..."
-	if ! bun install; then
+	if ! npm install; then
 		log_error "Failed to install dependencies"
 		exit 1
 	fi
@@ -211,7 +211,7 @@ install_globally() {
 		log_info "Installing package globally..."
 		local package_dir
 		package_dir=$(pwd -P)
-		if ! bun install -g "$package_dir"; then
+		if ! npm install -g "$package_dir"; then
 			log_error "Global installation failed"
 			log_warn "You may need to run this script with sudo privileges"
 			exit 1
@@ -234,8 +234,8 @@ verify_installation() {
 		log_success "Global npm prefix: $npm_prefix"
 	else
 		log_warn "Package binary not found in PATH"
-		log_info "You may need to add the bun global bin directory to your PATH"
-		log_info "Run: bun config get prefix to see where bun installs global packages"
+		log_info "You may need to add the npm global bin directory to your PATH"
+		log_info "Run: npm config get prefix to see where npm installs global packages"
 	fi
 
 	# Print completion message
