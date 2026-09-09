@@ -209,7 +209,9 @@ install_globally() {
 		log_success "Package linked globally"
 	else
 		log_info "Installing package globally..."
-		if ! npm install -g .; then
+		local package_dir
+		package_dir=$(pwd -P)
+		if ! npm install -g "$package_dir"; then
 			log_error "Global installation failed"
 			log_warn "You may need to run this script with sudo privileges"
 			exit 1

@@ -85,7 +85,7 @@ type ProcessedThoughtResponseState = {
  * };
  * ```
  */
-export interface CallToolResult {
+export interface CallToolResult extends Record<string, unknown> {
 	/** Array of content blocks (typically text) to return to the client. */
 	content: Array<{
 		type: 'text';

@@ -1,0 +1,188 @@
+{
+	"version": "1.4.4",
+	"approvedAt": "2026-06-26T00:00:00.000Z",
+	"categoryAverages": {
+		"adversarial-prompts": 100,
+		"long-horizon-tasks": 100,
+		"branching-revision-merge-backtrack": 100,
+		"hypothesis-and-verification": 100,
+		"tool-recommendation-quality": 100,
+		"skill-recommendation-quality": 100,
+		"state-isolation-and-reset": 100,
+		"malformed-and-edge-inputs": 100,
+		"reasoning-hints-and-confidence": 100,
+		"final-answer-consistency": 91.66666666666667,
+		"regression-anchors-and-calibration": 100
+	},
+	"caseScores": [
+		{
+			"caseId": "adversarial-urgency-step-field",
+			"category": "adversarial-prompts",
+			"score": 100
+		},
+		{
+			"caseId": "adversarial-dangerous-tags",
+			"category": "adversarial-prompts",
+			"score": 100
+		},
+		{
+			"caseId": "adversarial-rationale-cap",
+			"category": "adversarial-prompts",
+			"score": 100
+		},
+		{
+			"caseId": "long-horizon-six-step-chain",
+			"category": "long-horizon-tasks",
+			"score": 100
+		},
+		{
+			"caseId": "long-horizon-branch-depth-efficiency",
+			"category": "long-horizon-tasks",
+			"score": 100
+		},
+		{
+			"caseId": "long-horizon-revision-and-merge-stats",
+			"category": "long-horizon-tasks",
+			"score": 100
+		},
+		{
+			"caseId": "branching-topological-merge-order",
+			"category": "branching-revision-merge-backtrack",
+			"score": 100
+		},
+		{
+			"caseId": "branching-branch-thoughts-only",
+			"category": "branching-revision-merge-backtrack",
+			"score": 100
+		},
+		{
+			"caseId": "branching-cycle-detected",
+			"category": "branching-revision-merge-backtrack",
+			"score": 100
+		},
+		{
+			"caseId": "hypothesis-verified-stats",
+			"category": "hypothesis-and-verification",
+			"score": 100
+		},
+		{
+			"caseId": "hypothesis-healthy-pattern",
+			"category": "hypothesis-and-verification",
+			"score": 100
+		},
+		{
+			"caseId": "hypothesis-unverified-warning",
+			"category": "hypothesis-and-verification",
+			"score": 100
+		},
+		{
+			"caseId": "tool-recommendation-specific-tool",
+			"category": "tool-recommendation-quality",
+			"score": 100
+		},
+		{
+			"caseId": "tool-recommendation-step-current-tools",
+			"category": "tool-recommendation-quality",
+			"score": 100
+		},
+		{
+			"caseId": "tool-recommendation-alternative-paths",
+			"category": "tool-recommendation-quality",
+			"score": 100
+		},
+		{
+			"caseId": "skill-recommendation-specific-skill",
+			"category": "skill-recommendation-quality",
+			"score": 100
+		},
+		{
+			"caseId": "skill-recommendation-allowed-tools",
+			"category": "skill-recommendation-quality",
+			"score": 100
+		},
+		{
+			"caseId": "skill-recommendation-step-integration",
+			"category": "skill-recommendation-quality",
+			"score": 100
+		},
+		{
+			"caseId": "state-isolation-history-partitions",
+			"category": "state-isolation-and-reset",
+			"score": 100
+		},
+		{
+			"caseId": "state-isolation-clear-one-session",
+			"category": "state-isolation-and-reset",
+			"score": 100
+		},
+		{
+			"caseId": "state-isolation-tool-skill-partitions",
+			"category": "state-isolation-and-reset",
+			"score": 100
+		},
+		{
+			"caseId": "malformed-missing-thought",
+			"category": "malformed-and-edge-inputs",
+			"score": 100
+		},
+		{
+			"caseId": "malformed-invalid-confidence",
+			"category": "malformed-and-edge-inputs",
+			"score": 100
+		},
+		{
+			"caseId": "malformed-invalid-branch-id",
+			"category": "malformed-and-edge-inputs",
+			"score": 100
+		},
+		{
+			"caseId": "reasoning-hints-confidence-drift",
+			"category": "reasoning-hints-and-confidence",
+			"score": 100
+		},
+		{
+			"caseId": "reasoning-hints-no-alternatives",
+			"category": "reasoning-hints-and-confidence",
+			"score": 100
+		},
+		{
+			"caseId": "reasoning-hints-structural-quality",
+			"category": "reasoning-hints-and-confidence",
+			"score": 100
+		},
+		{
+			"caseId": "final-answer-hypothesis-trace",
+			"category": "final-answer-consistency",
+			"score": 100
+		},
+		{
+			"caseId": "final-answer-tool-trace",
+			"category": "final-answer-consistency",
+			"score": 100
+		},
+		{
+			"caseId": "final-answer-scope-trace",
+			"category": "final-answer-consistency",
+			"score": 75
+		},
+		{
+			"caseId": "regression-anchor-tot-no-graph-continues",
+			"category": "regression-anchors-and-calibration",
+			"score": 100
+		},
+		{
+			"caseId": "regression-anchor-tot-confidence-terminates",
+			"category": "regression-anchors-and-calibration",
+			"score": 100
+		},
+		{
+			"caseId": "regression-anchor-tot-outside-beam-branches",
+			"category": "regression-anchors-and-calibration",
+			"score": 100
+		}
+	],
+	"metadata": {
+		"approvedBy": "battle-test-seed",
+		"notes": ["Seeded from deterministic battle-test scenario catalog."]
+	}
+}
