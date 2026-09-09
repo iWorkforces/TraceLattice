@@ -802,7 +802,6 @@ export class ThoughtProcessor {
 			toolCallThoughtNumber: input.thought_number,
 			toolName: input.tool_name,
 			toolArguments: input.tool_arguments ?? {},
-			ttlMs: 5 * 60_000,
 			expiresAt: 0,
 		});
 		return {

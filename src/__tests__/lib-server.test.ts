@@ -191,9 +191,10 @@ describe('ToolAwareSequentialThinkingServer', () => {
 			expect(mocks.mockHistoryManager.shutdown).toHaveBeenCalled();
 		});
 
-		it('should handle shutdown error gracefully', async () => {
-			mocks.mockHistoryManager.shutdown.mockRejectedValue(new Error('Flush failed'));
-			await expect(server.stop()).resolves.toBeUndefined();
+		it('should surface shutdown errors after cleanup', async () => {
+			const failure = new Error('Flush failed');
+			mocks.mockHistoryManager.shutdown.mockRejectedValue(failure);
+			await expect(server.stop()).rejects.toMatchObject({ errors: [failure] });
 			expect(mocks.mockLogger.error).toHaveBeenCalled();
 		});
 
@@ -206,12 +207,13 @@ describe('ToolAwareSequentialThinkingServer', () => {
 			expect(mockPersistence.close).toHaveBeenCalled();
 		});
 
-		it('should handle persistence close error', async () => {
-			const mockPersistence = { close: vi.fn().mockRejectedValue(new Error('Close failed')) };
+		it('should surface persistence close errors', async () => {
+			const failure = new Error('Close failed');
+			const mockPersistence = { close: vi.fn().mockRejectedValue(failure) };
 			mocks.container.unregister('Persistence');
 			mocks.container.registerInstance('Persistence', mockPersistence as unknown as PersistenceBackend);
 
-			await expect(server.stop()).resolves.toBeUndefined();
+			await expect(server.stop()).rejects.toMatchObject({ errors: [failure] });
 			expect(mocks.mockLogger.error).toHaveBeenCalled();
 		});
 
@@ -328,7 +330,7 @@ describe('lib.ts — uncovered branches', () => {
 	});
 
 	describe('stop() non-Error branches (lines 389, 401)', () => {
-		it('should handle non-Error thrown during shutdown flush', async () => {
+		it('should surface a non-Error thrown during shutdown flush', async () => {
 			const mocks = createMockContainer();
 			mocks.mockHistoryManager.shutdown.mockRejectedValue('raw string error');
 			const server = new ToolAwareSequentialThinkingServer({
@@ -336,14 +338,14 @@ describe('lib.ts — uncovered branches', () => {
 				autoDiscover: false,
 			});
 
-			await expect(server.stop()).resolves.toBeUndefined();
+			await expect(server.stop()).rejects.toMatchObject({ errors: ['raw string error'] });
 			expect(mocks.mockLogger.error).toHaveBeenCalledWith(
 				'Error flushing write buffer during shutdown',
 				expect.objectContaining({ error: 'raw string error' })
 			);
 		});
 
-		it('should handle non-Error thrown during persistence close', async () => {
+		it('should surface a non-Error thrown during persistence close', async () => {
 			const mocks = createMockContainer();
 			const mockPersistence = { close: vi.fn().mockRejectedValue(42) };
 			mocks.container.unregister('Persistence');
@@ -353,7 +355,7 @@ describe('lib.ts — uncovered branches', () => {
 				autoDiscover: false,
 			});
 
-			await expect(server.stop()).resolves.toBeUndefined();
+			await expect(server.stop()).rejects.toMatchObject({ errors: [42] });
 			expect(mocks.mockLogger.error).toHaveBeenCalledWith(
 				'Error closing persistence backend',
 				expect.objectContaining({ error: '42' })
