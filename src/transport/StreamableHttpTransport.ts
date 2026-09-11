@@ -34,6 +34,11 @@ import type { ITransport, TransportKind } from '../contracts/transport.js';
 import { asSessionId, type SessionId } from '../contracts/ids.js';
 import { readRequestBody } from './HttpHelpers.js';
 import { runWithContext } from '../context/RequestContext.js';
+import {
+	AcceptedWorkTracker,
+	LifecycleFailureReporter,
+	ResponseFinalizer,
+} from './HttpRequestLifecycle.js';
 
 /**
  * MCP Streamable HTTP transport options extending base TransportOptions.
@@ -102,6 +107,12 @@ interface SessionState {
 	notificationStreams: Set<ServerResponse>;
 }
 
+type SessionError = {
+	readonly statusCode: number;
+	readonly code: number;
+	readonly message: string;
+};
+
 /**
  * Streamable HTTP Transport for MCP server.
  *
@@ -138,7 +149,9 @@ interface SessionState {
  * - 503: Server Not Ready / Shutting Down
  */
 export class StreamableHttpTransport extends BaseTransport implements ITransport {
-	get kind(): TransportKind { return 'streamable-http'; }
+	get kind(): TransportKind {
+		return 'streamable-http';
+	}
 	private _server: Server | null = null;
 	private _mcpServer: McpServer | null = null;
 	private _path: string;
@@ -152,6 +165,9 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	private _requestTimeout: number;
 	private _metrics?: IMetrics;
 	private _metricsProvider: (() => string) | null;
+	private readonly _lifecycleFailureReporter: LifecycleFailureReporter;
+	private readonly _acceptedWork: AcceptedWorkTracker;
+	private _stopPromise: Promise<void> | null = null;
 
 	constructor(options: StreamableHttpTransportOptions = {}) {
 		super(options);
@@ -164,13 +180,12 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		this._requestTimeout = options.requestTimeout ?? 30000;
 		this._metrics = options.metrics;
 		this._metricsProvider = options.metricsProvider ?? null;
-	}
-
-	private _requireServer(): Server {
-		if (!this._server) {
-			throw new Error('HTTP server not initialized. Did you call connect()?');
-		}
-		return this._server;
+		this._lifecycleFailureReporter = new LifecycleFailureReporter((error) => {
+			this.log('error', 'Streamable HTTP request lifecycle failed', {
+				error: getErrorMessage(error),
+			});
+		});
+		this._acceptedWork = new AcceptedWorkTracker(this._lifecycleFailureReporter);
 	}
 
 	private _requireMcpServer(): McpServer {
@@ -199,16 +214,44 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	 */
 	async connect(mcpServer: McpServer): Promise<void> {
 		this._mcpServer = mcpServer;
-		this._server = createServer((req, res) => this._handleRequest(req, res));
+		const server = createServer((req, res) => {
+			const responseFinalizer = new ResponseFinalizer(res, this._lifecycleFailureReporter);
+			void this._handleRequest(req, res).catch((error: unknown) => {
+				this._lifecycleFailureReporter.report(error);
+				responseFinalizer.finalize((response) => {
+					this._sendJsonRpcError(response, 500, -32603, 'Internal error', null, {
+						data: getErrorMessage(error),
+					});
+				});
+			});
+		});
+		this._server = server;
 
-		return new Promise((resolve) => {
-			this._requireServer().listen(this._port, this._host, () => {
+		return new Promise((resolve, reject) => {
+			const cleanup = (): void => {
+				server.off('error', onError);
+				server.off('listening', onListening);
+			};
+			const onError = (error: Error): void => {
+				cleanup();
+				reject(error);
+			};
+			const onListening = (): void => {
+				cleanup();
 				this.log(
 					'info',
 					`Streamable HTTP transport listening on http://${this._host}:${this._port}`
 				);
 				resolve();
-			});
+			};
+			server.once('error', onError);
+			server.once('listening', onListening);
+			try {
+				server.listen(this._port, this._host);
+			} catch (error) {
+				cleanup();
+				reject(error);
+			}
 		});
 	}
 
@@ -217,7 +260,12 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	 */
 	private async _handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
 		const startTime = Date.now();
-		this._metrics?.counter('streamable_http_requests_total', 1, {}, 'Total Streamable HTTP transport requests');
+		this._metrics?.counter(
+			'streamable_http_requests_total',
+			1,
+			{},
+			'Total Streamable HTTP transport requests'
+		);
 		res.once('finish', () => {
 			const durationSeconds = (Date.now() - startTime) / 1000;
 			this._metrics?.histogram('streamable_http_request_duration_seconds', durationSeconds, {});
@@ -283,7 +331,7 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		// MCP endpoint routing
 		if (urlPath === this._path) {
 			if (req.method === 'POST') {
-				await this._handleMcpPost(req, res);
+				this._acceptedWork.track(this._handleMcpPost(req, res));
 				return;
 			}
 			if (req.method === 'GET') {
@@ -291,7 +339,13 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 				return;
 			}
 			res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'GET, POST' });
-			res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32601, message: 'Method not allowed' } }));
+			res.end(
+				JSON.stringify({
+					jsonrpc: '2.0',
+					id: null,
+					error: { code: -32601, message: 'Method not allowed' },
+				})
+			);
 			return;
 		}
 
@@ -302,7 +356,14 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	/**
 	 * Send a JSON-RPC error response.
 	 */
-	private _sendJsonRpcError(res: ServerResponse, statusCode: number, code: number, message: string, id: unknown = null, extra?: Record<string, unknown>): void {
+	private _sendJsonRpcError(
+		res: ServerResponse,
+		statusCode: number,
+		code: number,
+		message: string,
+		id: unknown = null,
+		extra?: Record<string, unknown>
+	): void {
 		const error: Record<string, unknown> = { code, message };
 		if (extra) {
 			Object.assign(error, extra);
@@ -323,19 +384,20 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	private async _handleMcpPost(req: IncomingMessage, res: ServerResponse): Promise<void> {
 		this._requestCount++;
 		this._activeRequests++;
+		const responseFinalizer = new ResponseFinalizer(res, this._lifecycleFailureReporter);
 
 		const timeout = setTimeout(() => {
-			this._activeRequests--;
-			this._sendJsonRpcError(res, 500, -32603, 'Request timeout');
+			responseFinalizer.finalize((response) => {
+				this._sendJsonRpcError(response, 500, -32603, 'Request timeout');
+			});
 		}, this._requestTimeout);
-
 		try {
 			// Read request body with size limit
 			const body = await readRequestBody(req, this._bodySizeLimitEnabled ? this._maxBodySize : 0);
 			if (body === null) {
-				clearTimeout(timeout);
-				this._activeRequests--;
-				this._sendJsonRpcError(res, 413, -32000, 'Request body too large');
+				responseFinalizer.finalize((response) => {
+					this._sendJsonRpcError(response, 413, -32000, 'Request body too large');
+				});
 				return;
 			}
 
@@ -344,19 +406,29 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 			try {
 				rawBody = JSON.parse(body) as unknown;
 			} catch {
-				clearTimeout(timeout);
-				this._activeRequests--;
-				this._sendJsonRpcError(res, 200, -32700, 'Parse error');
+				responseFinalizer.finalize((response) => {
+					this._sendJsonRpcError(response, 200, -32700, 'Parse error');
+				});
 				return;
 			}
 
 			// Validate JSON-RPC schema
 			const parseResult = safeParse(JsonRpcRequestSchema, rawBody);
-			const rawId = (rawBody && typeof rawBody === 'object' && 'id' in rawBody) ? (rawBody as { id?: unknown }).id ?? null : null;
+			const rawId =
+				rawBody && typeof rawBody === 'object' && 'id' in rawBody
+					? ((rawBody as { id?: unknown }).id ?? null)
+					: null;
 			if (!parseResult.success) {
-				clearTimeout(timeout);
-				this._activeRequests--;
-				this._sendJsonRpcError(res, 200, -32600, 'Invalid Request', rawId as string | number | null, { data: parseResult.issues });
+				responseFinalizer.finalize((response) => {
+					this._sendJsonRpcError(
+						response,
+						200,
+						-32600,
+						'Invalid Request',
+						rawId as string | number | null,
+						{ data: parseResult.issues }
+					);
+				});
 				return;
 			}
 			const jsonRpcRequest = parseResult.output;
@@ -364,10 +436,16 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 			// Session management (stateful mode)
 			let sessionId: string | undefined;
 			if (this._stateful) {
-				const sessionResult = this._resolveSession(req, res);
-				if (sessionResult === false) {
-					clearTimeout(timeout);
-					this._activeRequests--;
+				const sessionResult = this._resolveSession(req);
+				if (typeof sessionResult !== 'string') {
+					responseFinalizer.finalize((response) => {
+						this._sendJsonRpcError(
+							response,
+							sessionResult.statusCode,
+							sessionResult.code,
+							sessionResult.message
+						);
+					});
 					return;
 				}
 				sessionId = sessionResult;
@@ -375,43 +453,58 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 
 			// Check if MCP server is ready
 			if (!this._mcpServer) {
-				clearTimeout(timeout);
-				this._activeRequests--;
-				this._sendJsonRpcError(res, 503, -32603, 'Server not ready', jsonRpcRequest?.id ?? null);
+				responseFinalizer.finalize((response) => {
+					this._sendJsonRpcError(
+						response,
+						503,
+						-32603,
+						'Server not ready',
+						jsonRpcRequest?.id ?? null
+					);
+				});
 				return;
 			}
 
-			// Process JSON-RPC request through MCP server
-			// Process JSON-RPC request through MCP server with owner context
-			const owner = this._stateful ? (sessionId ?? randomUUID()) : randomUUID();
-			const response = await runWithContext(
-				{ requestId: randomUUID(), owner },
-				() => this._requireMcpServer().receive(jsonRpcRequest as Parameters<McpServer['receive']>[0], { sessionInfo: {} })
+			await this._receiveAndFinalize(
+				jsonRpcRequest as Parameters<McpServer['receive']>[0],
+				sessionId,
+				responseFinalizer
 			);
-			clearTimeout(timeout);
-			this._activeRequests--;
-
-			// Send response with session header if applicable
-			const responseHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-			if (sessionId) responseHeaders['Mcp-Session-Id'] = sessionId;
-
-			if (response) {
-				res.writeHead(200, responseHeaders);
-				res.end(JSON.stringify(response));
-			} else {
-				if (sessionId) res.setHeader('Mcp-Session-Id', sessionId);
-				res.writeHead(202);
-				res.end();
-			}
 		} catch (error) {
+			responseFinalizer.finalize((response) => {
+				this._sendJsonRpcError(response, 200, -32603, 'Internal error', null, {
+					data: getErrorMessage(error),
+				});
+			});
+		} finally {
 			clearTimeout(timeout);
 			this._activeRequests--;
-			this._sendJsonRpcError(res, 200, -32603, 'Internal error', null, {
-				data: getErrorMessage(error),
-			});
 		}
 	}
 
+	private async _receiveAndFinalize(
+		jsonRpcRequest: Parameters<McpServer['receive']>[0],
+		sessionId: string | undefined,
+		responseFinalizer: ResponseFinalizer
+	): Promise<void> {
+		const owner = this._stateful ? (sessionId ?? randomUUID()) : randomUUID();
+		const response = await runWithContext({ requestId: randomUUID(), owner }, () =>
+			this._requireMcpServer().receive(jsonRpcRequest, { sessionInfo: {} })
+		);
+		const responseHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+		if (sessionId) responseHeaders['Mcp-Session-Id'] = sessionId;
+
+		responseFinalizer.finalize((httpResponse) => {
+			if (response) {
+				httpResponse.writeHead(200, responseHeaders);
+				httpResponse.end(JSON.stringify(response));
+				return;
+			}
+			if (sessionId) httpResponse.setHeader('Mcp-Session-Id', sessionId);
+			httpResponse.writeHead(202);
+			httpResponse.end();
+		});
+	}
 
 	/**
 	 * Handle GET /mcp — Optional SSE notification stream.
@@ -493,23 +586,19 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	/**
 	 * Resolve or create a session for a stateful request.
 	 *
-	 * @returns Session ID string on success, or `false` if the response was already sent (error).
+	 * @returns Session ID string on success, or the response error to finalize.
 	 */
-	private _resolveSession(req: IncomingMessage, res: ServerResponse): string | false {
+	private _resolveSession(req: IncomingMessage): string | SessionError {
 		const headerSessionId = this._getSessionIdFromHeader(req);
 
 		if (headerSessionId) {
 			// Validate format
 			if (!this.validateSessionId(headerSessionId)) {
-				res.writeHead(400, { 'Content-Type': 'application/json' });
-				res.end(
-					JSON.stringify({
-						jsonrpc: '2.0',
-						id: null,
-						error: { code: -32600, message: 'Invalid Mcp-Session-Id format' },
-					})
-				);
-				return false;
+				return {
+					statusCode: 400,
+					code: -32600,
+					message: 'Invalid Mcp-Session-Id format',
+				};
 			}
 
 			// Check if session exists
@@ -520,15 +609,7 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 			}
 
 			// Unknown session ID — per spec, return 404
-			res.writeHead(404, { 'Content-Type': 'application/json' });
-			res.end(
-				JSON.stringify({
-					jsonrpc: '2.0',
-					id: null,
-					error: { code: -32001, message: 'Session not found' },
-				})
-			);
-			return false;
+			return { statusCode: 404, code: -32001, message: 'Session not found' };
 		}
 
 		// No session header — create new session
@@ -556,7 +637,6 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		}
 		return undefined;
 	}
-
 
 	/**
 	 * Send an SSE event to a specific client response stream.
@@ -667,9 +747,10 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	/**
 	 * Stop transport server with graceful shutdown.
 	 *
-	 * @param timeout - Maximum time to wait for in-flight requests (default: 30s)
+	 * @param timeout - Maximum time before force-closing HTTP connections (default: 30s)
 	 */
-	async stop(timeout?: number): Promise<void> {
+	stop(timeout?: number): Promise<void> {
+		if (this._stopPromise) return this._stopPromise;
 		this._isShuttingDown = true;
 		this._stopRateLimitCleanup();
 
@@ -688,25 +769,42 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		}
 		this._sessions.clear();
 
-		return new Promise((resolve) => {
-			if (!this._server) {
-				this.log('info', 'Streamable HTTP transport stopped (no server)');
+		const server = this._server;
+		const serverClosed = new Promise<void>((resolve, reject) => {
+			if (!server?.listening) {
 				resolve();
 				return;
 			}
 
-			// Force close after timeout
-			const forceClose = setTimeout(() => {
-				this.log('warn', 'Streamable HTTP transport force-closing after timeout');
-				resolve();
-			}, shutdownTimeout);
-
-			this._server.close(() => {
-				clearTimeout(forceClose);
-				this.log('info', 'Streamable HTTP transport stopped');
+			let settled = false;
+			let forceClose: NodeJS.Timeout | null = null;
+			server.close((error) => {
+				if (settled) return;
+				settled = true;
+				if (forceClose) clearTimeout(forceClose);
+				if (error) {
+					reject(error);
+					return;
+				}
 				resolve();
 			});
+			if (settled) return;
+			forceClose = setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				this.log('warn', 'Streamable HTTP transport force-closing after timeout');
+				server.closeAllConnections();
+				resolve();
+			}, shutdownTimeout);
 		});
+		const stopPromise = Promise.all([serverClosed, this._acceptedWork.join()]).then(() => {
+			this.log('info', 'Streamable HTTP transport stopped');
+		});
+		this._stopPromise = stopPromise;
+		void stopPromise.catch(() => {
+			if (this._stopPromise === stopPromise) this._stopPromise = null;
+		});
+		return stopPromise;
 	}
 }
 
