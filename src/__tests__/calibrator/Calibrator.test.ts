@@ -6,10 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import { Calibrator } from '../../core/evaluator/Calibrator.js';
 import { ALL_THOUGHT_TYPES } from '../../core/evaluator/internals.js';
-import type {
-	IOutcomeRecorder,
-	VerificationOutcome,
-} from '../../contracts/interfaces.js';
+import type { IOutcomeRecorder, VerificationOutcome } from '../../contracts/interfaces.js';
 import type { ThoughtType } from '../../core/reasoning.js';
 import { asSessionId, asThoughtId } from '../../contracts/ids.js';
 
@@ -37,6 +34,10 @@ class MockOutcomeRecorder implements IOutcomeRecorder {
 	clearOutcomes(sessionId: string): void {
 		this._bySession.delete(sessionId);
 	}
+
+	clearAllOutcomes(): void {
+		this._bySession.clear();
+	}
 }
 
 function makeOutcome(
@@ -45,7 +46,7 @@ function makeOutcome(
 	type: ThoughtType = 'hypothesis',
 	sessionId: string = 's1',
 	thoughtId: string = 't',
-	thoughtNumber = 1,
+	thoughtNumber = 1
 ): Omit<VerificationOutcome, 'recordedAt'> {
 	return {
 		thoughtId: asThoughtId(thoughtId),
@@ -400,7 +401,7 @@ describe('Calibrator — temperature boundary (MIN_OUTCOMES_FOR_TEMPERATURE = 10
 		// fitTemperature returns 1.0 below threshold; calibrate path also gates on count.
 		expect(r.temperature).toBe(1.0);
 		// hypothesis: n=9, observedMean=0, priorWeight = 1/(1+9/10) = 1/1.9 ≈ 0.5263
-		const expected = (1 / (1 + 9 / 10)) * 0 + (1 - 1 / (1 + 9 / 10)) * 0.9;
+		const expected = (1 - 1 / (1 + 9 / 10)) * 0.9;
 		expect(r.calibrated).toBeCloseTo(expected, 10);
 	});
 
@@ -508,7 +509,14 @@ describe('Calibrator — determinism', () => {
 
 	it('Brier score is deterministic for the same outcome set', () => {
 		const seed: Array<[number, 0 | 1]> = [
-			[0.9, 1], [0.8, 0], [0.7, 1], [0.6, 1], [0.55, 0], [0.5, 1], [0.4, 0], [0.3, 0],
+			[0.9, 1],
+			[0.8, 0],
+			[0.7, 1],
+			[0.6, 1],
+			[0.55, 0],
+			[0.5, 1],
+			[0.4, 0],
+			[0.3, 0],
 		];
 		const rA = new MockOutcomeRecorder();
 		const rB = new MockOutcomeRecorder();
