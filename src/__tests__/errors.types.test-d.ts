@@ -52,6 +52,7 @@ import type { ERROR_CODES, ErrorCode } from '../errors.js';
  *  - PersistenceDrainError     → PERSISTENCE_DRAIN
  *  - PersistenceSessionAdmissionClosedError → PERSISTENCE_SESSION_ADMISSION_CLOSED
  *  - PersistenceSessionBarrierReentrancyError → PERSISTENCE_SESSION_BARRIER_REENTRANCY
+ *  - AsyncResetRequiredError → ASYNC_RESET_REQUIRED
  *
  * Direct `SequentialThinkingError` usages (no dedicated subclass):
  *  - DUPLICATE_SUMMARY (thrown by `core/compression/InMemorySummaryStore.ts`)
@@ -88,6 +89,7 @@ type _AllSubclassCodes =
 	| 'PERSISTENCE_DRAIN'
 	| 'PERSISTENCE_SESSION_ADMISSION_CLOSED'
 	| 'PERSISTENCE_SESSION_BARRIER_REENTRANCY'
+	| 'ASYNC_RESET_REQUIRED'
 	| 'PERSISTENCE_CAPABILITY_UNSUPPORTED'
 	| 'PERSISTENCE_SCOPE_MISMATCH'
 	| 'PERSISTENCE_COMPATIBILITY'
