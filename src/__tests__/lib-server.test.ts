@@ -28,7 +28,10 @@ function createMockContainer() {
 		getHistoryLength: vi.fn().mockReturnValue(0),
 		getBranches: vi.fn().mockReturnValue({}),
 		getBranchIds: vi.fn().mockReturnValue([]),
+		registerBranch: vi.fn(),
 		clear: vi.fn(),
+		resetSession: vi.fn().mockResolvedValue(undefined),
+		resetAll: vi.fn().mockResolvedValue(undefined),
 		getAvailableMcpTools: vi.fn().mockReturnValue([]),
 		getAvailableSkills: vi.fn().mockReturnValue([]),
 		setEventEmitter: vi.fn(),
@@ -40,6 +43,8 @@ function createMockContainer() {
 		process: vi.fn().mockResolvedValue({
 			content: [{ type: 'text', text: 'Processed thought' }],
 		}),
+		resetSession: vi.fn().mockResolvedValue(undefined),
+		resetAll: vi.fn().mockResolvedValue(undefined),
 	};
 
 	const mockMetrics = {
@@ -63,7 +68,10 @@ function createMockContainer() {
 
 	container.registerInstance('Logger', mockLogger as unknown as StructuredLogger);
 	container.registerInstance('HistoryManager', mockHistoryManager as unknown as HistoryManager);
-	container.registerInstance('ThoughtProcessor', mockThoughtProcessor as unknown as ThoughtProcessor);
+	container.registerInstance(
+		'ThoughtProcessor',
+		mockThoughtProcessor as unknown as ThoughtProcessor
+	);
 	container.registerInstance('Metrics', mockMetrics as unknown as Metrics);
 	container.registerInstance('Config', config);
 	container.registerInstance('ToolRegistry', mockToolRegistry as unknown as ToolRegistry);
@@ -156,6 +164,26 @@ describe('ToolAwareSequentialThinkingServer', () => {
 			);
 			expect(result).toBeDefined();
 		});
+
+		it('delegates reset and branch registration input without mutating or pre-registering it', async () => {
+			const input = {
+				thought: 'fresh thought',
+				thought_number: 1,
+				total_thoughts: 1,
+				next_thought_needed: false,
+				session_id: 'session-a',
+				reset_state: true,
+				register_branch_id: 'future',
+				tool_arguments: { nested: { values: ['unchanged'] } },
+			};
+			const before = structuredClone(input);
+
+			await server.processThought(input);
+
+			expect(mocks.mockThoughtProcessor.process).toHaveBeenCalledWith(input);
+			expect(mocks.mockHistoryManager.registerBranch).not.toHaveBeenCalled();
+			expect(input).toEqual(before);
+		});
 	});
 
 	describe('getMetricsSnapshot', () => {
@@ -205,7 +233,10 @@ describe('ToolAwareSequentialThinkingServer', () => {
 		it('should close persistence if available', async () => {
 			const mockPersistence = { close: vi.fn().mockResolvedValue(undefined) };
 			mocks.container.unregister('Persistence');
-			mocks.container.registerInstance('Persistence', mockPersistence as unknown as PersistenceBackend);
+			mocks.container.registerInstance(
+				'Persistence',
+				mockPersistence as unknown as PersistenceBackend
+			);
 
 			await server.stop();
 			expect(mockPersistence.close).toHaveBeenCalled();
@@ -215,7 +246,10 @@ describe('ToolAwareSequentialThinkingServer', () => {
 			const failure = new Error('Close failed');
 			const mockPersistence = { close: vi.fn().mockRejectedValue(failure) };
 			mocks.container.unregister('Persistence');
-			mocks.container.registerInstance('Persistence', mockPersistence as unknown as PersistenceBackend);
+			mocks.container.registerInstance(
+				'Persistence',
+				mockPersistence as unknown as PersistenceBackend
+			);
 
 			await expect(server.stop()).rejects.toMatchObject({ errors: [failure] });
 			expect(mocks.mockLogger.error).toHaveBeenCalled();
@@ -328,7 +362,7 @@ describe('lib.ts — uncovered branches', () => {
 					new ToolAwareSequentialThinkingServer({
 						autoDiscover: false,
 						enableWatcher: false,
-					}),
+					})
 			).toThrow('Container is required. Use createServer() or provide a container.');
 		});
 
@@ -344,7 +378,7 @@ describe('lib.ts — uncovered branches', () => {
 						autoDiscover: false,
 						enableWatcher: false,
 						logger: customLogger,
-					}),
+					})
 			).toThrow('Container is required. Use createServer() or provide a container.');
 		});
 	});
@@ -369,7 +403,10 @@ describe('lib.ts — uncovered branches', () => {
 			const mocks = createMockContainer();
 			const mockPersistence = { close: vi.fn().mockRejectedValue(42) };
 			mocks.container.unregister('Persistence');
-			mocks.container.registerInstance('Persistence', mockPersistence as unknown as PersistenceBackend);
+			mocks.container.registerInstance(
+				'Persistence',
+				mockPersistence as unknown as PersistenceBackend
+			);
 			const server = new ToolAwareSequentialThinkingServer({
 				container: mocks.container,
 				autoDiscover: false,

@@ -5,7 +5,7 @@
 import { EventEmitter } from 'node:events';
 import type * as v from 'valibot';
 import type { ThoughtData } from './core/thought.js';
-import { asBranchId, type BranchId } from './contracts/ids.js';
+import type { BranchId } from './contracts/ids.js';
 import type { SequentialThinkingSchema } from './schema.js';
 import { SEQUENTIAL_THINKING_TOOL } from './schema.js';
 import type { IDisposable } from './types/disposable.js';
@@ -95,9 +95,7 @@ function appendCleanupFailure(failures: unknown[], failure: unknown): void {
 	failures.push(failure);
 }
 
-async function collectCleanupFailures(
-	operations: readonly CleanupOperation[]
-): Promise<unknown[]> {
+async function collectCleanupFailures(operations: readonly CleanupOperation[]): Promise<unknown[]> {
 	const failures: unknown[] = [];
 	for (const operation of operations) {
 		try {
@@ -172,13 +170,22 @@ export interface IToolAwareSequentialThinkingServer extends IDisposable {
 	 */
 	clear(): void;
 
+	/** Awaitably reset one session and all matching auxiliary state. */
+	resetSession(sessionId: string): Promise<void>;
+
+	/** Awaitably reset all state from a trusted ownerless context. */
+	resetAll(): Promise<void>;
+
 	/**
 	 * Dispose of the server and all container services.
 	 */
 	dispose(): Promise<void>;
 }
 
-export class ToolAwareSequentialThinkingServer extends EventEmitter implements IToolAwareSequentialThinkingServer {
+export class ToolAwareSequentialThinkingServer
+	extends EventEmitter
+	implements IToolAwareSequentialThinkingServer
+{
 	/**
 	 * Factory method to create a new server instance with async initialization.
 	 * This is the recommended way to create server instances.
@@ -323,7 +330,6 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 		// Always include the sequential thinking tool
 		this.tools.addTool(SEQUENTIAL_THINKING_TOOL);
 
-
 		// Initialize watchers if enabled
 		if (options.enableWatcher) {
 			this._skillWatcher = new SkillWatcher(this.skills);
@@ -364,7 +370,7 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 		container.registerInstance('Metrics', metrics);
 		ToolAwareSequentialThinkingServer._registerDiscoveryRegistries(
 			container,
-			options.lazyDiscovery,
+			options.lazyDiscovery
 		);
 
 		// Register EdgeStore as a lazy singleton (always registered; flag gates writes)
@@ -408,7 +414,7 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 
 		// Register ReasoningStrategy as a lazy singleton (selected via feature flag)
 		container.register('reasoningStrategy', () =>
-			createReasoningStrategy(config.features.reasoningStrategy),
+			createReasoningStrategy(config.features.reasoningStrategy)
 		);
 
 		// Register SessionLock as a lazy singleton (always registered;
@@ -423,7 +429,7 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 
 	private static _resolveEffectiveConfig(
 		options: ServerOptions,
-		fileConfig: ConfigFileOptions | null,
+		fileConfig: ConfigFileOptions | null
 	): ServerConfig {
 		if (options.config) return options.config;
 		const loadedOptions = new ConfigLoader().toServerConfigOptions(fileConfig ?? {});
@@ -475,6 +481,7 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 			const pers = container.resolve('Persistence');
 			const componentMetrics = container.resolve('Metrics');
 			const edgeStore = container.resolve('EdgeStore');
+			const summaryStore = container.resolve('summaryStore');
 			return new HistoryManager({
 				maxHistorySize: cfg.maxHistorySize,
 				maxBranches: cfg.maxBranches,
@@ -486,8 +493,10 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 				persistenceFlushInterval: cfg.persistenceFlushInterval,
 				persistenceMaxRetries: cfg.persistenceMaxRetries,
 				edgeStore,
+				summaryStore,
 				dagEdges: cfg.features.dagEdges,
 				maxSessionsPerOwner: cfg.maxSessionsPerOwner,
+				sessionLock: container.resolve('sessionLock'),
 			});
 		});
 	}
@@ -499,23 +508,20 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 		// Register OutcomeRecorder as a lazy singleton (gated by feature flag)
 		container.register(
 			'outcomeRecorder',
-			() => new OutcomeRecorder({ enabled: config.features.outcomeRecording ?? false }),
+			() => new OutcomeRecorder({ enabled: config.features.outcomeRecording ?? false })
 		);
 
 		// Register Calibrator as a lazy singleton (gated by feature flag)
 		container.register(
 			'calibrator',
 			() =>
-				new Calibrator(
-					container.resolve('outcomeRecorder'),
-					config.features.calibration ?? false,
-				),
+				new Calibrator(container.resolve('outcomeRecorder'), config.features.calibration ?? false)
 		);
 
 		// Register ThoughtEvaluator (stateless, transient) with injected calibrator
 		container.registerFactory(
 			'ThoughtEvaluator',
-			() => new ThoughtEvaluator(container.resolve('calibrator')),
+			() => new ThoughtEvaluator(container.resolve('calibrator'))
 		);
 
 		// Register ThoughtProcessor
@@ -544,10 +550,10 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 				toolRegistry,
 				config.features,
 				sessionLock,
+				container.resolve('outcomeRecorder')
 			);
 		});
 	}
-
 
 	/**
 	 * Create and configure the DI container with async persistence initialization.
@@ -574,7 +580,7 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 			return ToolAwareSequentialThinkingServer._createContainerCore(
 				{ ...options, config },
 				fileConfig,
-				persistence,
+				persistence
 			);
 		} catch (error) {
 			const acquiredPersistence = persistence;
@@ -622,22 +628,7 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 	// Main processing method - delegate to ThoughtProcessor
 	public async processThought(input: v.InferInput<typeof SequentialThinkingSchema>) {
 		const startTime = Date.now();
-		const thoughtInput = input as ThoughtData & { register_branch_id?: string };
-		if (typeof thoughtInput.register_branch_id === 'string' && thoughtInput.register_branch_id.length > 0) {
-			try {
-				this._historyManager.registerBranch(
-					thoughtInput.session_id,
-					asBranchId(thoughtInput.register_branch_id)
-				);
-			} catch (err) {
-				this._logger.warn('registerBranch skipped', {
-					branch_id: thoughtInput.register_branch_id,
-					error: err instanceof Error ? err.message : String(err),
-				});
-			}
-			delete thoughtInput.register_branch_id;
-		}
-		const result = await this._thoughtProcessor.process(thoughtInput);
+		const result = await this._thoughtProcessor.process(input as ThoughtData);
 		const durationSeconds = (Date.now() - startTime) / 1000;
 		this._metrics.histogram('thought_processing_duration_seconds', durationSeconds, {});
 		return result;
@@ -726,6 +717,18 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 	public clear(): void {
 		this._historyManager.clear();
 		this._logger.info('Server state cleared');
+	}
+
+	/** Awaitably resets one session and matching processor-owned state. */
+	public async resetSession(sessionId: string): Promise<void> {
+		await this._thoughtProcessor.resetSession(sessionId);
+		this._logger.info('Server session reset', { sessionId });
+	}
+
+	/** Awaitably resets all server state from a trusted ownerless context. */
+	public async resetAll(): Promise<void> {
+		await this._thoughtProcessor.resetAll();
+		this._logger.info('All server sessions reset');
 	}
 
 	/**
