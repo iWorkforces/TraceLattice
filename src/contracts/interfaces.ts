@@ -60,7 +60,6 @@ export interface DiscoveryCacheOptions {
 	metrics?: IMetrics;
 }
 
-
 /**
  * Outcome recording interface for calibration data collection.
  *
@@ -115,6 +114,12 @@ export interface IOutcomeRecorder {
 	 * Clear outcomes for a specific session.
 	 */
 	clearOutcomes(sessionId: SessionId): void;
+
+	/**
+	 * Discard outcomes from every session namespace.
+	 * Use only for a trusted process-wide reset; scoped callers must use `clearOutcomes`.
+	 */
+	clearAllOutcomes(): void;
 
 	/**
 	 * Whether outcome recording is currently enabled.
@@ -193,6 +198,12 @@ export interface IEdgeStore {
 	clearSession(sessionId: SessionId): void;
 
 	/**
+	 * Discard edges from every session namespace.
+	 * Use only for a trusted process-wide reset; scoped callers must use `clearSession`.
+	 */
+	clearAll(): void;
+
+	/**
 	 * Count edges.
 	 *
 	 * @param sessionId - If provided, count for that session only
@@ -244,8 +255,11 @@ export interface ISessionLock {
 	withLock<T>(
 		sessionId: SessionId | undefined,
 		fn: () => Promise<T>,
-		timeoutMs?: number,
+		timeoutMs?: number
 	): Promise<T>;
+
+	/** Whether the session currently has a holder or queued operation. */
+	isActive(sessionId: SessionId | undefined): boolean;
 
 	/** Number of currently held lock chains (diagnostics). */
 	readonly size: number;
