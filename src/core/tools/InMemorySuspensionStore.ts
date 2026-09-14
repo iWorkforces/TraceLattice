@@ -9,7 +9,12 @@
  */
 
 import type { ISuspensionStore, SuspensionRecord } from '../../contracts/suspension.js';
-import { generateSuspensionToken, asSessionId, type SessionId, type SuspensionToken } from '../../contracts/ids.js';
+import {
+	generateSuspensionToken,
+	asSessionId,
+	type SessionId,
+	type SuspensionToken,
+} from '../../contracts/ids.js';
 import type { Logger } from '../../logger/StructuredLogger.js';
 
 /**
@@ -59,7 +64,7 @@ export class InMemorySuspensionStore implements ISuspensionStore {
 	}
 
 	suspend(
-		record: Omit<SuspensionRecord, 'token' | 'createdAt'> & { ttlMs?: number },
+		record: Omit<SuspensionRecord, 'token' | 'createdAt'> & { ttlMs?: number }
 	): SuspensionRecord {
 		const token = generateSuspensionToken();
 		const createdAt = Date.now();
@@ -120,6 +125,11 @@ export class InMemorySuspensionStore implements ISuspensionStore {
 			this._byToken.delete(token);
 		}
 		this._bySession.delete(asSessionId(sessionId));
+	}
+
+	clearAll(): void {
+		this._byToken.clear();
+		this._bySession.clear();
 	}
 
 	size(sessionId?: string): number {

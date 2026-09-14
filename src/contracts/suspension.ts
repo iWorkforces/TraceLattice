@@ -81,7 +81,7 @@ export interface ISuspensionStore {
 	 * ```
 	 */
 	suspend(
-		record: Omit<SuspensionRecord, 'token' | 'createdAt'> & { ttlMs?: number },
+		record: Omit<SuspensionRecord, 'token' | 'createdAt'> & { ttlMs?: number }
 	): SuspensionRecord;
 
 	/**
@@ -148,6 +148,12 @@ export interface ISuspensionStore {
 	 * ```
 	 */
 	clearSession(sessionId: SessionId): void;
+
+	/**
+	 * Discard records from every session namespace.
+	 * Use only for a trusted process-wide reset; scoped callers must use `clearSession`.
+	 */
+	clearAll(): void;
 
 	/**
 	 * Count stored records.
