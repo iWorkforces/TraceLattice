@@ -9,15 +9,16 @@ import { asBranchId, type BranchId } from '../contracts/ids.js';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { ThoughtProcessor } from '../core/ThoughtProcessor.js';
 import { ThoughtFormatter } from '../core/ThoughtFormatter.js';
+import { SessionLock } from '../core/SessionLock.js';
+import { SequentialStrategy } from '../core/reasoning/strategies/SequentialStrategy.js';
 import { StructuredLogger } from '../logger/StructuredLogger.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import { MockHistoryManager } from './helpers/factories.js';
 import type { ThoughtData } from '../core/thought.js';
 import { asSessionId } from '../contracts/ids.js';
-import type { IHistoryManager } from '../core/IHistoryManager.js';
+import type { HistorySessionSnapshot, IHistoryManager } from '../core/IHistoryManager.js';
 import { ThoughtEvaluator } from '../core/ThoughtEvaluator.js';
 import { createTestThought, createHypothesisThought } from './helpers/factories.js';
-
 
 describe('ThoughtProcessor', () => {
 	let processor: ThoughtProcessor;
@@ -256,40 +257,59 @@ describe('ThoughtProcessor', () => {
 
 		it('should return error response when processing fails', async () => {
 			// Create a HistoryManager that throws on addThought
-		class ThrowingHistoryManager implements IHistoryManager {
-			addThought(): void {
-				throw new Error('Database error');
+			class ThrowingHistoryManager implements IHistoryManager {
+				addThought(): void {
+					throw new Error('Database error');
+				}
+				getHistory(): ThoughtData[] {
+					return [];
+				}
+				getHistoryLength(): number {
+					return 0;
+				}
+				getBranches(): Record<BranchId, ThoughtData[]> {
+					return {};
+				}
+				getBranchIds(): BranchId[] {
+					return [];
+				}
+				registerBranch(): void {}
+				branchExists(): boolean {
+					return false;
+				}
+				clear(): void {}
+				async resetSession(): Promise<void> {}
+				async resetAll(): Promise<void> {}
+				inspectSession(): HistorySessionSnapshot {
+					return {
+						history: [],
+						branches: {},
+						branchIds: [],
+						availableMcpTools: undefined,
+						availableSkills: undefined,
+					};
+				}
+				getSessionIds(): string[] {
+					return [];
+				}
+				getAvailableMcpTools(): string[] | undefined {
+					return undefined;
+				}
+				getAvailableSkills(): string[] | undefined {
+					return undefined;
+				}
+				getEdgeStore(): undefined {
+					return undefined;
+				}
 			}
-			getHistory(): ThoughtData[] {
-				return [];
-			}
-			getHistoryLength(): number {
-				return 0;
-			}
-			getBranches(): Record<BranchId, ThoughtData[]> {
-				return {};
-			}
-			getBranchIds(): BranchId[] {
-				return [];
-			}
-			registerBranch(): void {}
-			branchExists(): boolean {
-				return false;
-			}
-			clear(): void {}
-			getAvailableMcpTools(): string[] | undefined {
-				return undefined;
-			}
-			getAvailableSkills(): string[] | undefined {
-				return undefined;
-			}
-			getEdgeStore(): undefined {
-				return undefined;
-			}
-		}
 
 			const throwingHistory = new ThrowingHistoryManager();
-			const throwingProcessor = new ThoughtProcessor(throwingHistory, formatter, new ThoughtEvaluator(), logger);
+			const throwingProcessor = new ThoughtProcessor(
+				throwingHistory,
+				formatter,
+				new ThoughtEvaluator(),
+				logger
+			);
 
 			const input: ThoughtData = {
 				thought: 'Test thought',
@@ -450,7 +470,11 @@ describe('ThoughtProcessor', () => {
 		});
 
 		it('should use NullLogger as default when no logger provided', async () => {
-			const processorWithoutLogger = new ThoughtProcessor(mockHistory, formatter, new ThoughtEvaluator());
+			const processorWithoutLogger = new ThoughtProcessor(
+				mockHistory,
+				formatter,
+				new ThoughtEvaluator()
+			);
 
 			const input: ThoughtData = {
 				thought: 'Test thought',
@@ -629,7 +653,6 @@ describe('ThoughtProcessor', () => {
 			expect(typeof parsed.reasoning_stats.average_quality_score).toBe('number');
 			expect(typeof parsed.reasoning_stats.average_confidence).toBe('number');
 		});
-
 
 		it('should produce reasoning fields with standard input', async () => {
 			const input = createTestThought();
@@ -1077,6 +1100,60 @@ describe('ThoughtProcessor', () => {
 	});
 
 	describe('cross-field reference validation', () => {
+		it('rejects a dangling scalar reference before branch registration', async () => {
+			const result = await processor.process({
+				thought: 'Strict scalar reference',
+				thought_number: 1,
+				total_thoughts: 1,
+				next_thought_needed: false,
+				verification_target: 1,
+				register_branch_id: 'future',
+			});
+
+			expect(result).toMatchObject({ isError: true });
+			expect(JSON.parse(result.content[0]!.text)).toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 'failed',
+			});
+			expect(mockHistory.getBranchIds()).toEqual([]);
+		});
+
+		it('rejects dangling thought-list references before branch registration', async () => {
+			const result = await processor.process({
+				thought: 'Strict list reference',
+				thought_number: 1,
+				total_thoughts: 1,
+				next_thought_needed: false,
+				synthesis_sources: [1],
+				register_branch_id: 'future',
+			});
+
+			expect(result).toMatchObject({ isError: true });
+			expect(JSON.parse(result.content[0]!.text)).toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 'failed',
+			});
+			expect(mockHistory.getBranchIds()).toEqual([]);
+		});
+
+		it('rejects dangling branch references before branch registration', async () => {
+			const result = await processor.process({
+				thought: 'Strict branch reference',
+				thought_number: 1,
+				total_thoughts: 1,
+				next_thought_needed: false,
+				merge_branch_ids: [asBranchId('missing')],
+				register_branch_id: 'future',
+			});
+
+			expect(result).toMatchObject({ isError: true });
+			expect(JSON.parse(result.content[0]!.text)).toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 'failed',
+			});
+			expect(mockHistory.getBranchIds()).toEqual([]);
+		});
+
 		it('should drop verification_target referencing non-existent thought', async () => {
 			// Seed 3 thoughts into history
 			for (let i = 1; i <= 3; i++) {
@@ -1246,13 +1323,20 @@ describe('ThoughtProcessor', () => {
 	describe('thought_number > total_thoughts auto-adjust warning', () => {
 		it('should log warning and include in response when auto-adjusting total_thoughts', async () => {
 			const mockHistoryManager = new MockHistoryManager();
-			const mockLogger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), setLevel: vi.fn(), getLevel: vi.fn() } as Logger;
+			const mockLogger = {
+				warn: vi.fn(),
+				info: vi.fn(),
+				error: vi.fn(),
+				debug: vi.fn(),
+				setLevel: vi.fn(),
+				getLevel: vi.fn(),
+			} as Logger;
 
 			const proc = new ThoughtProcessor(
 				mockHistoryManager,
 				new ThoughtFormatter(),
 				new ThoughtEvaluator(),
-				mockLogger,
+				mockLogger
 			);
 
 			const result = await proc.process({
@@ -1273,26 +1357,35 @@ describe('ThoughtProcessor', () => {
 					thought_number: 99,
 					original_total_thoughts: 3,
 					adjusted_total_thoughts: 99,
-				}),
+				})
 			);
 
 			// Verify warning in response
 			expect(response.warnings).toEqual(
 				expect.arrayContaining([
-					expect.stringContaining('[TOTAL_THOUGHTS_ADJUSTED] Auto-adjusted total_thoughts from 3 to 99'),
-				]),
+					expect.stringContaining(
+						'[TOTAL_THOUGHTS_ADJUSTED] Auto-adjusted total_thoughts from 3 to 99'
+					),
+				])
 			);
 		});
 
 		it('should not warn when thought_number <= total_thoughts', async () => {
 			const mockHistoryManager = new MockHistoryManager();
-			const mockLogger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), setLevel: vi.fn(), getLevel: vi.fn() } as Logger;
+			const mockLogger = {
+				warn: vi.fn(),
+				info: vi.fn(),
+				error: vi.fn(),
+				debug: vi.fn(),
+				setLevel: vi.fn(),
+				getLevel: vi.fn(),
+			} as Logger;
 
 			const proc = new ThoughtProcessor(
 				mockHistoryManager,
 				new ThoughtFormatter(),
 				new ThoughtEvaluator(),
-				mockLogger,
+				mockLogger
 			);
 
 			const result = await proc.process({
@@ -1308,7 +1401,7 @@ describe('ThoughtProcessor', () => {
 			// No auto-adjust warning
 			expect(mockLogger.warn).not.toHaveBeenCalledWith(
 				'Auto-adjusted total_thoughts to match thought_number',
-				expect.anything(),
+				expect.anything()
 			);
 
 			// No warnings in response (unless cross-field validation adds some)
@@ -1381,10 +1474,10 @@ describe('ThoughtProcessor', () => {
 			expect(spy).toHaveBeenCalledWith('sess-d');
 		});
 
-		it('passes session_id to historyManager.getAvailableMcpTools()', async () => {
+		it('uses a non-mutating session snapshot for cached MCP tools', async () => {
 			const mockHM = new MockHistoryManager();
 			const proc = new ThoughtProcessor(mockHM, formatter, new ThoughtEvaluator(), logger);
-			const spy = vi.spyOn(mockHM, 'getAvailableMcpTools');
+			const spy = vi.spyOn(mockHM, 'inspectSession');
 
 			await proc.process({
 				thought: 'Test',
@@ -1397,10 +1490,10 @@ describe('ThoughtProcessor', () => {
 			expect(spy).toHaveBeenCalledWith('sess-e');
 		});
 
-		it('passes session_id to historyManager.getAvailableSkills()', async () => {
+		it('uses a non-mutating session snapshot for cached skills', async () => {
 			const mockHM = new MockHistoryManager();
 			const proc = new ThoughtProcessor(mockHM, formatter, new ThoughtEvaluator(), logger);
-			const spy = vi.spyOn(mockHM, 'getAvailableSkills');
+			const spy = vi.spyOn(mockHM, 'inspectSession');
 
 			await proc.process({
 				thought: 'Test',
@@ -1469,9 +1562,101 @@ describe('ThoughtProcessor', () => {
 	});
 
 	describe('reset_state', () => {
-		it('calls historyManager.clear(sessionId) when reset_state is true', async () => {
+		it('delegates a direct reset without a session lock', async () => {
 			const mockHM = new MockHistoryManager();
-			const spy = vi.spyOn(mockHM, 'clear');
+			const resetSpy = vi.spyOn(mockHM, 'resetSession');
+			const proc = new ThoughtProcessor(mockHM, formatter, new ThoughtEvaluator(), logger);
+
+			await proc.resetSession('direct-reset');
+
+			expect(resetSpy).toHaveBeenCalledWith('direct-reset', expect.any(Function));
+		});
+
+		it('delegates a direct reset while holding the shared session lock', async () => {
+			const mockHM = new MockHistoryManager();
+			const resetSpy = vi.spyOn(mockHM, 'resetSession');
+			const proc = new ThoughtProcessor(
+				mockHM,
+				formatter,
+				new ThoughtEvaluator(),
+				logger,
+				new SequentialStrategy(),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				new SessionLock()
+			);
+
+			await proc.resetSession('locked-reset');
+
+			expect(resetSpy).toHaveBeenCalledWith('locked-reset', expect.any(Function));
+		});
+
+		it('validates identity and full input before reset or branch registration', async () => {
+			const mockHM = new MockHistoryManager();
+			const resetSpy = vi.spyOn(mockHM, 'resetSession');
+			const registrationSpy = vi.spyOn(mockHM, 'registerBranch');
+			const proc = new ThoughtProcessor(mockHM, formatter, new ThoughtEvaluator(), logger);
+			const malformed = {
+				thought: 'must not reset',
+				thought_number: 1,
+				total_thoughts: 1,
+				next_thought_needed: false,
+				session_id: 'bad/session',
+				reset_state: true,
+				register_branch_id: 'future',
+			};
+			const invalidContent = {
+				...malformed,
+				session_id: 'valid-session',
+				thought_number: 0,
+			};
+
+			const malformedResult = await proc.process(malformed as unknown as ThoughtData);
+			const invalidResult = await proc.process(invalidContent as unknown as ThoughtData);
+
+			expect(malformedResult).toMatchObject({ isError: true });
+			expect(invalidResult).toMatchObject({ isError: true });
+			expect(resetSpy).not.toHaveBeenCalled();
+			expect(registrationSpy).not.toHaveBeenCalled();
+			expect(mockHM.getHistoryLength()).toBe(0);
+		});
+
+		it('awaits reset then registers the branch before admitting the replacement', async () => {
+			const events: string[] = [];
+			const mockHM = new MockHistoryManager();
+			vi.spyOn(mockHM, 'resetSession').mockImplementation(async (sessionId) => {
+				events.push(`reset:${sessionId}`);
+			});
+			vi.spyOn(mockHM, 'registerBranch').mockImplementation((sessionId, branchId) => {
+				events.push(`register:${sessionId}:${branchId}`);
+			});
+			vi.spyOn(mockHM, 'addThought').mockImplementation((thought) => {
+				events.push(`add:${thought.session_id}:${thought.thought}`);
+			});
+			const proc = new ThoughtProcessor(mockHM, formatter, new ThoughtEvaluator(), logger);
+
+			await proc.process({
+				thought: 'replacement',
+				thought_number: 1,
+				total_thoughts: 1,
+				next_thought_needed: false,
+				session_id: asSessionId('ordered'),
+				reset_state: true,
+				register_branch_id: 'future',
+			} as unknown as ThoughtData);
+
+			expect(events).toEqual([
+				'reset:ordered',
+				'register:ordered:future',
+				'add:ordered:replacement',
+			]);
+		});
+
+		it('awaits historyManager.resetSession(sessionId) when reset_state is true', async () => {
+			const mockHM = new MockHistoryManager();
+			const spy = vi.spyOn(mockHM, 'resetSession');
 			const proc = new ThoughtProcessor(mockHM, formatter, new ThoughtEvaluator(), logger);
 
 			await proc.process({
@@ -1483,7 +1668,7 @@ describe('ThoughtProcessor', () => {
 				reset_state: true,
 			});
 
-			expect(spy).toHaveBeenCalledWith('my-session');
+			expect(spy).toHaveBeenCalledWith('my-session', expect.any(Function));
 		});
 
 		it('does not call clear when reset_state is false', async () => {
@@ -1583,7 +1768,12 @@ describe('ThoughtProcessor — uncovered branches', () => {
 			// 3+ decreasing confidence triggers confidence_drift (warning)
 			// We need at least 4 different warning patterns to hit the break.
 			// Let's use a longer history to trigger multiple distinct warning patterns.
-			const proc = new ThoughtProcessor(new MockHistoryManager(), formatter, new ThoughtEvaluator(), logger);
+			const proc = new ThoughtProcessor(
+				new MockHistoryManager(),
+				formatter,
+				new ThoughtEvaluator(),
+				logger
+			);
 
 			// First, seed 12 consecutive 'regular' thoughts with decreasing confidence
 			// This should trigger:
@@ -1623,23 +1813,56 @@ describe('ThoughtProcessor — uncovered branches', () => {
 			// Create a HistoryManager that throws a non-Error value
 			class StringThrowingHistoryManager implements IHistoryManager {
 				addThought(): void {
-					throw 'string failure';  
+					throw 'string failure';
 				}
-				getHistory(): ThoughtData[] { return []; }
-				getHistoryLength(): number { return 0; }
-				getBranches(): Record<BranchId, ThoughtData[]> { return {}; }
-				getBranchIds(): BranchId[] { return []; }
+				getHistory(): ThoughtData[] {
+					return [];
+				}
+				getHistoryLength(): number {
+					return 0;
+				}
+				getBranches(): Record<BranchId, ThoughtData[]> {
+					return {};
+				}
+				getBranchIds(): BranchId[] {
+					return [];
+				}
 				registerBranch(): void {}
-				branchExists(): boolean { return false; }
+				branchExists(): boolean {
+					return false;
+				}
 				clear(): void {}
-				getAvailableMcpTools(): string[] | undefined { return undefined; }
-				getAvailableSkills(): string[] | undefined { return undefined; }
-				getEdgeStore(): undefined { return undefined; }
+				async resetSession(): Promise<void> {}
+				async resetAll(): Promise<void> {}
+				inspectSession(): HistorySessionSnapshot {
+					return {
+						history: [],
+						branches: {},
+						branchIds: [],
+						availableMcpTools: undefined,
+						availableSkills: undefined,
+					};
+				}
+				getSessionIds(): string[] {
+					return [];
+				}
+				getAvailableMcpTools(): string[] | undefined {
+					return undefined;
+				}
+				getAvailableSkills(): string[] | undefined {
+					return undefined;
+				}
+				getEdgeStore(): undefined {
+					return undefined;
+				}
 			}
 
 			const throwingHistory = new StringThrowingHistoryManager();
 			const throwingProcessor = new ThoughtProcessor(
-				throwingHistory, formatter, new ThoughtEvaluator(), logger
+				throwingHistory,
+				formatter,
+				new ThoughtEvaluator(),
+				logger
 			);
 
 			const result = await throwingProcessor.process({
