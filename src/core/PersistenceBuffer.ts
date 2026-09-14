@@ -4,11 +4,17 @@
  * @module PersistenceBuffer
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 import type { PersistenceBackend } from '../contracts/PersistenceBackend.js';
 import type { IEdgeStore } from '../contracts/interfaces.js';
 import type { BranchId, SessionId } from '../contracts/ids.js';
-import type { PersistenceWorkToken } from '../contracts/persistence-work.js';
-import { PersistenceDrainError } from '../errors.js';
+import type { PersistenceWork, PersistenceWorkToken } from '../contracts/persistence-work.js';
+import {
+	PersistenceDrainError,
+	PersistenceSessionAdmissionClosedError,
+	PersistenceSessionBarrierReentrancyError,
+} from '../errors.js';
 import { NullLogger } from '../logger/NullLogger.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import { assertNever } from '../utils.js';
@@ -55,6 +61,13 @@ type ActiveDrain = {
 	readonly selectedTokens: Set<PersistenceWorkToken>;
 	mode: PersistenceSelectionMode;
 	backgroundObserved: boolean;
+	inFlightWork: PersistenceWork | null;
+	settlement: DrainSettlement | null;
+};
+
+type SessionBarrierState = {
+	tail: Promise<void>;
+	pendingOwners: number;
 };
 
 type DrainTermination =
@@ -62,6 +75,11 @@ type DrainTermination =
 
 type DrainSettlement =
 	{ readonly kind: 'resolved' } | { readonly kind: 'rejected'; readonly reason: unknown };
+
+type SessionQuiescence =
+	| { readonly kind: 'pending' }
+	| { readonly kind: 'resolved' }
+	| { readonly kind: 'rejected'; readonly reason: unknown };
 
 /**
  * Coordinates one globally joinable persistence generation at a time.
@@ -80,6 +98,9 @@ export class PersistenceBuffer<S extends BufferedSession> {
 
 	private _flushTimer: ReturnType<typeof setInterval> | null = null;
 	private _activeDrain: ActiveDrain | null = null;
+	private readonly _sessionBarriers = new Map<SessionId, SessionBarrierState>();
+	private readonly _sessionBarrierOwnership = new AsyncLocalStorage<ReadonlySet<SessionId>>();
+	private readonly _sessionProgressWaiters = new Map<SessionId, Set<() => void>>();
 
 	/**
 	 * Creates a persistence-drain coordinator.
@@ -135,6 +156,9 @@ export class PersistenceBuffer<S extends BufferedSession> {
 	public bufferThought(sessionId: SessionId, thought: ThoughtData): void;
 	public bufferThought(session: BufferedSession, thought: ThoughtData): void;
 	public bufferThought(source: SessionId | BufferedSession, thought: ThoughtData): void {
+		const sessionId =
+			typeof source === 'string' ? source : (thought.session_id ?? this._defaultSessionId);
+		this._assertSessionAdmissionOpen(sessionId);
 		if (this._queue.pendingThoughtCount >= this._bufferSize && this.isFlushing) {
 			this._logger.info('Write buffer full and flush in progress, applying backpressure', {
 				bufferSize: this._queue.pendingThoughtCount,
@@ -142,8 +166,6 @@ export class PersistenceBuffer<S extends BufferedSession> {
 			});
 		}
 
-		const sessionId =
-			typeof source === 'string' ? source : (thought.session_id ?? this._defaultSessionId);
 		this._queue.enqueueThought(sessionId, thought);
 		if (this._queue.pendingThoughtCount >= this._bufferSize) this._triggerBackgroundDrain();
 	}
@@ -160,6 +182,7 @@ export class PersistenceBuffer<S extends BufferedSession> {
 		branchId: BranchId,
 		thoughts: readonly ThoughtData[]
 	): void {
+		this._assertSessionAdmissionOpen(sessionId);
 		this._queue.replaceBranch(sessionId, branchId, thoughts);
 	}
 
@@ -170,6 +193,7 @@ export class PersistenceBuffer<S extends BufferedSession> {
 	 * @param edges - Edge snapshot copied by the queue.
 	 */
 	public bufferEdges(sessionId: SessionId, edges: readonly Edge[]): void {
+		this._assertSessionAdmissionOpen(sessionId);
 		this._queue.replaceEdges(sessionId, edges);
 	}
 
@@ -180,6 +204,7 @@ export class PersistenceBuffer<S extends BufferedSession> {
 	 * @param summaries - Summary snapshot copied by the queue.
 	 */
 	public bufferSummaries(sessionId: SessionId, summaries: readonly Summary[]): void {
+		this._assertSessionAdmissionOpen(sessionId);
 		this._queue.replaceSummaries(sessionId, summaries);
 	}
 
@@ -215,6 +240,8 @@ export class PersistenceBuffer<S extends BufferedSession> {
 
 	/**
 	 * Joins the global explicit generation and projects its terminal failures to one session.
+	 * This method does not close admission; lifecycle owners must use
+	 * {@link withSessionBarrier} when work must not cross an owner callback.
 	 *
 	 * @param sessionId - Session whose accepted writes form the barrier projection.
 	 * @returns A promise that rejects only for that session's failures or an unknown fault.
@@ -226,6 +253,60 @@ export class PersistenceBuffer<S extends BufferedSession> {
 			const failures = reason.failures.filter((failure) => failure.sessionId === sessionId);
 			if (failures.length > 0) throw new PersistenceDrainError(failures);
 		});
+	}
+
+	/**
+	 * Runs one lifecycle operation while persistence admission is closed for a session.
+	 *
+	 * Admission closes synchronously when this method is called. Already accepted work for
+	 * the session is settled first; an exhausted session failure rejects without invoking
+	 * `operation`. Concurrent calls for the same session execute in FIFO call order and keep
+	 * admission closed until the final callback settles. Other sessions remain admissible and
+	 * may be owned by a nested callback. Reacquiring the same session from the owning callback's
+	 * async call chain rejects before joining the FIFO because awaiting it would deadlock its owner.
+	 *
+	 * @example
+	 * ```ts
+	 * await buffer.withSessionBarrier(sessionId, async () => {
+	 *   await persistence.clearSession(sessionId);
+	 * });
+	 * ```
+	 *
+	 * @param sessionId - Session exclusively owned for the callback duration.
+	 * @param operation - Awaited lifecycle operation run only after prior work settles.
+	 * @returns The callback result after admission has reopened when no owner remains.
+	 * @throws {@link PersistenceSessionBarrierReentrancyError} when the owning async call chain
+	 * attempts to reacquire `sessionId`.
+	 */
+	public withSessionBarrier<T>(sessionId: SessionId, operation: () => Promise<T>): Promise<T> {
+		const currentOwnership = this._sessionBarrierOwnership.getStore();
+		if (currentOwnership?.has(sessionId) === true) {
+			return Promise.reject(new PersistenceSessionBarrierReentrancyError(sessionId));
+		}
+		const operationOwnership = new Set(currentOwnership);
+		operationOwnership.add(sessionId);
+
+		const state = this._sessionBarriers.get(sessionId) ?? {
+			tail: Promise.resolve(),
+			pendingOwners: 0,
+		};
+		this._sessionBarriers.set(sessionId, state);
+		state.pendingOwners += 1;
+
+		const result = state.tail.then(async () => {
+			try {
+				await this._awaitSessionQuiescence(sessionId);
+				return await this._sessionBarrierOwnership.run(operationOwnership, operation);
+			} finally {
+				state.pendingOwners -= 1;
+				if (state.pendingOwners === 0) this._sessionBarriers.delete(sessionId);
+			}
+		});
+		state.tail = result.then(
+			() => undefined,
+			() => undefined
+		);
+		return result;
 	}
 
 	private _joinOrStart(mode: PersistenceSelectionMode): ActiveDrain {
@@ -248,6 +329,8 @@ export class PersistenceBuffer<S extends BufferedSession> {
 			selectedTokens: new Set<PersistenceWorkToken>(),
 			mode,
 			backgroundObserved: false,
+			inFlightWork: null,
+			settlement: null,
 		};
 		this._activeDrain = generation;
 		void this._runDrain(generation).catch((fault: unknown) => {
@@ -271,9 +354,12 @@ export class PersistenceBuffer<S extends BufferedSession> {
 				return;
 			}
 
+			generation.inFlightWork = work;
 			const result = await this._writer.write(work);
 			if (result === true) this._queue.acknowledgeSuccess(work);
 			else this._queue.acknowledgeFailure(work, result);
+			generation.inFlightWork = null;
+			this._notifySessionProgress();
 		}
 	}
 
@@ -293,10 +379,13 @@ export class PersistenceBuffer<S extends BufferedSession> {
 				settlement = { kind: 'rejected', reason: termination.fault };
 				break;
 			default:
-				return assertNever(termination);
+				assertNever(termination);
 		}
 
+		generation.inFlightWork = null;
+		generation.settlement = settlement;
 		this._activeDrain = null;
+		this._notifySessionProgress();
 		switch (settlement.kind) {
 			case 'resolved':
 				generation.resolve();
@@ -308,7 +397,65 @@ export class PersistenceBuffer<S extends BufferedSession> {
 				}
 				return;
 			default:
-				return assertNever(settlement);
+				assertNever(settlement);
+		}
+	}
+
+	private async _awaitSessionQuiescence(sessionId: SessionId): Promise<void> {
+		const generation = this._joinOrStart('explicit');
+		void generation.promise.catch(() => undefined);
+		while (true) {
+			const quiescence = this._sessionQuiescence(generation, sessionId);
+			switch (quiescence.kind) {
+				case 'pending':
+					await this._waitForSessionProgress(sessionId);
+					break;
+				case 'resolved':
+					return;
+				case 'rejected':
+					throw quiescence.reason;
+				default:
+					return assertNever(quiescence);
+			}
+		}
+	}
+
+	private _sessionQuiescence(generation: ActiveDrain, sessionId: SessionId): SessionQuiescence {
+		if (
+			generation.settlement?.kind === 'rejected' &&
+			!(generation.settlement.reason instanceof PersistenceDrainError)
+		) {
+			return { kind: 'rejected', reason: generation.settlement.reason };
+		}
+		if (generation.inFlightWork?.sessionId === sessionId) return { kind: 'pending' };
+		if (this._queue.hasEligibleWork(generation.selectedTokens, generation.mode, sessionId)) {
+			return { kind: 'pending' };
+		}
+
+		const failures = this._queue.currentFailures(generation.selectedTokens, sessionId);
+		return failures.length === 0
+			? { kind: 'resolved' }
+			: { kind: 'rejected', reason: new PersistenceDrainError(failures) };
+	}
+
+	private _waitForSessionProgress(sessionId: SessionId): Promise<void> {
+		return new Promise((resolve) => {
+			const waiters = this._sessionProgressWaiters.get(sessionId) ?? new Set<() => void>();
+			waiters.add(resolve);
+			this._sessionProgressWaiters.set(sessionId, waiters);
+		});
+	}
+
+	private _notifySessionProgress(): void {
+		for (const [sessionId, waiters] of this._sessionProgressWaiters) {
+			this._sessionProgressWaiters.delete(sessionId);
+			for (const resolve of waiters) resolve();
+		}
+	}
+
+	private _assertSessionAdmissionOpen(sessionId: SessionId): void {
+		if (this._sessionBarriers.has(sessionId)) {
+			throw new PersistenceSessionAdmissionClosedError(sessionId);
 		}
 	}
 

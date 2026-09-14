@@ -25,6 +25,7 @@ import {
 import { PersistenceWorkQueue } from '../../core/PersistenceWorkQueue.js';
 import { PersistenceWriter, type PersistenceDelay } from '../../core/PersistenceWriter.js';
 import type { ThoughtData } from '../../core/thought.js';
+import { PersistenceSessionBarrierReentrancyError } from '../../errors.js';
 import { createTestThought } from '../helpers/factories.js';
 
 interface Deferred {
@@ -942,6 +943,321 @@ describe('PersistenceBuffer session-filtered barriers', () => {
 		// Then
 		expect(ranBeforeRelease).toBe(false);
 		expect(continuationRan).toBe(true);
+	});
+});
+
+describe('PersistenceBuffer exclusive session lifecycle barrier', () => {
+	it('closes A admission synchronously, waits for prior A, and does not wait for blocked B', async () => {
+		// Given
+		const sessionA = asSessionId('barrier-session-a');
+		const sessionB = asSessionId('barrier-session-b');
+		const oldAGate = createDeferred();
+		const blockedBGate = createDeferred();
+		const clearGate = createDeferred();
+		const blockedBStarted = createDeferred();
+		const clearStarted = createDeferred();
+		const events: string[] = [];
+		const persistence = new RecordingPersistence({
+			thought: async ({ thought }) => {
+				events.push(`${thought.id}:start`);
+				if (thought.id === asThoughtId('barrier-session-a-thought-1')) await oldAGate.promise;
+				if (thought.id === asThoughtId('barrier-session-b-thought-1')) {
+					blockedBStarted.resolve();
+					await blockedBGate.promise;
+				}
+				events.push(`${thought.id}:complete`);
+			},
+		});
+		const harness = createHarness({ persistence });
+		acceptThought(harness, sessionA, 1);
+		const globalDrain = settle(drain(harness.buffer));
+		await flushMicrotasks();
+
+		// When
+		const barrier = harness.buffer.withSessionBarrier(sessionA, async () => {
+			events.push('clear:start');
+			clearStarted.resolve();
+			await clearGate.promise;
+			events.push('clear:complete');
+			return 'cleared';
+		});
+		const barrierSettled = settlementProbe(barrier.then(() => undefined));
+		let closedAdmissionError: unknown;
+		try {
+			acceptThought(harness, sessionA, 2);
+		} catch (error) {
+			closedAdmissionError = error;
+		}
+		acceptThought(harness, sessionB, 1);
+		await flushMicrotasks();
+
+		// Then
+		try {
+			expect(closedAdmissionError).toMatchObject({
+				name: 'PersistenceSessionAdmissionClosedError',
+				sessionId: sessionA,
+			});
+			expect([...events]).toEqual(['barrier-session-a-thought-1:start']);
+			expect(barrierSettled()).toBe(false);
+
+			oldAGate.resolve();
+			await Promise.all([blockedBStarted.promise, clearStarted.promise]);
+			expect([...events]).toEqual([
+				'barrier-session-a-thought-1:start',
+				'barrier-session-a-thought-1:complete',
+				'barrier-session-b-thought-1:start',
+				'clear:start',
+			]);
+			expect(barrierSettled()).toBe(false);
+
+			const blockedAdmissions = [
+				() => acceptThought(harness, sessionA, 3),
+				() =>
+					acceptBranch(harness.buffer, sessionA, asBranchId('blocked-branch'), [
+						createTestThought({ session_id: sessionA }),
+					]),
+				() => acceptEdges(harness, sessionA, [edge(sessionA, 'blocked-edge', 1)]),
+				() => acceptSummaries(harness.buffer, sessionA, [summary(sessionA, 'blocked-summary')]),
+			];
+			const callbackAdmissionErrors: unknown[] = [];
+			for (const admission of blockedAdmissions) {
+				try {
+					admission();
+				} catch (error) {
+					callbackAdmissionErrors.push(error);
+				}
+			}
+			expect(callbackAdmissionErrors).toHaveLength(4);
+			for (const error of callbackAdmissionErrors) {
+				expect(error).toMatchObject({
+					name: 'PersistenceSessionAdmissionClosedError',
+					sessionId: sessionA,
+				});
+			}
+
+			clearGate.resolve();
+			expect(await barrier).toBe('cleared');
+			await flushMicrotasks();
+			expect(barrierSettled()).toBe(true);
+			acceptThought(harness, sessionA, 4);
+		} finally {
+			oldAGate.resolve();
+			clearGate.resolve();
+			blockedBGate.resolve();
+		}
+		const globalOutcome = await globalDrain;
+
+		// Then
+		expect(globalOutcome).toEqual({ status: 'fulfilled' });
+		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([
+			1, 1, 4,
+		]);
+	});
+
+	it('rejects completion-triggered stale A admission while the callback owns A', async () => {
+		// Given
+		const sessionA = asSessionId('completion-race-a');
+		const oldGate = createDeferred();
+		const persistence = new RecordingPersistence({ thought: async () => oldGate.promise });
+		const harness = createHarness({ persistence });
+		acceptThought(harness, sessionA, 1);
+		const globalDrain = drain(harness.buffer);
+		await flushMicrotasks();
+		let racingAdmissionError: unknown;
+
+		// When
+		const barrier = harness.buffer.withSessionBarrier(sessionA, async () => {
+			await Promise.resolve();
+		});
+		void globalDrain.then(() => {
+			try {
+				acceptThought(harness, sessionA, 2);
+			} catch (error) {
+				racingAdmissionError = error;
+			}
+		});
+		oldGate.resolve();
+		await Promise.all([globalDrain, barrier]);
+
+		// Then
+		expect(racingAdmissionError).toMatchObject({
+			name: 'PersistenceSessionAdmissionClosedError',
+			sessionId: sessionA,
+		});
+		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([1]);
+	});
+
+	it('rejects on exhausted prior A work without running the lifecycle callback', async () => {
+		// Given
+		const sessionA = asSessionId('barrier-failure-a');
+		const failure = new ExpectedWriteError('A cannot settle');
+		const persistence = new RecordingPersistence({
+			thought: async () => {
+				throw failure;
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		acceptThought(harness, sessionA, 1);
+		let callbackCount = 0;
+
+		// When
+		const outcome = await settle(
+			harness.buffer.withSessionBarrier(sessionA, async () => {
+				callbackCount += 1;
+			})
+		);
+
+		// Then
+		expect(outcome).toMatchObject({
+			status: 'rejected',
+			reason: {
+				name: 'PersistenceDrainError',
+				failures: [{ sessionId: sessionA, attempts: 1, cause: failure }],
+			},
+		});
+		expect(callbackCount).toBe(0);
+	});
+
+	it('serializes repeated A barriers in call order without duplicate accepted writes', async () => {
+		// Given
+		const sessionA = asSessionId('serialized-barrier-a');
+		const firstGate = createDeferred();
+		const secondGate = createDeferred();
+		const firstStarted = createDeferred();
+		const secondStarted = createDeferred();
+		const events: string[] = [];
+		const persistence = new RecordingPersistence();
+		const harness = createHarness({ persistence });
+		acceptThought(harness, sessionA, 1);
+
+		// When
+		const first = harness.buffer.withSessionBarrier(sessionA, async () => {
+			events.push('first:start');
+			firstStarted.resolve();
+			await firstGate.promise;
+			events.push('first:complete');
+			return 1;
+		});
+		const second = harness.buffer.withSessionBarrier(sessionA, async () => {
+			events.push('second:start');
+			secondStarted.resolve();
+			await secondGate.promise;
+			events.push('second:complete');
+			return 2;
+		});
+		await firstStarted.promise;
+
+		// Then
+		try {
+			expect([...events]).toEqual(['first:start']);
+			let closedAdmissionError: unknown;
+			try {
+				acceptThought(harness, sessionA, 2);
+			} catch (error) {
+				closedAdmissionError = error;
+			}
+			expect(closedAdmissionError).toMatchObject({
+				name: 'PersistenceSessionAdmissionClosedError',
+				sessionId: sessionA,
+			});
+
+			firstGate.resolve();
+			expect(await first).toBe(1);
+			await secondStarted.promise;
+			expect([...events]).toEqual(['first:start', 'first:complete', 'second:start']);
+
+			secondGate.resolve();
+			expect(await second).toBe(2);
+			acceptThought(harness, sessionA, 3);
+			await drain(harness.buffer);
+		} finally {
+			firstGate.resolve();
+			secondGate.resolve();
+		}
+
+		// Then
+		expect(events).toEqual(['first:start', 'first:complete', 'second:start', 'second:complete']);
+		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([1, 3]);
+	});
+
+	it('rejects awaited same-chain A reentrancy without disturbing external A FIFO or nested B', async () => {
+		// Given
+		const sessionA = asSessionId('reentrant-barrier-a');
+		const sessionB = asSessionId('reentrant-barrier-b');
+		const nestedAttempted = createDeferred();
+		const externalStarted = createDeferred();
+		const externalRelease = createDeferred();
+		const events: string[] = [];
+		const persistence = new RecordingPersistence();
+		const harness = createHarness({ persistence });
+		let nestedCallbackEntered = false;
+		let nestedError: unknown;
+		let nestedSettled = false;
+
+		// When
+		const outer = harness.buffer.withSessionBarrier(sessionA, async () => {
+			events.push('outer-a:start');
+			await harness.buffer.withSessionBarrier(sessionB, async () => {
+				events.push('nested-b:start');
+				events.push('nested-b:complete');
+			});
+			const nested = harness.buffer.withSessionBarrier(sessionA, async () => {
+				nestedCallbackEntered = true;
+			});
+			nestedAttempted.resolve();
+			try {
+				await nested;
+			} catch (error) {
+				nestedError = error;
+				events.push('nested-a:rejected');
+			} finally {
+				nestedSettled = true;
+			}
+			events.push('outer-a:complete');
+		});
+		const external = harness.buffer.withSessionBarrier(sessionA, async () => {
+			events.push('external-a:start');
+			externalStarted.resolve();
+			await externalRelease.promise;
+			events.push('external-a:complete');
+		});
+		const outerOutcome = settle(outer);
+		const externalOutcome = settle(external);
+		await nestedAttempted.promise;
+		await flushMicrotasks();
+
+		// Then
+		expect(nestedSettled).toBe(true);
+		expect(nestedCallbackEntered).toBe(false);
+		expect(nestedError).toBeInstanceOf(PersistenceSessionBarrierReentrancyError);
+		expect(nestedError).toMatchObject({
+			name: 'PersistenceSessionBarrierReentrancyError',
+			code: 'PERSISTENCE_SESSION_BARRIER_REENTRANCY',
+			sessionId: sessionA,
+			message: `Persistence lifecycle barrier for session '${sessionA}' is not reentrant`,
+		});
+		await externalStarted.promise;
+		expect(events).toEqual([
+			'outer-a:start',
+			'nested-b:start',
+			'nested-b:complete',
+			'nested-a:rejected',
+			'outer-a:complete',
+			'external-a:start',
+		]);
+		expect(() => acceptThought(harness, sessionA, 1)).toThrow(
+			expect.objectContaining({ name: 'PersistenceSessionAdmissionClosedError' })
+		);
+
+		externalRelease.resolve();
+		expect(await Promise.all([outerOutcome, externalOutcome])).toEqual([
+			{ status: 'fulfilled' },
+			{ status: 'fulfilled' },
+		]);
+		acceptThought(harness, sessionA, 2);
+		await drain(harness.buffer);
+		expect(events.at(-1)).toBe('external-a:complete');
+		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([2]);
 	});
 });
 
