@@ -25,6 +25,9 @@ declare module 'better-sqlite3' {
 		lastInsertRowid: number;
 	}
 
-	const DatabaseCtor: new (path: string) => Database;
+	const DatabaseCtor: new (
+		path: string,
+		options?: { readonly readonly?: boolean; readonly fileMustExist?: boolean }
+	) => Database;
 	export default DatabaseCtor;
 }

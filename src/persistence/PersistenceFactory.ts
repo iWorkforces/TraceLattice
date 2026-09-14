@@ -38,7 +38,10 @@ export async function createPersistenceBackend(
 
 		case 'memory': {
 			const { MemoryPersistence } = await import('./MemoryPersistence.js');
-			return new MemoryPersistence();
+			return new MemoryPersistence({
+				maxHistorySize: config.options?.maxHistorySize,
+				persistBranches: config.options?.persistBranches,
+			});
 		}
 
 		default:

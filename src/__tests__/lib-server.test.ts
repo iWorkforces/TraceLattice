@@ -107,13 +107,17 @@ describe('ToolAwareSequentialThinkingServer', () => {
 			expect(mocks.mockToolRegistry.addTool).toHaveBeenCalled();
 		});
 
-		it('should create watchers when enableWatcher is true', () => {
+		it('should create watchers when enableWatcher is true', async () => {
 			const serverWithWatchers = new ToolAwareSequentialThinkingServer({
 				container: mocks.container,
 				enableWatcher: true,
 				autoDiscover: false,
 			});
-			expect(serverWithWatchers).toBeInstanceOf(ToolAwareSequentialThinkingServer);
+			try {
+				expect(serverWithWatchers).toBeInstanceOf(ToolAwareSequentialThinkingServer);
+			} finally {
+				await serverWithWatchers.stop();
+			}
 		});
 
 		it('should not create watchers when enableWatcher is false', () => {
@@ -271,8 +275,12 @@ describe('ToolAwareSequentialThinkingServer', () => {
 describe('createServer', () => {
 	it('should create a server with async initialization', async () => {
 		const server = await createServer({ autoDiscover: false, loadFromPersistence: false });
-		expect(server).toBeInstanceOf(ToolAwareSequentialThinkingServer);
-		expect(server.getContainer()).toBeDefined();
+		try {
+			expect(server).toBeInstanceOf(ToolAwareSequentialThinkingServer);
+			expect(server.getContainer()).toBeDefined();
+		} finally {
+			await server.stop();
+		}
 	});
 
 	it('should create server with all options disabled', async () => {
@@ -281,7 +289,11 @@ describe('createServer', () => {
 			loadFromPersistence: false,
 			lazyDiscovery: true,
 		});
-		expect(server).toBeInstanceOf(ToolAwareSequentialThinkingServer);
+		try {
+			expect(server).toBeInstanceOf(ToolAwareSequentialThinkingServer);
+		} finally {
+			await server.stop();
+		}
 	});
 
 	it('should load from persistence when enabled', async () => {
@@ -289,14 +301,22 @@ describe('createServer', () => {
 			autoDiscover: false,
 			loadFromPersistence: true,
 		});
-		expect(server).toBeInstanceOf(ToolAwareSequentialThinkingServer);
+		try {
+			expect(server).toBeInstanceOf(ToolAwareSequentialThinkingServer);
+		} finally {
+			await server.stop();
+		}
 	});
 });
 
 describe('initializeServer', () => {
 	it('should create and return a server', async () => {
 		const server = await initializeServer();
-		expect(server).toBeInstanceOf(ToolAwareSequentialThinkingServer);
+		try {
+			expect(server).toBeInstanceOf(ToolAwareSequentialThinkingServer);
+		} finally {
+			await server.stop();
+		}
 	});
 });
 

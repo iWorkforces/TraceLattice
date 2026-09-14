@@ -392,7 +392,18 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 			const edgeStore = container.resolve('EdgeStore');
 			const summaryStore = container.resolve('summaryStore');
 			const log = container.resolve('Logger');
-			return new CompressionService({ historyManager, edgeStore, summaryStore, logger: log });
+			return new CompressionService({
+				historyManager,
+				edgeStore,
+				summaryStore,
+				onSummaryCreated: (summary) => {
+					historyManager.bufferSummaries(
+						summary.sessionId,
+						summaryStore.forSession(summary.sessionId)
+					);
+				},
+				logger: log,
+			});
 		});
 
 		// Register ReasoningStrategy as a lazy singleton (selected via feature flag)

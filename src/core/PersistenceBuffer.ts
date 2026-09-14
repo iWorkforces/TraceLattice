@@ -1,23 +1,24 @@
 /**
- * PersistenceBuffer — owns the periodic flush timer, retry/backoff logic, and
- * concurrent-flush guarding for HistoryManager's persistence write buffer.
- *
- * Extracted from HistoryManager. The session Map and write buffers remain
- * owned by HistoryManager (passed by reference) so public access patterns
- * (e.g. `manager._sessions`) are preserved.
+ * Joinable coordinator for attributable persistence work.
  *
  * @module PersistenceBuffer
  */
 
-import type { IEdgeStore } from '../contracts/interfaces.js';
-import type { SessionId } from '../contracts/ids.js';
-import { getErrorMessage } from '../errors.js';
-import type { Logger } from '../logger/StructuredLogger.js';
-import { NullLogger } from '../logger/NullLogger.js';
 import type { PersistenceBackend } from '../contracts/PersistenceBackend.js';
+import type { IEdgeStore } from '../contracts/interfaces.js';
+import type { BranchId, SessionId } from '../contracts/ids.js';
+import type { PersistenceWorkToken } from '../contracts/persistence-work.js';
+import { PersistenceDrainError } from '../errors.js';
+import { NullLogger } from '../logger/NullLogger.js';
+import type { Logger } from '../logger/StructuredLogger.js';
+import { assertNever } from '../utils.js';
+import type { Summary } from './compression/Summary.js';
+import type { Edge } from './graph/Edge.js';
+import { PersistenceWorkQueue, type PersistenceSelectionMode } from './PersistenceWorkQueue.js';
+import { PersistenceWriter, type PersistenceDelay } from './PersistenceWriter.js';
 import type { ThoughtData } from './thought.js';
 
-/** Minimal session view: anything that owns a `writeBuffer`. */
+/** Minimal compatibility view for legacy callers that own a `writeBuffer`. */
 export interface BufferedSession {
 	writeBuffer: ThoughtData[];
 }
@@ -27,243 +28,295 @@ export interface PersistenceEventEmitter {
 	emit(event: 'persistenceError', payload: { operation: string; error: Error }): boolean;
 }
 
-/** Configuration options for PersistenceBuffer. */
+/** Configuration options for {@link PersistenceBuffer}. */
 export interface PersistenceBufferConfig<S extends BufferedSession> {
-	persistence: PersistenceBackend;
-	bufferSize: number;
-	flushInterval: number;
-	maxRetries: number;
-	defaultSessionId: SessionId;
-	/** Returns the live session map (called on each flush). */
-	getSessions: () => Map<SessionId, S>;
-	/** Returns the requeue target session (default-session buffer). */
-	getDefaultSession: () => S;
-	/** Optional EdgeStore for flushing edges alongside thoughts. */
-	edgeStore?: IEdgeStore;
+	readonly persistence: PersistenceBackend;
+	readonly bufferSize: number;
+	readonly flushInterval: number;
+	readonly maxRetries: number;
+	readonly defaultSessionId: SessionId;
+	/** Compatibility-only session source retained until producer wiring is migrated. */
+	readonly getSessions: () => Map<SessionId, S>;
+	/** Compatibility-only default session retained until producer wiring is migrated. */
+	readonly getDefaultSession: () => S;
+	/** Compatibility-only edge source retained until producers register snapshots. */
+	readonly edgeStore?: IEdgeStore;
 	/** Optional emitter for `persistenceError` events. */
-	eventEmitter?: PersistenceEventEmitter | null;
-	logger?: Logger;
+	readonly eventEmitter?: PersistenceEventEmitter | null;
+	readonly logger?: Logger;
+	/** Optional retry scheduler for deterministic coordination and testing. */
+	readonly delay?: PersistenceDelay;
 }
 
+type ActiveDrain = {
+	readonly promise: Promise<void>;
+	readonly resolve: () => void;
+	readonly reject: (reason: unknown) => void;
+	readonly selectedTokens: Set<PersistenceWorkToken>;
+	mode: PersistenceSelectionMode;
+	backgroundObserved: boolean;
+};
+
+type DrainTermination =
+	{ readonly kind: 'result' } | { readonly kind: 'fault'; readonly fault: unknown };
+
+type DrainSettlement =
+	{ readonly kind: 'resolved' } | { readonly kind: 'rejected'; readonly reason: unknown };
+
 /**
- * Manages buffered persistence writes with periodic flushing, exponential
- * backoff retries, concurrent-flush guarding, and edge store integration.
+ * Coordinates one globally joinable persistence generation at a time.
+ *
+ * Accepted work is owned by a queue independent of live session state. Explicit
+ * callers can join and upgrade a background generation without starting another writer.
  */
 export class PersistenceBuffer<S extends BufferedSession> {
-	private readonly _persistence: PersistenceBackend;
 	private readonly _bufferSize: number;
 	private readonly _flushInterval: number;
-	private readonly _maxRetries: number;
 	private readonly _defaultSessionId: SessionId;
-	private readonly _getSessions: () => Map<SessionId, S>;
-	private readonly _getDefaultSession: () => S;
-	private readonly _edgeStore?: IEdgeStore;
+	private readonly _queue = new PersistenceWorkQueue();
+	private readonly _writer: PersistenceWriter;
 	private _eventEmitter: PersistenceEventEmitter | null;
 	private readonly _logger: Logger;
 
 	private _flushTimer: ReturnType<typeof setInterval> | null = null;
-	private _isFlushing = false;
-	private _flushRetryCount = 0;
+	private _activeDrain: ActiveDrain | null = null;
 
-	constructor(config: PersistenceBufferConfig<S>) {
-		this._persistence = config.persistence;
+	/**
+	 * Creates a persistence-drain coordinator.
+	 *
+	 * @param config - Persistence dependencies, trigger thresholds, and retry policy.
+	 */
+	public constructor(config: PersistenceBufferConfig<S>) {
 		this._bufferSize = config.bufferSize;
 		this._flushInterval = config.flushInterval;
-		this._maxRetries = config.maxRetries;
 		this._defaultSessionId = config.defaultSessionId;
-		this._getSessions = config.getSessions;
-		this._getDefaultSession = config.getDefaultSession;
-		this._edgeStore = config.edgeStore;
 		this._eventEmitter = config.eventEmitter ?? null;
 		this._logger = config.logger ?? new NullLogger();
+		this._writer = new PersistenceWriter({
+			persistence: config.persistence,
+			maxRetries: config.maxRetries,
+			delay: config.delay,
+		});
 	}
 
-	/** Returns the underlying flush timer (for test introspection). */
+	/** @returns The underlying flush timer for lifecycle introspection. */
 	public get timer(): ReturnType<typeof setInterval> | null {
 		return this._flushTimer;
 	}
 
-	/** Returns true when a flush is in progress. */
+	/** @returns Whether a global drain generation is active. */
 	public get isFlushing(): boolean {
-		return this._isFlushing;
+		return this._activeDrain !== null;
 	}
 
-	/** Sets / replaces the persistence error event emitter. */
+	/** @returns Number of accepted thought writes not yet acknowledged successful. */
+	public get pendingThoughtCount(): number {
+		return this._queue.pendingThoughtCount;
+	}
+
+	/**
+	 * Sets or clears the persistence error event emitter.
+	 *
+	 * @param emitter - Replacement emitter, or `null` to disable events.
+	 */
 	public setEventEmitter(emitter: PersistenceEventEmitter | null): void {
 		this._eventEmitter = emitter;
 	}
 
 	/**
-	 * Buffers a thought into the given session's write buffer. Triggers an
-	 * immediate flush when the buffer reaches `bufferSize`.
+	 * Accepts a thought with authoritative session attribution.
+	 *
+	 * The legacy session overload derives attribution from `thought.session_id` and
+	 * falls back to the configured default session without using the live write buffer.
+	 *
+	 * @param sessionId - Session that owns the accepted thought.
+	 * @param thought - Thought to persist.
 	 */
-	public bufferThought(session: BufferedSession, thought: ThoughtData): void {
-		// Backpressure: if buffer is full and flush is in progress, log warning
-		if (session.writeBuffer.length >= this._bufferSize && this._isFlushing) {
+	public bufferThought(sessionId: SessionId, thought: ThoughtData): void;
+	public bufferThought(session: BufferedSession, thought: ThoughtData): void;
+	public bufferThought(source: SessionId | BufferedSession, thought: ThoughtData): void {
+		if (this._queue.pendingThoughtCount >= this._bufferSize && this.isFlushing) {
 			this._logger.info('Write buffer full and flush in progress, applying backpressure', {
-				bufferSize: session.writeBuffer.length,
+				bufferSize: this._queue.pendingThoughtCount,
 				maxSize: this._bufferSize,
 			});
 		}
 
-		session.writeBuffer.push(thought);
-
-		if (session.writeBuffer.length >= this._bufferSize) {
-			void this.flush();
-		}
+		const sessionId =
+			typeof source === 'string' ? source : (thought.session_id ?? this._defaultSessionId);
+		this._queue.enqueueThought(sessionId, thought);
+		if (this._queue.pendingThoughtCount >= this._bufferSize) this._triggerBackgroundDrain();
 	}
 
 	/**
-	 * Starts the periodic flush timer. No-op if already started.
-	 * The timer is unref'd so it does not block process exit.
+	 * Accepts the latest snapshot for one session-owned branch.
+	 *
+	 * @param sessionId - Session that owns the branch.
+	 * @param branchId - Stable branch coordinate.
+	 * @param thoughts - Branch snapshot copied by the queue.
 	 */
+	public bufferBranch(
+		sessionId: SessionId,
+		branchId: BranchId,
+		thoughts: readonly ThoughtData[]
+	): void {
+		this._queue.replaceBranch(sessionId, branchId, thoughts);
+	}
+
+	/**
+	 * Accepts the latest edge snapshot for one session.
+	 *
+	 * @param sessionId - Session that owns the edges.
+	 * @param edges - Edge snapshot copied by the queue.
+	 */
+	public bufferEdges(sessionId: SessionId, edges: readonly Edge[]): void {
+		this._queue.replaceEdges(sessionId, edges);
+	}
+
+	/**
+	 * Accepts the latest summary snapshot for one session.
+	 *
+	 * @param sessionId - Session that owns the summaries.
+	 * @param summaries - Summary snapshot copied by the queue.
+	 */
+	public bufferSummaries(sessionId: SessionId, summaries: readonly Summary[]): void {
+		this._queue.replaceSummaries(sessionId, summaries);
+	}
+
+	/** Starts the periodic background-drain timer without keeping the process alive. */
 	public startFlushTimer(): void {
 		if (this._flushTimer !== null) return;
-		this._flushTimer = setInterval(() => {
-			void this.flush();
-		}, this._flushInterval);
-		if (this._flushTimer && typeof this._flushTimer === 'object' && 'unref' in this._flushTimer) {
+		this._flushTimer = setInterval(() => this._triggerBackgroundDrain(), this._flushInterval);
+		if (typeof this._flushTimer === 'object' && 'unref' in this._flushTimer) {
 			this._flushTimer.unref();
 		}
 	}
 
-	/** Stops the periodic flush timer. */
+	/** Stops the periodic background-drain timer. */
 	public stopFlushTimer(): void {
-		if (this._flushTimer !== null) {
-			clearInterval(this._flushTimer);
-			this._flushTimer = null;
-		}
+		if (this._flushTimer === null) return;
+		clearInterval(this._flushTimer);
+		this._flushTimer = null;
 	}
 
 	/**
-	 * Flushes the write buffer to the persistence backend.
+	 * Starts or joins an explicit global drain generation.
 	 *
-	 * Collects all buffered thoughts across all sessions and saves them
-	 * individually with retry logic. On persistent failure (all retries
-	 * exhausted), emits a `persistenceError` event and re-queues failed items
-	 * into the default session's buffer.
+	 * @returns The exact shared promise for the active generation.
+	 */
+	public drain(): Promise<void> {
+		return this._joinOrStart('explicit').promise;
+	}
+
+	/** @returns The exact same promise as {@link drain} for the active generation. */
+	public flush(): Promise<void> {
+		return this.drain();
+	}
+
+	/**
+	 * Joins the global explicit generation and projects its terminal failures to one session.
 	 *
-	 * Safe to call concurrently — duplicate calls are skipped.
+	 * @param sessionId - Session whose accepted writes form the barrier projection.
+	 * @returns A promise that rejects only for that session's failures or an unknown fault.
 	 */
-	public async flush(): Promise<void> {
-		if (this._isFlushing) return;
+	public drainSession(sessionId: SessionId): Promise<void> {
+		const generation = this._joinOrStart('explicit');
+		return generation.promise.catch((reason: unknown) => {
+			if (!(reason instanceof PersistenceDrainError)) throw reason;
+			const failures = reason.failures.filter((failure) => failure.sessionId === sessionId);
+			if (failures.length > 0) throw new PersistenceDrainError(failures);
+		});
+	}
 
-		// Collect all pending writes from all sessions
-		const allPending: ThoughtData[] = [];
-		for (const session of this._getSessions().values()) {
-			if (session.writeBuffer.length > 0) {
-				allPending.push(...session.writeBuffer.splice(0));
-			}
+	private _joinOrStart(mode: PersistenceSelectionMode): ActiveDrain {
+		const active = this._activeDrain;
+		if (active !== null) {
+			if (mode === 'explicit') active.mode = mode;
+			return active;
 		}
 
-		if (allPending.length === 0) return;
+		let resolveGeneration = (): void => undefined;
+		let rejectGeneration = (_reason: unknown): void => undefined;
+		const promise = new Promise<void>((resolve, reject) => {
+			resolveGeneration = resolve;
+			rejectGeneration = reject;
+		});
+		const generation: ActiveDrain = {
+			promise,
+			resolve: resolveGeneration,
+			reject: rejectGeneration,
+			selectedTokens: new Set<PersistenceWorkToken>(),
+			mode,
+			backgroundObserved: false,
+		};
+		this._activeDrain = generation;
+		void this._runDrain(generation).catch((fault: unknown) => {
+			this._closeGeneration(generation, { kind: 'fault', fault });
+		});
+		return generation;
+	}
 
-		this._isFlushing = true;
-		const failedItems: ThoughtData[] = [];
+	private _triggerBackgroundDrain(): void {
+		const generation = this._joinOrStart('background');
+		if (generation.backgroundObserved) return;
+		generation.backgroundObserved = true;
+		void generation.promise.catch(() => undefined);
+	}
 
-		try {
-			for (const thought of allPending) {
-				const saved = await this._flushSingleThought(thought);
-				if (!saved) {
-					failedItems.push(thought);
+	private async _runDrain(generation: ActiveDrain): Promise<void> {
+		while (true) {
+			const work = this._queue.nextEligibleWork(generation.selectedTokens, generation.mode);
+			if (work === undefined) {
+				this._closeGeneration(generation, { kind: 'result' });
+				return;
+			}
+
+			const result = await this._writer.write(work);
+			if (result === true) this._queue.acknowledgeSuccess(work);
+			else this._queue.acknowledgeFailure(work, result);
+		}
+	}
+
+	private _closeGeneration(generation: ActiveDrain, termination: DrainTermination): void {
+		if (this._activeDrain !== generation) return;
+		let settlement: DrainSettlement;
+		switch (termination.kind) {
+			case 'result': {
+				const result = this._queue.generationResult(generation.selectedTokens);
+				settlement =
+					result.failures.length === 0
+						? { kind: 'resolved' }
+						: { kind: 'rejected', reason: new PersistenceDrainError(result.failures) };
+				break;
+			}
+			case 'fault':
+				settlement = { kind: 'rejected', reason: termination.fault };
+				break;
+			default:
+				return assertNever(termination);
+		}
+
+		this._activeDrain = null;
+		switch (settlement.kind) {
+			case 'resolved':
+				generation.resolve();
+				return;
+			case 'rejected':
+				generation.reject(settlement.reason);
+				if (settlement.reason instanceof PersistenceDrainError) {
+					this._observeFailure(generation, settlement.reason);
 				}
-			}
-
-			this._handleFlushResult(failedItems, allPending.length);
-
-			if (this._edgeStore) {
-				await this._flushEdges();
-			}
-		} finally {
-			this._isFlushing = false;
+				return;
+			default:
+				return assertNever(settlement);
 		}
 	}
 
-	/**
-	 * Flushes edges for all known sessions to the persistence backend.
-	 * No-op when EdgeStore is unavailable.
-	 */
-	private async _flushEdges(): Promise<void> {
-		if (!this._edgeStore) return;
-		const sessionKeys = new Set<SessionId>(this._getSessions().keys());
-		sessionKeys.add(this._defaultSessionId);
-		for (const sessionId of sessionKeys) {
-			const edges = this._edgeStore.edgesForSession(sessionId);
-			if (edges.length === 0) continue;
-			try {
-				await this._persistence.saveEdges(sessionId, edges);
-			} catch (err) {
-				this._logger.info('Failed to persist edges for session', {
-					sessionId,
-					error: getErrorMessage(err),
-				});
-			}
-		}
-	}
-
-	/**
-	 * Flushes a single thought to persistence with exponential backoff retry.
-	 * @returns true if saved successfully, false otherwise
-	 */
-	private async _flushSingleThought(thought: ThoughtData): Promise<boolean> {
-		const backoffDelays = [100, 500, 2000];
-
-		for (let attempt = 0; attempt <= this._maxRetries; attempt++) {
-			try {
-				await this._persistence.saveThought(thought);
-				return true;
-			} catch (err) {
-				if (attempt < this._maxRetries) {
-					const delay = backoffDelays[attempt] ?? backoffDelays[backoffDelays.length - 1]!;
-					this._logger.info(`Persistence retry ${attempt + 1}/${this._maxRetries}`, {
-						thoughtNumber: thought.thought_number,
-						delay,
-						error: getErrorMessage(err),
-					});
-					await this._delay(delay);
-				} else {
-					this._logger.info('All persistence retries exhausted for thought', {
-						thoughtNumber: thought.thought_number,
-						error: getErrorMessage(err),
-					});
-				}
-			}
-		}
-
-		return false;
-	}
-
-	/**
-	 * Handles the result of a flush operation, re-queuing failures into the
-	 * default session's buffer and emitting a `persistenceError` event when
-	 * any items failed.
-	 */
-	private _handleFlushResult(failedItems: ThoughtData[], totalCount: number): void {
-		if (failedItems.length > 0) {
-			const defaultSession = this._getDefaultSession();
-			defaultSession.writeBuffer.unshift(...failedItems);
-			this._flushRetryCount++;
-
-			const error = new Error(
-				`Failed to persist ${failedItems.length} thoughts after ${this._maxRetries} retries`
-			);
-			this._eventEmitter?.emit('persistenceError', {
-				operation: 'flushBuffer',
-				error,
-			});
-
-			this._logger.info('Flush completed with failures', {
-				failed: failedItems.length,
-				total: totalCount,
-				consecutiveFailures: this._flushRetryCount,
-			});
-		} else {
-			this._flushRetryCount = 0;
-		}
-	}
-
-	/** Returns a promise that resolves after the specified delay. */
-	private _delay(ms: number): Promise<void> {
-		return new Promise((resolve) => setTimeout(resolve, ms));
+	private _observeFailure(generation: ActiveDrain, error: PersistenceDrainError): void {
+		this._logger.info('Persistence drain completed with failures', {
+			failed: error.failures.length,
+			selected: generation.selectedTokens.size,
+		});
+		this._eventEmitter?.emit('persistenceError', { operation: 'flushBuffer', error });
 	}
 }
