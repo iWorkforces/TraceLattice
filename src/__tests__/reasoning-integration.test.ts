@@ -15,7 +15,7 @@ import { ThoughtFormatter } from '../core/ThoughtFormatter.js';
 import { ThoughtEvaluator } from '../core/ThoughtEvaluator.js';
 import { StructuredLogger } from '../logger/StructuredLogger.js';
 import type { ThoughtData } from '../core/thought.js';
-import type { IHistoryManager } from '../core/IHistoryManager.js';
+import type { HistorySessionSnapshot, IHistoryManager } from '../core/IHistoryManager.js';
 import { createTestThought } from './helpers/factories.js';
 
 /**
@@ -71,6 +71,28 @@ class BranchAwareMockHistoryManager implements IHistoryManager {
 		this._branches = {};
 		this._availableMcpTools = undefined;
 		this._availableSkills = undefined;
+	}
+
+	async resetSession(): Promise<void> {
+		this.clear();
+	}
+
+	async resetAll(): Promise<void> {
+		this.clear();
+	}
+
+	inspectSession(): HistorySessionSnapshot {
+		return {
+			history: [...this._history],
+			branches: { ...this._branches } as Record<BranchId, ThoughtData[]>,
+			branchIds: Object.keys(this._branches) as BranchId[],
+			availableMcpTools: this._availableMcpTools,
+			availableSkills: this._availableSkills,
+		};
+	}
+
+	getSessionIds(): string[] {
+		return ['__global__'];
 	}
 
 	getAvailableMcpTools(): string[] | undefined {

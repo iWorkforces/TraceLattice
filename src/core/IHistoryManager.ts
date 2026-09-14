@@ -11,6 +11,15 @@ import type { IEdgeStore } from '../contracts/interfaces.js';
 import type { BranchId } from '../contracts/ids.js';
 import type { ThoughtData } from './thought.js';
 
+/** Non-mutating view used to validate one operation before state admission. */
+export interface HistorySessionSnapshot {
+	readonly history: readonly ThoughtData[];
+	readonly branches: Readonly<Record<BranchId, readonly ThoughtData[]>>;
+	readonly branchIds: readonly BranchId[];
+	readonly availableMcpTools: readonly string[] | undefined;
+	readonly availableSkills: readonly string[] | undefined;
+}
+
 /**
  * Interface for history and branch management.
  *
@@ -91,6 +100,18 @@ export interface IHistoryManager {
 	 * @param sessionId - Optional session ID to clear
 	 */
 	clear(sessionId?: string): void;
+
+	/** Awaitably clears one authorized live and durable session. */
+	resetSession(sessionId: string, clearAuxiliaryState?: () => void): Promise<void>;
+
+	/** Awaitably clears every live and durable session from an ownerless context. */
+	resetAll(clearAuxiliaryState?: () => void): Promise<void>;
+
+	/** Returns a non-mutating session snapshot without creating or binding state. */
+	inspectSession(sessionId: string): HistorySessionSnapshot;
+
+	/** Returns the currently materialized session identifiers without binding ownership. */
+	getSessionIds(): string[];
 
 	/**
 	 * Gets the most recently available MCP tools from the session.

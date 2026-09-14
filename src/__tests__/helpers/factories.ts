@@ -14,7 +14,7 @@ import { asBranchId, type BranchId } from '../../contracts/ids.js';
 import type { ToolRecommendation } from '../../types/tool.js';
 import type { SkillRecommendation } from '../../types/skill.js';
 import type { StepRecommendation } from '../../core/step.js';
-import type { IHistoryManager } from '../../core/IHistoryManager.js';
+import type { HistorySessionSnapshot, IHistoryManager } from '../../core/IHistoryManager.js';
 import type { ThoughtFormatter } from '../../core/ThoughtFormatter.js';
 
 // === Branded ID Helpers ===
@@ -174,6 +174,7 @@ export class MockHistoryManager implements IHistoryManager {
 		}
 	>();
 	private _clearCallCount = 0;
+	private _resetCallCount = 0;
 	private static readonly DEFAULT = '__global__';
 
 	private _getSession(sessionId?: string) {
@@ -213,7 +214,8 @@ export class MockHistoryManager implements IHistoryManager {
 	}
 
 	registerBranch(_sessionId: string | undefined, _branchId: BranchId): void {
-		/* no-op for mock */
+		const session = this._getSession(_sessionId);
+		if (!session.branches[_branchId]) session.branches[_branchId] = [];
 	}
 
 	branchExists(sessionId: string | undefined, branchId: BranchId): boolean {
@@ -226,8 +228,42 @@ export class MockHistoryManager implements IHistoryManager {
 		this._clearCallCount++;
 	}
 
+	async resetSession(sessionId: string, clearAuxiliaryState?: () => void): Promise<void> {
+		this._sessions.delete(sessionId);
+		clearAuxiliaryState?.();
+		this._resetCallCount++;
+	}
+
+	async resetAll(clearAuxiliaryState?: () => void): Promise<void> {
+		this._sessions.clear();
+		clearAuxiliaryState?.();
+		this._resetCallCount++;
+	}
+
+	inspectSession(sessionId: string): HistorySessionSnapshot {
+		const session = this._sessions.get(sessionId);
+		return {
+			history: [...(session?.history ?? [])],
+			branches: (session === undefined ? {} : { ...session.branches }) as Record<
+				BranchId,
+				ThoughtData[]
+			>,
+			branchIds: Object.keys(session?.branches ?? {}) as BranchId[],
+			availableMcpTools: session?.mcpTools,
+			availableSkills: session?.skills,
+		};
+	}
+
+	getSessionIds(): string[] {
+		return Array.from(this._sessions.keys());
+	}
+
 	getClearCallCount(): number {
 		return this._clearCallCount;
+	}
+
+	getResetCallCount(): number {
+		return this._resetCallCount;
 	}
 
 	getAvailableMcpTools(sessionId?: string): string[] | undefined {
