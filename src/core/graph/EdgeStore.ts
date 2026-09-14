@@ -13,7 +13,13 @@
  */
 
 import type { IEdgeStore } from '../../contracts/interfaces.js';
-import { asEdgeId, asThoughtId, type EdgeId, type SessionId, type ThoughtId } from '../../contracts/ids.js';
+import {
+	asEdgeId,
+	asThoughtId,
+	type EdgeId,
+	type SessionId,
+	type ThoughtId,
+} from '../../contracts/ids.js';
 import { InvalidEdgeError } from '../../errors.js';
 import type { Edge } from './Edge.js';
 
@@ -63,9 +69,7 @@ export class EdgeStore implements IEdgeStore {
 	 */
 	addEdge(edge: Edge): void {
 		if (edge.from === edge.to) {
-			throw new InvalidEdgeError(
-				`Self-edge not allowed: from and to are the same (${edge.from})`
-			);
+			throw new InvalidEdgeError(`Self-edge not allowed: from and to are the same (${edge.from})`);
 		}
 
 		const session = this._getOrCreateSession(edge.sessionId);
@@ -154,6 +158,10 @@ export class EdgeStore implements IEdgeStore {
 	 */
 	clearSession(sessionId: SessionId): void {
 		this._sessions.delete(sessionId);
+	}
+
+	clearAll(): void {
+		this._sessions.clear();
 	}
 
 	/**
