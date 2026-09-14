@@ -64,6 +64,8 @@ export const ERROR_CODES = {
 	PERSISTENCE_PUBLICATION: 'PERSISTENCE_PUBLICATION',
 	PERSISTENCE_CLOSED: 'PERSISTENCE_CLOSED',
 	PERSISTENCE_DRAIN: 'PERSISTENCE_DRAIN',
+	PERSISTENCE_SESSION_ADMISSION_CLOSED: 'PERSISTENCE_SESSION_ADMISSION_CLOSED',
+	PERSISTENCE_SESSION_BARRIER_REENTRANCY: 'PERSISTENCE_SESSION_BARRIER_REENTRANCY',
 	PERSISTENCE_CAPABILITY_UNSUPPORTED: 'PERSISTENCE_CAPABILITY_UNSUPPORTED',
 	PERSISTENCE_SCOPE_MISMATCH: 'PERSISTENCE_SCOPE_MISMATCH',
 	PERSISTENCE_COMPATIBILITY: 'PERSISTENCE_COMPATIBILITY',
@@ -887,6 +889,59 @@ export class PersistenceDrainError extends SequentialThinkingError {
 		);
 		this.name = 'PersistenceDrainError';
 		this.failures = Object.freeze([...failures]);
+	}
+}
+
+/**
+ * Error raised when persistence work is submitted while a lifecycle owner holds the session.
+ *
+ * @example
+ * ```typescript
+ * try {
+ *   buffer.bufferThought(sessionId, thought);
+ * } catch (error) {
+ *   if (error instanceof PersistenceSessionAdmissionClosedError) {
+ *     console.error(`Session ${error.sessionId} is temporarily closed`);
+ *   }
+ * }
+ * ```
+ */
+export class PersistenceSessionAdmissionClosedError extends SequentialThinkingError {
+	/** Session whose persistence admission is closed. */
+	public readonly sessionId: SessionId;
+
+	/**
+	 * Creates a session admission error.
+	 *
+	 * @param sessionId - Session held by a lifecycle barrier
+	 */
+	constructor(sessionId: SessionId) {
+		super(
+			`Persistence admission for session '${sessionId}' is closed by a lifecycle barrier`,
+			ERROR_CODES.PERSISTENCE_SESSION_ADMISSION_CLOSED
+		);
+		this.name = 'PersistenceSessionAdmissionClosedError';
+		this.sessionId = sessionId;
+	}
+}
+
+/** Error raised when an owning async call chain tries to reacquire its session barrier. */
+export class PersistenceSessionBarrierReentrancyError extends SequentialThinkingError {
+	/** Session already owned by the current async call chain. */
+	public readonly sessionId: SessionId;
+
+	/**
+	 * Creates a session barrier reentrancy error.
+	 *
+	 * @param sessionId - Session already owned by the current async call chain
+	 */
+	constructor(sessionId: SessionId) {
+		super(
+			`Persistence lifecycle barrier for session '${sessionId}' is not reentrant`,
+			ERROR_CODES.PERSISTENCE_SESSION_BARRIER_REENTRANCY
+		);
+		this.name = 'PersistenceSessionBarrierReentrancyError';
+		this.sessionId = sessionId;
 	}
 }
 

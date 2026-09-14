@@ -50,6 +50,8 @@ import type { ERROR_CODES, ErrorCode } from '../errors.js';
  *  - PersistencePublicationError → PERSISTENCE_PUBLICATION
  *  - PersistenceClosedError    → PERSISTENCE_CLOSED
  *  - PersistenceDrainError     → PERSISTENCE_DRAIN
+ *  - PersistenceSessionAdmissionClosedError → PERSISTENCE_SESSION_ADMISSION_CLOSED
+ *  - PersistenceSessionBarrierReentrancyError → PERSISTENCE_SESSION_BARRIER_REENTRANCY
  *
  * Direct `SequentialThinkingError` usages (no dedicated subclass):
  *  - DUPLICATE_SUMMARY (thrown by `core/compression/InMemorySummaryStore.ts`)
@@ -84,6 +86,8 @@ type _AllSubclassCodes =
 	| 'PERSISTENCE_PUBLICATION'
 	| 'PERSISTENCE_CLOSED'
 	| 'PERSISTENCE_DRAIN'
+	| 'PERSISTENCE_SESSION_ADMISSION_CLOSED'
+	| 'PERSISTENCE_SESSION_BARRIER_REENTRANCY'
 	| 'PERSISTENCE_CAPABILITY_UNSUPPORTED'
 	| 'PERSISTENCE_SCOPE_MISMATCH'
 	| 'PERSISTENCE_COMPATIBILITY'
