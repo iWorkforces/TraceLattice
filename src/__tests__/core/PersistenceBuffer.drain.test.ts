@@ -22,7 +22,8 @@ import {
 	type BufferedSession,
 	type PersistenceEventEmitter,
 } from '../../core/PersistenceBuffer.js';
-import type { PersistenceDelay } from '../../core/PersistenceWriter.js';
+import { PersistenceWorkQueue } from '../../core/PersistenceWorkQueue.js';
+import { PersistenceWriter, type PersistenceDelay } from '../../core/PersistenceWriter.js';
 import type { ThoughtData } from '../../core/thought.js';
 import { createTestThought } from '../helpers/factories.js';
 
@@ -427,6 +428,46 @@ describe('PersistenceBuffer joinable drain generation', () => {
 });
 
 describe('PersistenceBuffer bounded attributable retries', () => {
+	it('rejects invalid retry bounds before accepting a persistence policy', () => {
+		// Given
+		const persistence = new RecordingPersistence();
+
+		// When
+		const construct = (): PersistenceWriter =>
+			new PersistenceWriter({ persistence, maxRetries: -1 });
+
+		// Then
+		expect(construct).toThrow(new RangeError('maxRetries must be a non-negative safe integer'));
+	});
+
+	it('retries with zero delay from an explicitly empty schedule and persists the work', async () => {
+		// Given
+		const retryDelays: number[] = [];
+		const persistence = new RecordingPersistence({
+			thought: async () => {
+				if (persistence.thoughtWrites.length === 1) throw new ExpectedWriteError('first attempt');
+			},
+		});
+		const writer = new PersistenceWriter({
+			persistence,
+			maxRetries: 1,
+			retryDelays: [],
+			delay: async (milliseconds) => {
+				retryDelays.push(milliseconds);
+			},
+		});
+		const queue = new PersistenceWorkQueue();
+		const work = queue.enqueueThought(GLOBAL_SESSION_ID, createTestThought({ thought_number: 1 }));
+
+		// When
+		const outcome = await writer.write(work);
+
+		// Then
+		expect(outcome).toBe(true);
+		expect(retryDelays).toEqual([0]);
+		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([1, 1]);
+	});
+
 	it('removes successes once and retains only terminal failures for an explicit later generation', async () => {
 		// Given
 		const sessionId = asSessionId('partial-session');
@@ -729,6 +770,41 @@ describe('PersistenceBuffer versioned auxiliary acknowledgements', () => {
 });
 
 describe('PersistenceBuffer session-filtered barriers', () => {
+	it('selects only requested session work and projects only its terminal failure', () => {
+		// Given
+		const sessionA = asSessionId('queue-session-a');
+		const sessionB = asSessionId('queue-session-b');
+		const queue = new PersistenceWorkQueue();
+		const workA = queue.enqueueThought(sessionA, createTestThought({ session_id: sessionA }));
+		const workB = queue.enqueueThought(sessionB, createTestThought({ session_id: sessionB }));
+		const failureA = new ExpectedWriteError('A failed');
+		const failureB = new ExpectedWriteError('B failed');
+		queue.acknowledgeFailure(workA, {
+			kind: 'thought',
+			token: workA.token,
+			sessionId: sessionA,
+			attempts: 1,
+			cause: failureA,
+		});
+		queue.acknowledgeFailure(workB, {
+			kind: 'thought',
+			token: workB.token,
+			sessionId: sessionB,
+			attempts: 1,
+			cause: failureB,
+		});
+
+		// When
+		const selected = queue.nextEligibleWork(new Set(), 'explicit', sessionB);
+		const result = queue.generationResult(undefined, sessionB);
+
+		// Then
+		expect(selected).toMatchObject({ token: workB.token, sessionId: sessionB });
+		expect(result.failures).toEqual([
+			{ kind: 'thought', token: workB.token, sessionId: sessionB, attempts: 1, cause: failureB },
+		]);
+	});
+
 	it('joins an active global generation and includes A work accepted while B is blocked', async () => {
 		// Given
 		const sessionA = asSessionId('join-session-a');

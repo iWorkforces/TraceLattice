@@ -755,6 +755,63 @@ describe('File v2 compatibility boundary', () => {
 		}
 	});
 
+	it('imports non-empty legacy edge and summary namespaces into a reloaded v2 session', async () => {
+		// Given
+		const root = await mkdtemp(join(tmpdir(), 'tracelattice-task7-non-empty-v1-'));
+		const source = join(root, 'source');
+		const destination = join(root, 'destination');
+		const sessionId = asSessionId('legacy-edge-summary-session');
+		const edgePath = join(source, 'edges', `${sessionId}.json`);
+		const summaryPath = join(source, 'summaries', `${sessionId}.json`);
+		const legacyEdge = {
+			id: 'legacy-edge-1',
+			from: 'legacy-thought-1',
+			to: 'legacy-thought-2',
+			kind: 'verifies',
+			sessionId,
+			createdAt: 123,
+			metadata: { source: 'legacy-v1' },
+		};
+		const legacySummary = {
+			id: 'legacy-summary-1',
+			sessionId,
+			branchId: 'legacy-branch',
+			rootThoughtId: 'legacy-thought-1',
+			coveredIds: ['legacy-thought-1', 'legacy-thought-2'],
+			coveredRange: [1, 2],
+			topics: ['legacy', 'import'],
+			aggregateConfidence: 0.75,
+			createdAt: 456,
+			meta: { source: 'legacy-v1' },
+		};
+		await mkdir(join(source, 'edges'), { recursive: true });
+		await mkdir(join(source, 'summaries'), { recursive: true });
+		await writeFile(edgePath, JSON.stringify([legacyEdge]), 'utf-8');
+		await writeFile(summaryPath, JSON.stringify([legacySummary]), 'utf-8');
+		const sourceBytes = await Promise.all([readFile(edgePath), readFile(summaryPath)]);
+
+		try {
+			// When
+			await importLegacyFileV1(source, destination);
+			const reloaded = await FilePersistence.create({ dataDir: destination });
+			try {
+				const [edges, summaries] = await Promise.all([
+					reloaded.loadEdges(sessionId),
+					reloaded.loadSummaries(sessionId),
+				]);
+
+				// Then
+				expect(edges).toEqual([legacyEdge]);
+				expect(summaries).toEqual([legacySummary]);
+			} finally {
+				await reloaded.close();
+			}
+			expect(await Promise.all([readFile(edgePath), readFile(summaryPath)])).toEqual(sourceBytes);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it.each([
 		['edge', { sessionId: 'empty-session', edges: [] }],
 		['summary', { sessionId: 'empty-session', summaries: [] }],
