@@ -16,6 +16,26 @@ describe('SessionLock', () => {
 	});
 
 	describe('serialization', () => {
+		it('reports session activity only while its lock chain exists', async () => {
+			const sessionId = asSessionId('s1');
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			expect(lock.isActive(sessionId)).toBe(false);
+
+			const operation = lock.withLock(sessionId, async () => {
+				entered.resolve();
+				await release.promise;
+			});
+			await entered.promise;
+
+			expect(lock.isActive(sessionId)).toBe(true);
+			expect(lock.isActive(asSessionId('s2'))).toBe(false);
+			release.resolve();
+			await operation;
+			await Promise.resolve();
+			expect(lock.isActive(sessionId)).toBe(false);
+		});
+
 		it('preserves FIFO order for ordinary same-session callers', async () => {
 			const holderEntered = Promise.withResolvers<void>();
 			const releaseHolder = Promise.withResolvers<void>();

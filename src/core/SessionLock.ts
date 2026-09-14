@@ -60,6 +60,11 @@ export class SessionLock implements ISessionLock {
 		return this._locks.size;
 	}
 
+	/** Returns whether a session currently has a holder or queued operation. */
+	public isActive(sessionId: SessionId | undefined): boolean {
+		return this._locks.has(lockKey(sessionId));
+	}
+
 	/**
 	 * Execute `fn` while holding the lock for the given session.
 	 *
