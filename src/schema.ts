@@ -687,7 +687,7 @@ export const JsonRpcRequestSchema = v.object({
 	method: v.pipe(v.string(), v.minLength(1), v.description('Method name to invoke')),
 	params: v.optional(
 		v.pipe(
-			v.union([v.object({}), v.array(v.unknown())]),
+			v.union([v.array(v.unknown()), v.record(v.string(), v.unknown())]),
 			v.description('Method parameters (object or array)')
 		)
 	),

@@ -28,7 +28,7 @@ export async function createPersistenceBackend(
 	switch (config.backend) {
 		case 'file': {
 			const { FilePersistence } = await import('./FilePersistence.js');
-			return new FilePersistence(config.options);
+			return await FilePersistence.create(config.options);
 		}
 
 		case 'sqlite': {

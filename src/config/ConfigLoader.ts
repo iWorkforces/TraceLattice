@@ -14,8 +14,9 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import * as v from 'valibot';
 import type { PersistenceConfig } from '../contracts/PersistenceBackend.js';
-import { getErrorMessage } from '../errors.js';
+import { ConfigurationError, getErrorMessage } from '../errors.js';
 import type { FeatureFlags } from '../contracts/features.js';
+import type { ServerConfigOptions } from '../ServerConfig.js';
 
 /**
  * Lenient runtime schema for config files. Only validates top-level shape;
@@ -282,28 +283,41 @@ export class ConfigLoader {
 	 *
 	 * @param config - The configuration to apply overrides to
 	 * @returns A new configuration object with environment overrides applied
-	 * @private
 	 */
-	private applyEnvironmentOverrides(config: ConfigFileOptions): ConfigFileOptions {
-		const result: Mutable<ConfigFileOptions> = { ...config };
+	public applyEnvironmentOverrides(config: ConfigFileOptions): ConfigFileOptions {
+		const result: Mutable<ConfigFileOptions> = {
+			...config,
+			...(config.skillDirs === undefined ? {} : { skillDirs: [...config.skillDirs] }),
+			...(config.discoveryCache === undefined
+				? {}
+				: { discoveryCache: { ...config.discoveryCache } }),
+			...(config.persistence === undefined
+				? {}
+				: {
+						persistence: {
+							...config.persistence,
+							...(config.persistence.options === undefined
+								? {}
+								: { options: { ...config.persistence.options } }),
+						},
+					}),
+			...(config.features === undefined ? {} : { features: { ...config.features } }),
+		};
 
-		if (process.env.MAX_HISTORY_SIZE) {
-			const parsed = parseInt(process.env.MAX_HISTORY_SIZE, 10);
-			if (Number.isFinite(parsed)) {
-				result.maxHistorySize = parsed;
-			}
+		if (process.env.MAX_HISTORY_SIZE !== undefined) {
+			result.maxHistorySize = this.parseEnvironmentInteger(
+				'MAX_HISTORY_SIZE',
+				process.env.MAX_HISTORY_SIZE
+			);
 		}
-		if (process.env.MAX_BRANCHES) {
-			const parsed = parseInt(process.env.MAX_BRANCHES, 10);
-			if (Number.isFinite(parsed)) {
-				result.maxBranches = parsed;
-			}
+		if (process.env.MAX_BRANCHES !== undefined) {
+			result.maxBranches = this.parseEnvironmentInteger('MAX_BRANCHES', process.env.MAX_BRANCHES);
 		}
-		if (process.env.MAX_BRANCH_SIZE) {
-			const parsed = parseInt(process.env.MAX_BRANCH_SIZE, 10);
-			if (Number.isFinite(parsed)) {
-				result.maxBranchSize = parsed;
-			}
+		if (process.env.MAX_BRANCH_SIZE !== undefined) {
+			result.maxBranchSize = this.parseEnvironmentInteger(
+				'MAX_BRANCH_SIZE',
+				process.env.MAX_BRANCH_SIZE
+			);
 		}
 		if (
 			process.env.LOG_LEVEL &&
@@ -317,35 +331,41 @@ export class ConfigLoader {
 		if (process.env.SKILL_DIRS) {
 			result.skillDirs = process.env.SKILL_DIRS.split(':');
 		}
-		if (process.env.DISCOVERY_CACHE_TTL) {
-			const parsed = parseInt(process.env.DISCOVERY_CACHE_TTL, 10);
-			if (Number.isFinite(parsed)) {
-				result.discoveryCache = { ...(result.discoveryCache ?? {}), ttl: parsed * 1000 };
+		if (process.env.DISCOVERY_CACHE_TTL !== undefined) {
+			const seconds = this.parseEnvironmentInteger(
+				'DISCOVERY_CACHE_TTL',
+				process.env.DISCOVERY_CACHE_TTL
+			);
+			const ttl = seconds * 1000;
+			if (!Number.isSafeInteger(ttl)) {
+				throw new ConfigurationError('DISCOVERY_CACHE_TTL exceeds the safe integer range');
 			}
+			result.discoveryCache = { ...result.discoveryCache, ttl };
 		}
-		if (process.env.DISCOVERY_CACHE_MAX_SIZE) {
-			const parsed = parseInt(process.env.DISCOVERY_CACHE_MAX_SIZE, 10);
-			if (Number.isFinite(parsed)) {
-				result.discoveryCache = { ...(result.discoveryCache ?? {}), maxSize: parsed };
-			}
+		if (process.env.DISCOVERY_CACHE_MAX_SIZE !== undefined) {
+			const maxSize = this.parseEnvironmentInteger(
+				'DISCOVERY_CACHE_MAX_SIZE',
+				process.env.DISCOVERY_CACHE_MAX_SIZE
+			);
+			result.discoveryCache = { ...result.discoveryCache, maxSize };
 		}
-		if (process.env.TRACELATTICE_TOOL_INTERLEAVE_TTL_MS) {
-			const parsed = parseInt(process.env.TRACELATTICE_TOOL_INTERLEAVE_TTL_MS, 10);
-			if (Number.isFinite(parsed)) {
-				result.toolInterleaveTtlMs = parsed;
-			}
+		if (process.env.TRACELATTICE_TOOL_INTERLEAVE_TTL_MS !== undefined) {
+			result.toolInterleaveTtlMs = this.parseEnvironmentInteger(
+				'TRACELATTICE_TOOL_INTERLEAVE_TTL_MS',
+				process.env.TRACELATTICE_TOOL_INTERLEAVE_TTL_MS
+			);
 		}
-		if (process.env.TRACELATTICE_TOOL_INTERLEAVE_SWEEP_MS) {
-			const parsed = parseInt(process.env.TRACELATTICE_TOOL_INTERLEAVE_SWEEP_MS, 10);
-			if (Number.isFinite(parsed)) {
-				result.toolInterleaveSweepMs = parsed;
-			}
+		if (process.env.TRACELATTICE_TOOL_INTERLEAVE_SWEEP_MS !== undefined) {
+			result.toolInterleaveSweepMs = this.parseEnvironmentInteger(
+				'TRACELATTICE_TOOL_INTERLEAVE_SWEEP_MS',
+				process.env.TRACELATTICE_TOOL_INTERLEAVE_SWEEP_MS
+			);
 		}
-		if (process.env.SESSION_MAX_PER_OWNER) {
-			const parsed = parseInt(process.env.SESSION_MAX_PER_OWNER, 10);
-			if (Number.isFinite(parsed)) {
-				result.maxSessionsPerOwner = parsed;
-			}
+		if (process.env.SESSION_MAX_PER_OWNER !== undefined) {
+			result.maxSessionsPerOwner = this.parseEnvironmentInteger(
+				'SESSION_MAX_PER_OWNER',
+				process.env.SESSION_MAX_PER_OWNER
+			);
 		}
 
 		this.applyFeatureFlagOverrides(result);
@@ -356,7 +376,7 @@ export class ConfigLoader {
 	/**
 	 * Applies TRACELATTICE_FEATURES_* environment variable overrides for feature flags.
 	 * Booleans accept 'true'/'false'/'1'/'0' (case-insensitive).
-	 * Invalid reasoningStrategy values are warned and ignored (fall back to default).
+	 * Invalid reasoningStrategy values are rejected.
 	 *
 	 * @param result - Configuration object to mutate with feature flag overrides
 	 * @private
@@ -388,19 +408,27 @@ export class ConfigLoader {
 
 		const strategyRaw = process.env.TRACELATTICE_FEATURES_REASONING_STRATEGY;
 		if (strategyRaw !== undefined) {
-			const allowed = ['sequential', 'tot'] as const;
-			if ((allowed as readonly string[]).includes(strategyRaw)) {
-				const features: { -readonly [K in keyof FeatureFlags]?: FeatureFlags[K] } =
-					result.features ?? {};
-				features.reasoningStrategy = strategyRaw as 'sequential' | 'tot';
-				result.features = features;
-			} else {
-				console.warn(
-					`Invalid value for TRACELATTICE_FEATURES_REASONING_STRATEGY: "${strategyRaw}" ` +
-						`(expected one of ${allowed.join(', ')}). Falling back to 'sequential'.`
+			if (strategyRaw !== 'sequential' && strategyRaw !== 'tot') {
+				throw new ConfigurationError(
+					`TRACELATTICE_FEATURES_REASONING_STRATEGY must be one of sequential, tot, got ${strategyRaw}`
 				);
 			}
+			const features: { -readonly [K in keyof FeatureFlags]?: FeatureFlags[K] } =
+				result.features ?? {};
+			features.reasoningStrategy = strategyRaw;
+			result.features = features;
 		}
+	}
+
+	private parseEnvironmentInteger(environmentName: string, raw: string): number {
+		if (!/^(0|[1-9]\d*)$/.test(raw)) {
+			throw new ConfigurationError(`${environmentName} must be an integer, got ${raw}`);
+		}
+		const parsed = Number(raw);
+		if (!Number.isSafeInteger(parsed)) {
+			throw new ConfigurationError(`${environmentName} must be a safe integer, got ${raw}`);
+		}
+		return parsed;
 	}
 
 	/**
@@ -458,19 +486,14 @@ export class ConfigLoader {
 	 * }
 	 * ```
 	 */
-	toServerConfigOptions(config: ConfigFileOptions): {
-		maxHistorySize?: number;
-		maxBranches?: number;
-		maxBranchSize?: number;
-		features?: Partial<FeatureFlags>;
-		toolInterleaveTtlMs?: number;
-		toolInterleaveSweepMs?: number;
-		maxSessionsPerOwner?: number;
-	} {
+	toServerConfigOptions(config: ConfigFileOptions): ServerConfigOptions {
 		return {
 			maxHistorySize: config.maxHistorySize,
 			maxBranches: config.maxBranches,
 			maxBranchSize: config.maxBranchSize,
+			skillDirs: config.skillDirs,
+			discoveryCache: config.discoveryCache,
+			persistence: config.persistence,
 			features: config.features,
 			toolInterleaveTtlMs: config.toolInterleaveTtlMs,
 			toolInterleaveSweepMs: config.toolInterleaveSweepMs,

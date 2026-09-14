@@ -10,6 +10,7 @@ import type { SequentialThinkingSchema } from './schema.js';
 import { SEQUENTIAL_THINKING_TOOL } from './schema.js';
 import type { IDisposable } from './types/disposable.js';
 import { getErrorMessage } from './errors.js';
+import { assertNever } from './utils.js';
 
 // New component imports
 import { DiscoveryCache } from './cache/DiscoveryCache.js';
@@ -82,6 +83,30 @@ interface ServerEvents {
 	discoveryError: { directory: string; error: Error };
 	transportError: { transport: string; error: Error };
 	thoughtProcessed: { thoughtNumber: number; duration: number };
+}
+
+type CleanupOperation = () => void | Promise<void>;
+
+function appendCleanupFailure(failures: unknown[], failure: unknown): void {
+	if (failure instanceof AggregateError) {
+		failures.push(...failure.errors);
+		return;
+	}
+	failures.push(failure);
+}
+
+async function collectCleanupFailures(
+	operations: readonly CleanupOperation[]
+): Promise<unknown[]> {
+	const failures: unknown[] = [];
+	for (const operation of operations) {
+		try {
+			await operation();
+		} catch (error) {
+			appendCleanupFailure(failures, error);
+		}
+	}
+	return failures;
 }
 
 /**
@@ -162,26 +187,47 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 	 * @returns A Promise that resolves to a configured server instance
 	 */
 	static async create(options: ServerOptions = {}): Promise<ToolAwareSequentialThinkingServer> {
-		// Create the async container first
 		const container = await ToolAwareSequentialThinkingServer._createContainerAsyncStatic(options);
+		let server: ToolAwareSequentialThinkingServer | undefined;
+		try {
+			server = new ToolAwareSequentialThinkingServer({
+				...options,
+				container,
+			});
 
-		// Create a minimal server with the container
-		const server = new ToolAwareSequentialThinkingServer({
-			...options,
-			container,
-		});
+			if (options.loadFromPersistence !== false) {
+				await server.history.loadFromPersistence();
+			}
 
-		// Load from persistence if enabled (default: true)
-		if (options.loadFromPersistence !== false) {
-			await server.history.loadFromPersistence();
+			if (options.autoDiscover !== false) {
+				await server.discoverSkillsAsync();
+			}
+
+			return server;
+		} catch (error) {
+			const startedServer = server;
+			const cleanupFailures = await collectCleanupFailures(
+				startedServer
+					? [() => startedServer.dispose()]
+					: [
+							() => {
+								if (container.has('suspensionStore')) {
+									container.resolve('suspensionStore').stop();
+								}
+							},
+							() => container.resolve('Persistence')?.close(),
+							() => container.dispose(),
+						]
+			);
+			if (cleanupFailures.length > 0) {
+				throw new AggregateError(
+					[error, ...cleanupFailures],
+					'Server startup failed and cleanup also failed',
+					{ cause: error }
+				);
+			}
+			throw error;
 		}
-
-		// Perform async discovery if enabled (default: true)
-		if (options.autoDiscover !== false) {
-			await server.discoverSkillsAsync();
-		}
-
-		return server;
 	}
 
 	// Type-safe event emission
@@ -207,6 +253,8 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 	private _skillWatcher: SkillWatcher | null = null;
 	private _toolWatcher: ToolWatcher | null = null;
 	private _config: ServerConfig;
+	private _stopPromise: Promise<void> | null = null;
+	private _disposePromise: Promise<void> | null = null;
 
 	// Public manager properties (recommended API)
 	/**
@@ -297,16 +345,7 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 			prefix: 'sequentialthinking',
 		});
 
-		// Initialize config with file defaults overridden by constructor options
-		const config = new ServerConfig({
-			maxHistorySize: options.maxHistorySize ?? fileConfig?.maxHistorySize,
-			maxBranches: options.maxBranches ?? fileConfig?.maxBranches,
-			maxBranchSize: options.maxBranchSize ?? fileConfig?.maxBranchSize,
-			skillDirs: fileConfig?.skillDirs,
-			discoveryCache: fileConfig?.discoveryCache,
-			persistence: fileConfig?.persistence,
-			maxSessionsPerOwner: fileConfig?.maxSessionsPerOwner,
-		});
+		const config = ToolAwareSequentialThinkingServer._resolveEffectiveConfig(options, fileConfig);
 
 		// Initialize logger
 		const logger =
@@ -371,6 +410,20 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 		return container;
 	}
 
+	private static _resolveEffectiveConfig(
+		options: ServerOptions,
+		fileConfig: ConfigFileOptions | null,
+	): ServerConfig {
+		if (options.config) return options.config;
+		const loadedOptions = new ConfigLoader().toServerConfigOptions(fileConfig ?? {});
+		return new ServerConfig({
+			...loadedOptions,
+			maxHistorySize: options.maxHistorySize ?? loadedOptions.maxHistorySize,
+			maxBranches: options.maxBranches ?? loadedOptions.maxBranches,
+			maxBranchSize: options.maxBranchSize ?? loadedOptions.maxBranchSize,
+		});
+	}
+
 	private static _registerDiscoveryRegistries(
 		container: Container,
 		lazyDiscovery: ServerOptions['lazyDiscovery']
@@ -422,6 +475,7 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 				persistenceFlushInterval: cfg.persistenceFlushInterval,
 				persistenceMaxRetries: cfg.persistenceMaxRetries,
 				edgeStore,
+				dagEdges: cfg.features.dagEdges,
 				maxSessionsPerOwner: cfg.maxSessionsPerOwner,
 			});
 		});
@@ -489,15 +543,43 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 	 * This is used internally by the static create() factory.
 	 */
 	private static async _createContainerAsyncStatic(options: ServerOptions): Promise<Container> {
-		const configLoader = new ConfigLoader();
-		const fileConfig = configLoader.load();
+		let fileConfig: ConfigFileOptions | null;
+		let config: ServerConfig;
+		if (options.config) {
+			fileConfig = options.fileConfig ?? null;
+			config = options.config;
+		} else {
+			const configLoader = new ConfigLoader();
+			fileConfig =
+				options.fileConfig === undefined
+					? configLoader.load()
+					: configLoader.applyEnvironmentOverrides(options.fileConfig);
+			config = ToolAwareSequentialThinkingServer._resolveEffectiveConfig(options, fileConfig);
+		}
 
-		// Initialize persistence backend (async)
-		const persistence = await createPersistenceBackend(
-			fileConfig?.persistence ?? { enabled: false }
-		);
-
-		return ToolAwareSequentialThinkingServer._createContainerCore(options, fileConfig, persistence);
+		let persistence: PersistenceBackend | null = null;
+		try {
+			persistence = await createPersistenceBackend(config.persistence);
+			return ToolAwareSequentialThinkingServer._createContainerCore(
+				{ ...options, config },
+				fileConfig,
+				persistence,
+			);
+		} catch (error) {
+			const acquiredPersistence = persistence;
+			const cleanupFailures =
+				acquiredPersistence === null
+					? []
+					: await collectCleanupFailures([() => acquiredPersistence.close()]);
+			if (cleanupFailures.length > 0) {
+				throw new AggregateError(
+					[error, ...cleanupFailures],
+					'Container construction failed and cleanup also failed',
+					{ cause: error }
+				);
+			}
+			throw error;
+		}
 	}
 
 	/**
@@ -558,45 +640,72 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 	 * Stop the server and clean up watchers.
 	 * Closes persistence backend gracefully to ensure data is flushed.
 	 */
-	public async stop(): Promise<void> {
-		this._skillWatcher?.stop();
-		this._toolWatcher?.stop();
+	public stop(): Promise<void> {
+		if (this._stopPromise) return this._stopPromise;
+		this._stopPromise = (async () => {
+			const failures: unknown[] = [];
+			const watcherResults = await Promise.allSettled([
+				this._skillWatcher?.stop() ?? Promise.resolve(),
+				this._toolWatcher?.stop() ?? Promise.resolve(),
+			]);
+			for (const result of watcherResults) {
+				switch (result.status) {
+					case 'fulfilled':
+						break;
+					case 'rejected':
+						appendCleanupFailure(failures, result.reason);
+						this._logger.error('Error stopping watcher', {
+							error: getErrorMessage(result.reason),
+						});
+						break;
+					default:
+						assertNever(result);
+				}
+			}
 
-		// Stop suspension store sweeper if registered
-		if (this._config.features.toolInterleave && this._container.has('suspensionStore')) {
+			// Stop suspension store sweeper if registered
+			if (this._config.features.toolInterleave && this._container.has('suspensionStore')) {
+				try {
+					const suspensionStore = this._container.resolve('suspensionStore');
+					suspensionStore.stop();
+				} catch (error) {
+					appendCleanupFailure(failures, error);
+					this._logger.error('Error stopping suspension store', {
+						error: getErrorMessage(error),
+					});
+				}
+			}
+
+			// Flush any buffered writes before closing persistence
 			try {
-				const suspensionStore = this._container.resolve('suspensionStore');
-				suspensionStore.stop();
+				await this._historyManager.shutdown();
 			} catch (error) {
-				this._logger.error('Error stopping suspension store', {
+				appendCleanupFailure(failures, error);
+				this._logger.error('Error flushing write buffer during shutdown', {
 					error: getErrorMessage(error),
 				});
 			}
-		}
 
-		// Flush any buffered writes before closing persistence
-		try {
-			await this._historyManager.shutdown();
-		} catch (error) {
-			this._logger.error('Error flushing write buffer during shutdown', {
-				error: getErrorMessage(error),
-			});
-		}
-
-		// Close persistence backend if available
-		const persistence = this._container.resolve('Persistence');
-		if (persistence) {
-			try {
-				await persistence.close();
-				this._logger.info('Persistence backend closed');
-			} catch (error) {
-				this._logger.error('Error closing persistence backend', {
-					error: getErrorMessage(error),
-				});
+			// Close persistence backend if available
+			const persistence = this._container.resolve('Persistence');
+			if (persistence) {
+				try {
+					await persistence.close();
+					this._logger.info('Persistence backend closed');
+				} catch (error) {
+					appendCleanupFailure(failures, error);
+					this._logger.error('Error closing persistence backend', {
+						error: getErrorMessage(error),
+					});
+				}
 			}
-		}
 
-		this._logger.info('Server stopped, watchers cleaned up');
+			if (failures.length > 0) {
+				throw new AggregateError(failures, 'Failed to stop server cleanly');
+			}
+			this._logger.info('Server stopped, watchers cleaned up');
+		})();
+		return this._stopPromise;
 	}
 
 	/**
@@ -613,10 +722,19 @@ export class ToolAwareSequentialThinkingServer extends EventEmitter implements I
 	 * Implements the IDisposable interface.
 	 * Calls stop() for existing cleanup, then disposes the DI container.
 	 */
-	public async dispose(): Promise<void> {
-		await this.stop();
-		await this._container.dispose();
-		this._logger.info('Server disposed, all resources released');
+	public dispose(): Promise<void> {
+		if (this._disposePromise) return this._disposePromise;
+		this._disposePromise = (async () => {
+			const failures = await collectCleanupFailures([
+				() => this.stop(),
+				() => this._container.dispose(),
+			]);
+			if (failures.length > 0) {
+				throw new AggregateError(failures, 'Failed to dispose server cleanly');
+			}
+			this._logger.info('Server disposed, all resources released');
+		})();
+		return this._disposePromise;
 	}
 }
 
@@ -658,18 +776,21 @@ export async function createServer(
 export async function initializeServer(): Promise<ToolAwareSequentialThinkingServer> {
 	// Create logger for initialization
 	const configLoader = new ConfigLoader();
-	const fileConfig = configLoader.load();
+	const fileConfig = configLoader.load() ?? {};
+	const config = new ServerConfig(configLoader.toServerConfigOptions(fileConfig));
 
 	const logger = new StructuredLogger({
-		level: fileConfig?.logLevel ?? 'info',
+		level: fileConfig.logLevel ?? 'info',
 		context: 'SequentialThinking',
-		pretty: fileConfig?.prettyLog ?? true,
+		pretty: fileConfig.prettyLog ?? true,
 	});
 
 	// Create server instance
 	const thinkingServer = await createServer({
 		logger,
 		enableWatcher: true,
+		config,
+		fileConfig,
 	});
 
 	logger.info('Server initialized successfully');
