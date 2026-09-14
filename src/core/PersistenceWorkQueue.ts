@@ -241,7 +241,7 @@ export class PersistenceWorkQueue {
 				this._summaries.delete(work.key);
 				return;
 			default:
-				return assertNever(work);
+				assertNever(work);
 		}
 	}
 
@@ -304,6 +304,30 @@ export class PersistenceWorkQueue {
 		let branchCount = 0;
 		for (const branches of this._branches.values()) branchCount += branches.size;
 		return this._thoughts.length + branchCount + this._edges.size + this._summaries.size;
+	}
+
+	/** Discards every retained work item and version coordinate for one deleted session. */
+	public discardSession(sessionId: SessionId): void {
+		for (let index = this._thoughts.length - 1; index >= 0; index -= 1) {
+			if (this._thoughts[index]?.work.sessionId === sessionId) this._thoughts.splice(index, 1);
+		}
+		this._branches.delete(sessionId);
+		this._edges.delete(sessionId);
+		this._summaries.delete(sessionId);
+		this._branchVersions.delete(sessionId);
+		this._edgeVersions.delete(sessionId);
+		this._summaryVersions.delete(sessionId);
+	}
+
+	/** Discards all retained work after a successful durable global reset. */
+	public discardAll(): void {
+		this._thoughts.length = 0;
+		this._branches.clear();
+		this._edges.clear();
+		this._summaries.clear();
+		this._branchVersions.clear();
+		this._edgeVersions.clear();
+		this._summaryVersions.clear();
 	}
 
 	private _accept(): Acceptance {

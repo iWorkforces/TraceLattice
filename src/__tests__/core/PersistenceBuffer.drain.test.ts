@@ -57,6 +57,7 @@ interface PersistenceHandlers {
 	readonly branch?: (write: BranchWrite) => Promise<void>;
 	readonly edges?: (write: SnapshotWrite<Edge>) => Promise<void>;
 	readonly summaries?: (write: SnapshotWrite<Summary>) => Promise<void>;
+	readonly clearSession?: (sessionId: SessionId) => Promise<void>;
 }
 
 class ExpectedWriteError extends Error {
@@ -154,7 +155,9 @@ class RecordingPersistence implements SessionScopedPersistenceBackend {
 
 	public async clear(): Promise<void> {}
 
-	public async clearSession(_sessionId: SessionId): Promise<void> {}
+	public async clearSession(sessionId: SessionId): Promise<void> {
+		await this._handlers.clearSession?.(sessionId);
+	}
 
 	public async close(): Promise<void> {}
 
@@ -1258,6 +1261,52 @@ describe('PersistenceBuffer exclusive session lifecycle barrier', () => {
 		await drain(harness.buffer);
 		expect(events.at(-1)).toBe('external-a:complete');
 		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([2]);
+	});
+
+	it('quarantines a failed scoped reset until successful deletion discards stale A work', async () => {
+		// Given
+		const sessionA = asSessionId('reset-quarantine-a');
+		const sessionB = asSessionId('reset-quarantine-b');
+		const events: string[] = [];
+		let deletionFails = true;
+		const persistence = new RecordingPersistence({
+			thought: async ({ sessionId, thought }) => {
+				events.push(`write:${sessionId}:${thought.thought_number}`);
+				if (sessionId === sessionA && thought.thought_number === 1) {
+					throw new ExpectedWriteError('stale A write');
+				}
+			},
+			clearSession: async (sessionId) => {
+				events.push(`clear:${sessionId}:${deletionFails ? 'failed' : 'succeeded'}`);
+				if (deletionFails) throw new ExpectedWriteError('scoped deletion failed');
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		acceptThought(harness, sessionA, 1);
+		expect((await settle(drain(harness.buffer))).status).toBe('rejected');
+
+		// When
+		const failedReset = await settle(
+			harness.buffer.withSessionResetBarrier(sessionA, () => persistence.clearSession(sessionA))
+		);
+
+		// Then
+		expect(failedReset.status).toBe('rejected');
+		expect(() => acceptThought(harness, sessionA, 2)).toThrow(
+			expect.objectContaining({ name: 'PersistenceSessionAdmissionClosedError' })
+		);
+		acceptThought(harness, sessionB, 1);
+		expect((await settle(drain(harness.buffer))).status).toBe('rejected');
+		expect(events).toContain(`write:${sessionB}:1`);
+
+		deletionFails = false;
+		await harness.buffer.withSessionResetBarrier(sessionA, () =>
+			persistence.clearSession(sessionA)
+		);
+		const recoveryIndex = events.indexOf(`clear:${sessionA}:succeeded`);
+		acceptThought(harness, sessionA, 2);
+		await drain(harness.buffer);
+		expect(events.slice(recoveryIndex + 1)).toEqual([`write:${sessionA}:2`]);
 	});
 });
 

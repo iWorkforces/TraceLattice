@@ -101,6 +101,10 @@ export class PersistenceBuffer<S extends BufferedSession> {
 	private readonly _sessionBarriers = new Map<SessionId, SessionBarrierState>();
 	private readonly _sessionBarrierOwnership = new AsyncLocalStorage<ReadonlySet<SessionId>>();
 	private readonly _sessionProgressWaiters = new Map<SessionId, Set<() => void>>();
+	private readonly _quarantinedSessions = new Set<SessionId>();
+	private _globalResetTail: Promise<void> = Promise.resolve();
+	private _globalResetOwners = 0;
+	private _globalQuarantined = false;
 
 	/**
 	 * Creates a persistence-drain coordinator.
@@ -208,6 +212,11 @@ export class PersistenceBuffer<S extends BufferedSession> {
 		this._queue.replaceSummaries(sessionId, summaries);
 	}
 
+	/** Rejects synchronously when lifecycle coordination has closed persistence admission. */
+	public assertSessionAdmissionOpen(sessionId: SessionId): void {
+		this._assertSessionAdmissionOpen(sessionId);
+	}
+
 	/** Starts the periodic background-drain timer without keeping the process alive. */
 	public startFlushTimer(): void {
 		if (this._flushTimer !== null) return;
@@ -303,6 +312,85 @@ export class PersistenceBuffer<S extends BufferedSession> {
 			}
 		});
 		state.tail = result.then(
+			() => undefined,
+			() => undefined
+		);
+		return result;
+	}
+
+	/**
+	 * Runs a scoped reset, retaining admission quarantine on failure.
+	 * A retry may pass retained write failures because successful durable deletion
+	 * invalidates those stale queue entries before admission reopens.
+	 */
+	public withSessionResetBarrier<T>(sessionId: SessionId, operation: () => Promise<T>): Promise<T> {
+		if (this._globalResetOwners > 0 || this._globalQuarantined) {
+			return Promise.reject(new PersistenceSessionAdmissionClosedError(sessionId));
+		}
+		const currentOwnership = this._sessionBarrierOwnership.getStore();
+		if (currentOwnership?.has(sessionId) === true) {
+			return Promise.reject(new PersistenceSessionBarrierReentrancyError(sessionId));
+		}
+		const operationOwnership = new Set(currentOwnership);
+		operationOwnership.add(sessionId);
+		const state = this._sessionBarriers.get(sessionId) ?? {
+			tail: Promise.resolve(),
+			pendingOwners: 0,
+		};
+		this._sessionBarriers.set(sessionId, state);
+		state.pendingOwners += 1;
+
+		const result = state.tail.then(async () => {
+			try {
+				try {
+					await this._awaitSessionQuiescence(sessionId);
+				} catch (error) {
+					if (!(error instanceof PersistenceDrainError)) throw error;
+				}
+				const value = await this._sessionBarrierOwnership.run(operationOwnership, operation);
+				this._queue.discardSession(sessionId);
+				this._quarantinedSessions.delete(sessionId);
+				return value;
+			} catch (error) {
+				this._quarantinedSessions.add(sessionId);
+				throw error;
+			} finally {
+				state.pendingOwners -= 1;
+				if (state.pendingOwners === 0) this._sessionBarriers.delete(sessionId);
+			}
+		});
+		state.tail = result.then(
+			() => undefined,
+			() => undefined
+		);
+		return result;
+	}
+
+	/** Runs a trusted global reset behind a global admission barrier. */
+	public withGlobalResetBarrier<T>(operation: () => Promise<T>): Promise<T> {
+		this._globalResetOwners += 1;
+		const prior = this._globalResetTail;
+		const result = prior.then(async () => {
+			try {
+				await Promise.all(Array.from(this._sessionBarriers.values(), (state) => state.tail));
+				try {
+					await this.drain();
+				} catch (error) {
+					if (!(error instanceof PersistenceDrainError)) throw error;
+				}
+				const value = await operation();
+				this._queue.discardAll();
+				this._quarantinedSessions.clear();
+				this._globalQuarantined = false;
+				return value;
+			} catch (error) {
+				this._globalQuarantined = true;
+				throw error;
+			} finally {
+				this._globalResetOwners -= 1;
+			}
+		});
+		this._globalResetTail = result.then(
 			() => undefined,
 			() => undefined
 		);
@@ -454,7 +542,12 @@ export class PersistenceBuffer<S extends BufferedSession> {
 	}
 
 	private _assertSessionAdmissionOpen(sessionId: SessionId): void {
-		if (this._sessionBarriers.has(sessionId)) {
+		if (
+			this._globalResetOwners > 0 ||
+			this._globalQuarantined ||
+			this._sessionBarriers.has(sessionId) ||
+			this._quarantinedSessions.has(sessionId)
+		) {
 			throw new PersistenceSessionAdmissionClosedError(sessionId);
 		}
 	}
