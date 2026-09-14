@@ -14,7 +14,14 @@
 
 import { SequentialThinkingError } from '../../errors.js';
 import type { ISummaryStore, Summary } from '../../contracts/summary.js';
-import { asBranchId, asSessionId, asSummaryId, type BranchId, type SessionId, type SummaryId } from '../../contracts/ids.js';
+import {
+	asBranchId,
+	asSessionId,
+	asSummaryId,
+	type BranchId,
+	type SessionId,
+	type SummaryId,
+} from '../../contracts/ids.js';
 
 /**
  * Compose the composite branch key used by the per-branch index.
@@ -73,16 +80,17 @@ export class InMemorySummaryStore implements ISummaryStore {
 	 */
 	add(summary: Summary): void {
 		if (this._byId.has(asSummaryId(summary.id))) {
-			throw new SequentialThinkingError(
-				`Duplicate summary id: ${summary.id}`,
-				'DUPLICATE_SUMMARY'
-			);
+			throw new SequentialThinkingError(`Duplicate summary id: ${summary.id}`, 'DUPLICATE_SUMMARY');
 		}
 
 		this._byId.set(asSummaryId(summary.id), summary);
 		this._insertSorted(this._bySession, summary.sessionId, summary);
 		if (summary.branchId !== undefined) {
-			this._insertSorted(this._byBranch, branchKey(asSessionId(summary.sessionId), summary.branchId), summary);
+			this._insertSorted(
+				this._byBranch,
+				branchKey(asSessionId(summary.sessionId), summary.branchId),
+				summary
+			);
 		}
 	}
 
@@ -158,6 +166,12 @@ export class InMemorySummaryStore implements ISummaryStore {
 			}
 		}
 		this._bySession.delete(asSessionId(sessionId));
+	}
+
+	clearAll(): void {
+		this._byId.clear();
+		this._bySession.clear();
+		this._byBranch.clear();
 	}
 
 	/**
