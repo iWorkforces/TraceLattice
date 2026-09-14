@@ -17,11 +17,20 @@ import { generateUlid } from '../../core/ids.js';
 import { createTestThought } from '../helpers/factories.js';
 import type { ThoughtData } from '../../core/thought.js';
 import type { Edge } from '../../core/graph/Edge.js';
-import { asSessionId, asThoughtId, type EdgeId, type SessionId, type ThoughtId } from '../../contracts/ids.js';
+import {
+	asSessionId,
+	asThoughtId,
+	type EdgeId,
+	type SessionId,
+	type ThoughtId,
+} from '../../contracts/ids.js';
 
 const GLOBAL: SessionId = asSessionId('__global__');
 
-function makeThought(num: number, overrides?: Partial<Omit<ThoughtData, 'session_id'>> & { session_id?: string }): ThoughtData {
+function makeThought(
+	num: number,
+	overrides?: Partial<Omit<ThoughtData, 'session_id'>> & { session_id?: string }
+): ThoughtData {
 	const { session_id, ...rest } = overrides ?? {};
 	return createTestThought({
 		id: generateUlid() as ThoughtId,
@@ -142,7 +151,7 @@ describe('HistoryManager edge persistence', () => {
 		await manager.shutdown();
 	});
 
-	it('clear() purges edges from the EdgeStore', async () => {
+	it('resetAll() purges edges from the EdgeStore', async () => {
 		const { manager, edgeStore } = setup();
 
 		manager.addThought(makeThought(1));
@@ -151,7 +160,7 @@ describe('HistoryManager edge persistence', () => {
 
 		expect(edgeStore.size(GLOBAL)).toBeGreaterThan(0);
 
-		manager.clear();
+		await manager.resetAll();
 
 		expect(edgeStore.size(GLOBAL)).toBe(0);
 		await manager.shutdown();
@@ -262,7 +271,9 @@ describe('HistoryManager edge persistence', () => {
 			'sequence',
 			'sequence',
 		]);
-		expect(edgeStore.edgesForSession(asSessionId('test-B')).map((e) => e.kind)).toEqual(['derives_from']);
+		expect(edgeStore.edgesForSession(asSessionId('test-B')).map((e) => e.kind)).toEqual([
+			'derives_from',
+		]);
 		await manager.shutdown();
 	});
 

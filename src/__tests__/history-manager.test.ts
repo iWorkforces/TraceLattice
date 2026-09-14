@@ -2,12 +2,13 @@ import { asSessionId } from '../contracts/ids.js';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { ABSOLUTE_MAX_HISTORY_SIZE, HistoryManager } from '../core/HistoryManager.js';
 import { EdgeStore } from '../core/graph/EdgeStore.js';
+import { SessionLock } from '../core/SessionLock.js';
 import type { SessionScopedPersistenceBackend } from '../contracts/PersistenceBackend.js';
 import { createTestThought } from './helpers/factories.js';
 import { useFakeTimers, useRealTimers } from './helpers/timers.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import type { ThoughtData } from '../core/thought.js';
-import { PersistenceDrainError } from '../errors.js';
+import { AsyncResetRequiredError, PersistenceDrainError } from '../errors.js';
 
 import { asBranchId, type BranchId } from '../contracts/ids.js';
 import type { SessionId } from '../contracts/ids.js';
@@ -244,13 +245,25 @@ describe('HistoryManager', () => {
 		it('should remove oldest branches when maxBranches is exceeded', () => {
 			const manager = new HistoryManager({ maxBranches: 2 });
 			manager.addThought(
-				createTestThought({ thought_number: 1, branch_from_thought: 1, branch_id: asBranchId('branch-a') })
+				createTestThought({
+					thought_number: 1,
+					branch_from_thought: 1,
+					branch_id: asBranchId('branch-a'),
+				})
 			);
 			manager.addThought(
-				createTestThought({ thought_number: 2, branch_from_thought: 1, branch_id: asBranchId('branch-b') })
+				createTestThought({
+					thought_number: 2,
+					branch_from_thought: 1,
+					branch_id: asBranchId('branch-b'),
+				})
 			);
 			manager.addThought(
-				createTestThought({ thought_number: 3, branch_from_thought: 1, branch_id: asBranchId('branch-c') })
+				createTestThought({
+					thought_number: 3,
+					branch_from_thought: 1,
+					branch_id: asBranchId('branch-c'),
+				})
 			);
 
 			expect(manager.getBranchIds()).toHaveLength(2);
@@ -509,7 +522,9 @@ describe('HistoryManager', () => {
 		it('should load history and branches from persistence', async () => {
 			const persistence = new MockPersistence();
 			await persistence.saveThought(createTestThought({ thought_number: 1 }));
-			await persistence.saveBranch(asBranchId('branch-1'), [createTestThought({ thought_number: 1 })]);
+			await persistence.saveBranch(asBranchId('branch-1'), [
+				createTestThought({ thought_number: 1 }),
+			]);
 
 			const manager = new HistoryManager({ persistence });
 			await manager.loadFromPersistence();
@@ -558,7 +573,7 @@ describe('HistoryManager', () => {
 	});
 
 	describe('clear with persistence', () => {
-		it('should clear persisted data when persistence is enabled', async () => {
+		it('requires awaitable resetAll when persistence is enabled', async () => {
 			useFakeTimers();
 			const persistence = new MockPersistence();
 			const manager = new HistoryManager({ persistence });
@@ -567,19 +582,82 @@ describe('HistoryManager', () => {
 			await vi.advanceTimersByTimeAsync(1100);
 			expect(manager.getWriteBufferLength()).toBe(0);
 
-			manager.clear();
-			await vi.advanceTimersByTimeAsync(0);
+			expect(() => manager.clear()).toThrowError(AsyncResetRequiredError);
+			await manager.resetAll();
 			expect(await persistence.loadHistory()).toHaveLength(0);
 		});
 
-		it('should not crash when persistence clear fails', async () => {
+		it('surfaces persistence reset failure without clearing live state', async () => {
 			const persistence = new MockPersistence();
 			persistence.clearFail = true;
 			const manager = new HistoryManager({ persistence });
 
 			manager.addThought(createTestThought({ thought_number: 1 }));
-			manager.clear();
-			expect(manager.getHistoryLength()).toBe(0);
+			await expect(manager.resetAll()).rejects.toThrow('Clear failed');
+			expect(manager.getHistoryLength()).toBe(1);
+		});
+	});
+
+	describe('clear with active operations', () => {
+		it('rejects a synchronous session clear while that session is active', async () => {
+			const sessionLock = new SessionLock();
+			const manager = new HistoryManager({ sessionLock });
+			const sessionId = asSessionId('active-session');
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			manager.addThought(createTestThought({ thought: 'keep', session_id: sessionId }));
+			const activeOperation = sessionLock.withLock(sessionId, async () => {
+				entered.resolve();
+				await release.promise;
+			});
+			await entered.promise;
+
+			expect(() => manager.clear(sessionId)).toThrowError(AsyncResetRequiredError);
+			expect(manager.getHistory(sessionId).map((thought) => thought.thought)).toEqual(['keep']);
+
+			release.resolve();
+			await activeOperation;
+		});
+
+		it('allows a synchronous clear of an idle session while another session is active', async () => {
+			const sessionLock = new SessionLock();
+			const manager = new HistoryManager({ sessionLock });
+			const activeSessionId = asSessionId('active-session');
+			const idleSessionId = asSessionId('idle-session');
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			manager.addThought(createTestThought({ thought: 'remove', session_id: idleSessionId }));
+			const activeOperation = sessionLock.withLock(activeSessionId, async () => {
+				entered.resolve();
+				await release.promise;
+			});
+			await entered.promise;
+
+			manager.clear(idleSessionId);
+
+			expect(manager.getHistory(idleSessionId)).toEqual([]);
+			release.resolve();
+			await activeOperation;
+		});
+
+		it('rejects a synchronous global clear while any session is active', async () => {
+			const sessionLock = new SessionLock();
+			const manager = new HistoryManager({ sessionLock });
+			const sessionId = asSessionId('active-session');
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			manager.addThought(createTestThought({ thought: 'keep', session_id: sessionId }));
+			const activeOperation = sessionLock.withLock(sessionId, async () => {
+				entered.resolve();
+				await release.promise;
+			});
+			await entered.promise;
+
+			expect(() => manager.clear()).toThrowError(AsyncResetRequiredError);
+			expect(manager.getHistory(sessionId).map((thought) => thought.thought)).toEqual(['keep']);
+
+			release.resolve();
+			await activeOperation;
 		});
 	});
 
@@ -864,9 +942,7 @@ describe('HistoryManager', () => {
 			const manager = new HistoryManager();
 
 			for (let i = 0; i < 10; i++) {
-				manager.addThought(
-					createTestThought({ thought_number: 1, session_id: `session-${i}` })
-				);
+				manager.addThought(createTestThought({ thought_number: 1, session_id: `session-${i}` }));
 			}
 
 			expect(manager.getSessionCount()).toBe(10);
@@ -878,9 +954,7 @@ describe('HistoryManager', () => {
 
 			// MAX_SESSIONS is 100. Create 100 sessions.
 			for (let i = 0; i < 100; i++) {
-				manager.addThought(
-					createTestThought({ thought_number: 1, session_id: `s-${i}` })
-				);
+				manager.addThought(createTestThought({ thought_number: 1, session_id: `s-${i}` }));
 				// Small time advance to ensure distinct lastAccessedAt
 				vi.advanceTimersByTime(1);
 			}
@@ -888,9 +962,7 @@ describe('HistoryManager', () => {
 			expect(manager.getSessionCount()).toBe(100);
 
 			// Creating the 101st session should evict the oldest (s-0)
-			manager.addThought(
-				createTestThought({ thought_number: 1, session_id: 'overflow' })
-			);
+			manager.addThought(createTestThought({ thought_number: 1, session_id: 'overflow' }));
 
 			expect(manager.getSessionCount()).toBe(100);
 			expect(manager.getSessionIds()).not.toContain('s-0');
@@ -899,6 +971,35 @@ describe('HistoryManager', () => {
 	});
 
 	describe('session persistence', () => {
+		it('awaitably resets only the requested durable and live session', async () => {
+			const persistence = new MockPersistence();
+			const manager = new HistoryManager({
+				persistence,
+				persistenceBufferSize: 100,
+				persistenceFlushInterval: 60000,
+			});
+			manager.addThought(createTestThought({ thought: 'a-old', session_id: 'a' }));
+			manager.addThought(createTestThought({ thought: 'b-keep', session_id: 'b' }));
+			await manager._flushBuffer();
+
+			await manager.resetSession('a');
+
+			expect(manager.getHistoryLength('a')).toBe(0);
+			expect(manager.getHistory('b').map((thought) => thought.thought)).toEqual(['b-keep']);
+			expect(await persistence.loadHistoryForSession(asSessionId('a'))).toEqual([]);
+			expect(await persistence.loadHistoryForSession(asSessionId('b'))).toHaveLength(1);
+			await manager.shutdown();
+		});
+
+		it('rejects legacy clear synchronously before mutating a persistent scope', () => {
+			const persistence = new MockPersistence();
+			const manager = new HistoryManager({ persistence, persistenceFlushInterval: 60000 });
+			manager.addThought(createTestThought({ thought: 'keep', session_id: 'a' }));
+
+			expect(() => manager.clear('a')).toThrowError(AsyncResetRequiredError);
+			expect(manager.getHistory('a').map((thought) => thought.thought)).toEqual(['keep']);
+		});
+
 		it('buffers writes per session', () => {
 			const persistence = new MockPersistence();
 			const manager = new HistoryManager({
@@ -996,7 +1097,14 @@ describe('ABSOLUTE_MAX_HISTORY_SIZE cap', () => {
 	});
 
 	it('should log warning when capping occurs', () => {
-		const mockLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), setLevel: vi.fn(), getLevel: vi.fn() } as Logger;
+		const mockLogger = {
+			info: vi.fn(),
+			warn: vi.fn(),
+			error: vi.fn(),
+			debug: vi.fn(),
+			setLevel: vi.fn(),
+			getLevel: vi.fn(),
+		} as Logger;
 		new HistoryManager({ maxHistorySize: 50_000, logger: mockLogger });
 		expect(mockLogger.warn).toHaveBeenCalledWith(
 			'maxHistorySize exceeds absolute maximum, capped',
@@ -1016,9 +1124,20 @@ describe('HistoryManager — uncovered branches', () => {
 			const persistence = new MockPersistence();
 			// Hold the first write so the coordinator keeps one drain generation active.
 			let resolveSave!: () => void;
-			const savePromise = new Promise<void>((resolve) => { resolveSave = resolve; });
-			persistence.saveThought = async () => { await savePromise; };
-			const mockLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), setLevel: vi.fn(), getLevel: vi.fn() } as Logger;
+			const savePromise = new Promise<void>((resolve) => {
+				resolveSave = resolve;
+			});
+			persistence.saveThought = async () => {
+				await savePromise;
+			};
+			const mockLogger = {
+				info: vi.fn(),
+				warn: vi.fn(),
+				error: vi.fn(),
+				debug: vi.fn(),
+				setLevel: vi.fn(),
+				getLevel: vi.fn(),
+			} as Logger;
 			const manager = new HistoryManager({
 				persistence,
 				persistenceBufferSize: 1,
@@ -1055,8 +1174,17 @@ describe('HistoryManager — uncovered branches', () => {
 		it('should catch and log when persistence throws during load', async () => {
 			const persistence = new MockPersistence();
 			// healthy returns true, but loadHistory throws
-			persistence.loadHistory = async () => { throw new Error('Disk I/O error'); };
-			const mockLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), setLevel: vi.fn(), getLevel: vi.fn() } as Logger;
+			persistence.loadHistory = async () => {
+				throw new Error('Disk I/O error');
+			};
+			const mockLogger = {
+				info: vi.fn(),
+				warn: vi.fn(),
+				error: vi.fn(),
+				debug: vi.fn(),
+				setLevel: vi.fn(),
+				getLevel: vi.fn(),
+			} as Logger;
 			const manager = new HistoryManager({ persistence, logger: mockLogger });
 
 			await manager.loadFromPersistence();
@@ -1070,8 +1198,17 @@ describe('HistoryManager — uncovered branches', () => {
 
 		it('should catch non-Error throws during load', async () => {
 			const persistence = new MockPersistence();
-			persistence.loadHistory = async () => { throw 'string error'; };
-			const mockLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), setLevel: vi.fn(), getLevel: vi.fn() } as Logger;
+			persistence.loadHistory = async () => {
+				throw 'string error';
+			};
+			const mockLogger = {
+				info: vi.fn(),
+				warn: vi.fn(),
+				error: vi.fn(),
+				debug: vi.fn(),
+				setLevel: vi.fn(),
+				getLevel: vi.fn(),
+			} as Logger;
 			const manager = new HistoryManager({ persistence, logger: mockLogger });
 
 			await manager.loadFromPersistence();
@@ -1091,13 +1228,15 @@ describe('HistoryManager — uncovered branches', () => {
 			const manager = new HistoryManager({ persistence });
 
 			// Access private _flushTimer to verify it's set
-			const timer1 = (manager as unknown as { _flushTimer: ReturnType<typeof setInterval> | null })._flushTimer;
+			const timer1 = (manager as unknown as { _flushTimer: ReturnType<typeof setInterval> | null })
+				._flushTimer;
 			expect(timer1).not.toBeNull();
 
 			// Calling _startFlushTimer again should be a no-op
 			(manager as unknown as { _startFlushTimer: () => void })._startFlushTimer();
 
-			const timer2 = (manager as unknown as { _flushTimer: ReturnType<typeof setInterval> | null })._flushTimer;
+			const timer2 = (manager as unknown as { _flushTimer: ReturnType<typeof setInterval> | null })
+				._flushTimer;
 			expect(timer2).toBe(timer1);
 
 			manager.shutdown();
@@ -1122,8 +1261,13 @@ describe('HistoryManager — uncovered branches', () => {
 
 			// Simplest approach: override MAX_SESSIONS to 0 via Object.defineProperty
 			// which forces the while loop to trigger, but since only __global__ exists, oldestKey=null → break
-			const originalMaxSessions = (HistoryManager as unknown as { MAX_SESSIONS: number }).MAX_SESSIONS;
-			Object.defineProperty(HistoryManager, 'MAX_SESSIONS', { value: 0, writable: true, configurable: true });
+			const originalMaxSessions = (HistoryManager as unknown as { MAX_SESSIONS: number })
+				.MAX_SESSIONS;
+			Object.defineProperty(HistoryManager, 'MAX_SESSIONS', {
+				value: 0,
+				writable: true,
+				configurable: true,
+			});
 
 			try {
 				// Trigger _evictExcessSessions by creating a new session
@@ -1135,7 +1279,11 @@ describe('HistoryManager — uncovered branches', () => {
 				// If we got here without infinite loop, the break branch was hit
 				expect(sessions.size).toBeGreaterThan(0);
 			} finally {
-				Object.defineProperty(HistoryManager, 'MAX_SESSIONS', { value: originalMaxSessions, writable: true, configurable: true });
+				Object.defineProperty(HistoryManager, 'MAX_SESSIONS', {
+					value: originalMaxSessions,
+					writable: true,
+					configurable: true,
+				});
 			}
 		});
 	});
@@ -1300,7 +1448,11 @@ describe('HistoryManager — declarative branch registration', () => {
 	it('branchExists returns true for branches created via addThought', () => {
 		const manager = new HistoryManager();
 		manager.addThought(
-			createTestThought({ thought_number: 1, branch_from_thought: 1, branch_id: asBranchId('alt-2') })
+			createTestThought({
+				thought_number: 1,
+				branch_from_thought: 1,
+				branch_id: asBranchId('alt-2'),
+			})
 		);
 		expect(manager.branchExists(undefined, asBranchId('alt-2'))).toBe(true);
 	});
@@ -1340,14 +1492,20 @@ describe('HistoryManager — declarative branch registration', () => {
 		expect(manager.branchExists(asSessionId('session-b'), asBranchId('shared-name'))).toBe(false);
 
 		// Same name can be registered in a different session without conflict
-		expect(() => manager.registerBranch(asSessionId('session-b'), asBranchId('shared-name'))).not.toThrow();
+		expect(() =>
+			manager.registerBranch(asSessionId('session-b'), asBranchId('shared-name'))
+		).not.toThrow();
 		expect(manager.branchExists(asSessionId('session-b'), asBranchId('shared-name'))).toBe(true);
 	});
 
 	it('getBranchIds merges thought-backed and registered branches without duplicates', () => {
 		const manager = new HistoryManager();
 		manager.addThought(
-			createTestThought({ thought_number: 1, branch_from_thought: 1, branch_id: asBranchId('with-thoughts') })
+			createTestThought({
+				thought_number: 1,
+				branch_from_thought: 1,
+				branch_id: asBranchId('with-thoughts'),
+			})
 		);
 		manager.registerBranch(undefined, asBranchId('registered-only'));
 

@@ -12,11 +12,15 @@
  * @module HistoryManager
  */
 
-import type { IMetrics } from '../contracts/interfaces.js';
-import type { IEdgeStore } from '../contracts/interfaces.js';
-import { asSessionId, type BranchId, type SessionId } from '../contracts/ids.js';
+import type { IEdgeStore, IMetrics, ISessionLock } from '../contracts/interfaces.js';
+import { asSessionId, GLOBAL_SESSION_ID, type BranchId, type SessionId } from '../contracts/ids.js';
 import type { ISummaryStore } from '../contracts/summary.js';
-import { ValidationError, SessionAccessDeniedError, getErrorMessage } from '../errors.js';
+import {
+	AsyncResetRequiredError,
+	ValidationError,
+	SessionAccessDeniedError,
+	getErrorMessage,
+} from '../errors.js';
 import { NullLogger } from '../logger/NullLogger.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import type { PersistenceBackend } from '../contracts/PersistenceBackend.js';
@@ -27,12 +31,12 @@ import {
 } from './compression/DehydrationPolicy.js';
 import type { Summary } from './compression/Summary.js';
 import { EdgeEmitter } from './graph/EdgeEmitter.js';
-import type { IHistoryManager } from './IHistoryManager.js';
+import type { HistorySessionSnapshot, IHistoryManager } from './IHistoryManager.js';
 import { PersistenceBuffer, type PersistenceEventEmitter } from './PersistenceBuffer.js';
 import { SessionManager } from './SessionManager.js';
+import { SessionResetCoordinator } from './SessionResetCoordinator.js';
 import type { ThoughtData } from './thought.js';
 import { getOwner } from '../context/RequestContext.js';
-
 
 /** Absolute maximum history size (~20MB at 2KB/thought). Cannot be overridden. */
 export const ABSOLUTE_MAX_HISTORY_SIZE = 10_000;
@@ -72,6 +76,8 @@ export interface HistoryManagerConfig {
 	dagEdges?: boolean;
 	/** Maximum sessions per owner (per-owner LRU bucket). @default 50 */
 	maxSessionsPerOwner?: number;
+	/** Shared processor lock used to reject unsafe legacy synchronous clears. */
+	sessionLock?: ISessionLock;
 }
 
 /**
@@ -83,7 +89,7 @@ export interface HistoryManagerConfig {
  * `_flushBuffer`, `_sessions`).
  */
 export class HistoryManager implements IHistoryManager {
-	private static readonly DEFAULT_SESSION = '__global__';
+	private static readonly DEFAULT_SESSION = GLOBAL_SESSION_ID;
 	private static readonly SESSION_TTL_MS = 30 * 60 * 1000;
 	private static readonly MAX_SESSIONS = 100;
 	private _sessions: Map<SessionId, SessionState> = new Map();
@@ -104,6 +110,8 @@ export class HistoryManager implements IHistoryManager {
 	private readonly _edgeEmitter: EdgeEmitter;
 	private _persistenceBuffer: PersistenceBuffer<SessionState> | null;
 	private readonly _sessionManager: SessionManager<SessionState>;
+	private readonly _resetCoordinator: SessionResetCoordinator<SessionState>;
+	private readonly _sessionLock?: ISessionLock;
 
 	constructor(config: HistoryManagerConfig = {}) {
 		this._logger = config.logger ?? new NullLogger();
@@ -124,6 +132,7 @@ export class HistoryManager implements IHistoryManager {
 		this._edgeStore = config.edgeStore;
 		this._summaryStore = config.summaryStore;
 		this._dagEdges = config.dagEdges ?? true;
+		this._sessionLock = config.sessionLock;
 
 		// Wire delegates
 		this._edgeEmitter = new EdgeEmitter({
@@ -158,6 +167,15 @@ export class HistoryManager implements IHistoryManager {
 			});
 			this._startFlushTimer();
 		}
+		this._resetCoordinator = new SessionResetCoordinator({
+			persistence: this._persistence,
+			barrier: this._persistenceBuffer,
+			edgeStore: this._edgeStore,
+			summaryStore: this._summaryStore,
+			sessions: this._sessions,
+			createSessionState: (owner) => this._createSessionState(owner),
+			logger: this._logger,
+		});
 
 		this._sessionManager.startCleanupTimer(this._sessions);
 	}
@@ -226,19 +244,10 @@ export class HistoryManager implements IHistoryManager {
 	 *   (e.g. by stdio), the owner is set on first owner-aware access.
 	 */
 	private _getSession(sessionId?: string, owner?: string): SessionState {
-		const key = sessionId === undefined ? asSessionId(HistoryManager.DEFAULT_SESSION) : asSessionId(sessionId);
+		const key = sessionId === undefined ? HistoryManager.DEFAULT_SESSION : asSessionId(sessionId);
 		let session = this._sessions.get(key);
 		if (!session) {
-			session = {
-				thought_history: [],
-				branches: {},
-				availableMcpTools: undefined,
-				availableSkills: undefined,
-				writeBuffer: [],
-				lastAccessedAt: Date.now(),
-				registeredBranches: new Set<BranchId>(),
-				owner,
-			};
+			session = this._createSessionState(owner);
 			this._sessions.set(key, session);
 			this._sessionManager.evictExcessSessions(this._sessions);
 		} else if (owner !== undefined) {
@@ -256,12 +265,44 @@ export class HistoryManager implements IHistoryManager {
 		return session;
 	}
 
+	private _createSessionState(owner?: string): SessionState {
+		return {
+			thought_history: [],
+			branches: {},
+			availableMcpTools: undefined,
+			availableSkills: undefined,
+			writeBuffer: [],
+			lastAccessedAt: Date.now(),
+			registeredBranches: new Set<BranchId>(),
+			owner,
+		};
+	}
+
+	private _authorizeExistingSession(
+		sessionId: SessionId,
+		owner: string | undefined
+	): string | undefined {
+		const sessionOwner = this._sessions.get(sessionId)?.owner;
+		if (owner !== undefined && sessionOwner !== undefined && sessionOwner !== owner) {
+			throw new SessionAccessDeniedError(sessionId, sessionOwner, owner);
+		}
+		return sessionOwner ?? owner;
+	}
+
+	private _assertOwnerlessResetAll(): void {
+		const owner = this._getCurrentOwner();
+		if (owner === undefined) return;
+		const firstSessionId = this._sessions.keys().next().value ?? HistoryManager.DEFAULT_SESSION;
+		throw new SessionAccessDeniedError(firstSessionId, 'trusted ownerless context', owner);
+	}
+
 	/**
 	 * Adds a thought to the history. Routes per-session, applies retraction for backtrack,
 	 * caches tools/skills, trims, branches, emits DAG edges, and buffers for persistence.
 	 */
 	public addThought(thought: ThoughtData): void {
 		const sessionId = asSessionId(thought.session_id ?? HistoryManager.DEFAULT_SESSION);
+		this._persistenceBuffer?.assertSessionAdmissionOpen(sessionId);
 		const session = this._getSession(sessionId, this._getCurrentOwner());
 		this._metrics?.counter(
 			'thought_requests_total',
@@ -396,10 +437,7 @@ export class HistoryManager implements IHistoryManager {
 	 * Returns history with optional sliding-window dehydration. Non-mutating: when
 	 * `dagEdges` is off OR no `ISummaryStore` is configured, returns same as getHistory.
 	 */
-	public getHistoryHydrated(
-		sessionId?: string,
-		opts?: DehydrationOptions
-	): HydratedEntry[] {
+	public getHistoryHydrated(sessionId?: string, opts?: DehydrationOptions): HydratedEntry[] {
 		const history = this.getHistory(sessionId);
 		if (!this._dagEdges || !this._summaryStore) {
 			return history.slice();
@@ -424,12 +462,43 @@ export class HistoryManager implements IHistoryManager {
 		return Array.from(ids);
 	}
 
+	/** Returns validation state without creating a session, binding an owner, or updating LRU data. */
+	public inspectSession(sessionId: string): HistorySessionSnapshot {
+		const canonicalSessionId = asSessionId(sessionId);
+		this._authorizeExistingSession(canonicalSessionId, this._getCurrentOwner());
+		const session = this._sessions.get(canonicalSessionId);
+		if (session === undefined) {
+			return {
+				history: [],
+				branches: {},
+				branchIds: [],
+				availableMcpTools: undefined,
+				availableSkills: undefined,
+			};
+		}
+		const branchIds = new Set<BranchId>(Object.keys(session.branches) as BranchId[]);
+		for (const branchId of session.registeredBranches) branchIds.add(branchId);
+		return {
+			history: [...session.thought_history],
+			branches: Object.fromEntries(
+				Object.entries(session.branches).map(([branchId, thoughts]) => [branchId, [...thoughts]])
+			) as Record<BranchId, readonly ThoughtData[]>,
+			branchIds: Array.from(branchIds),
+			availableMcpTools:
+				session.availableMcpTools === undefined ? undefined : [...session.availableMcpTools],
+			availableSkills:
+				session.availableSkills === undefined ? undefined : [...session.availableSkills],
+		};
+	}
+
 	/** @throws {ValidationError} If branchId is empty or already exists. */
 	public registerBranch(sessionId: string | undefined, branchId: BranchId): void {
 		if (typeof branchId !== 'string' || branchId.length === 0) {
 			throw new ValidationError('branch_id', 'branch_id must be a non-empty string');
 		}
-		const session = this._getSession(sessionId, this._getCurrentOwner());
+		const canonicalSessionId = asSessionId(sessionId ?? HistoryManager.DEFAULT_SESSION);
+		this._persistenceBuffer?.assertSessionAdmissionOpen(canonicalSessionId);
+		const session = this._getSession(canonicalSessionId, this._getCurrentOwner());
 		if (branchId in session.branches || session.registeredBranches.has(branchId)) {
 			throw new ValidationError('branch_id', `Branch already exists: ${branchId}`);
 		}
@@ -454,42 +523,42 @@ export class HistoryManager implements IHistoryManager {
 		return this._getSession(sessionId, this._getCurrentOwner()).branches[branchId];
 	}
 
-	/** Clears history and branches. If sessionId provided, clears only that session. */
+	/** Clears only persistence-disabled state synchronously. */
 	public clear(sessionId?: string): void {
-		// Enforce ownership before clearing a specific session.
-		// _getSession throws SessionAccessDeniedError on owner mismatch.
 		if (sessionId !== undefined) {
-			this._getSession(sessionId, this._getCurrentOwner());
-		}
-		// Clear edges from EdgeStore (before session map mutation so keys are still available)
-		if (this._edgeStore) {
-			if (sessionId !== undefined) {
-				this._edgeStore.clearSession(asSessionId(sessionId));
-			} else {
-			for (const sid of this._sessions.keys()) {
-				this._edgeStore.clearSession(sid);
-				}
-				// Also clear the default session in case no session entries exist yet
-			this._edgeStore.clearSession(asSessionId(HistoryManager.DEFAULT_SESSION));
+			const canonicalSessionId = asSessionId(sessionId);
+			this._authorizeExistingSession(canonicalSessionId, this._getCurrentOwner());
+			if (this._sessionLock?.isActive(canonicalSessionId) === true) {
+				throw new AsyncResetRequiredError('session', canonicalSessionId, 'active');
 			}
+			this._resetCoordinator.clearSession(canonicalSessionId);
+			return;
 		}
+		this._assertOwnerlessResetAll();
+		if (this._sessionLock !== undefined && this._sessionLock.size > 0) {
+			throw new AsyncResetRequiredError('all', undefined, 'active');
+		}
+		this._resetCoordinator.clearAll();
+	}
 
-		if (sessionId !== undefined) {
-			this._sessions.delete(asSessionId(sessionId));
-			this.log('Session cleared', { sessionId });
-		} else {
-			this._sessions.clear();
-			this.log('History cleared (all sessions)');
-		}
+	/** Awaitably deletes one authorized durable namespace before replacing its live state. */
+	public async resetSession(sessionId: string, clearAuxiliaryState?: () => void): Promise<void> {
+		const canonicalSessionId = asSessionId(sessionId);
+		const preservedOwner = this._authorizeExistingSession(
+			canonicalSessionId,
+			this._getCurrentOwner()
+		);
+		await this._resetCoordinator.resetSession(
+			canonicalSessionId,
+			preservedOwner,
+			clearAuxiliaryState
+		);
+	}
 
-		// Clear persisted data if enabled
-		if (this._persistenceEnabled && this._persistence) {
-			this._persistence.clear().catch((err) => {
-				this.log('Failed to clear persisted data', {
-					error: getErrorMessage(err),
-				});
-			});
-		}
+	/** Awaitably deletes all durable namespaces from a trusted ownerless context. */
+	public async resetAll(clearAuxiliaryState?: () => void): Promise<void> {
+		this._assertOwnerlessResetAll();
+		await this._resetCoordinator.resetAll(clearAuxiliaryState);
 	}
 
 	public clearSession(sessionId: string): void {
@@ -555,7 +624,7 @@ export class HistoryManager implements IHistoryManager {
 						}
 					}
 					this.log(
-						`Loaded ${totalEdges} edges across ${edgeSessions.length} sessions from persistence`,
+						`Loaded ${totalEdges} edges across ${edgeSessions.length} sessions from persistence`
 					);
 				} catch (edgeError) {
 					this.log('Failed to load edges from persistence', {
