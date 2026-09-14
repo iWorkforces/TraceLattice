@@ -1,29 +1,45 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, unlink } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
-import * as v from 'valibot';
+import { join } from 'node:path';
 import type { IMetrics } from '../contracts/interfaces.js';
-import type { ThoughtData } from '../core/thought.js';
-import type { Edge } from '../core/graph/Edge.js';
+import type {
+	PersistenceConfig,
+	SessionScopedPersistenceBackend,
+} from '../contracts/PersistenceBackend.js';
+import { asSessionId, GLOBAL_SESSION_ID, type BranchId, type SessionId } from '../contracts/ids.js';
 import type { Summary } from '../core/compression/Summary.js';
-import type { PersistenceBackend, PersistenceConfig } from '../contracts/PersistenceBackend.js';
-import { asBranchId, asSessionId, type BranchId, type SessionId } from '../contracts/ids.js';
-import { SequentialThinkingSchema, EdgeSchema } from '../schema.js';
-import { SummarySchema } from '../core/compression/Summary.js';
-import { PersistenceCorruptionError, ValidationError } from '../errors.js';
+import type { Edge } from '../core/graph/Edge.js';
+import type { ThoughtData } from '../core/thought.js';
+import { PersistenceImportRequiredError } from '../errors.js';
+import {
+	EMPTY_FILE_SNAPSHOT_V2,
+	parseFileSnapshotV2,
+	serializeFileSnapshotV2,
+	sessionsInSnapshot,
+	type FileSnapshotV2,
+} from './FileSnapshotV2.js';
 import { FileWriter, isFileNotFound, type FileWriterOperations } from './FileWriter.js';
-
-const ThoughtArraySchema = v.array(SequentialThinkingSchema);
-const EdgeArraySchema = v.array(EdgeSchema);
-const SummaryArraySchema = v.array(SummarySchema);
+import {
+	assertBranchScope,
+	assertEdgeScopes,
+	assertPersistableThoughtCollections,
+	assertPersistableThoughts,
+	assertSummaryScopes,
+	assertThoughtScope,
+	compareCodePoint,
+	parsePersistenceBranchId,
+} from './PersistenceScope.js';
 
 type FilePersistenceOptions = NonNullable<PersistenceConfig['options']> & {
 	readonly metrics?: IMetrics;
 	readonly writerOperations?: FileWriterOperations;
 };
 
-export class FilePersistence implements PersistenceBackend {
+const SNAPSHOT_NAME = 'snapshot.json';
+const LEGACY_DIRECTORIES = ['branches', 'edges', 'summaries'] as const;
+
+export class FilePersistence implements SessionScopedPersistenceBackend {
 	private readonly _dataDir: string;
 	private readonly _maxHistorySize: number;
 	private readonly _persistBranches: boolean;
@@ -45,6 +61,7 @@ export class FilePersistence implements PersistenceBackend {
 		const persistence = new FilePersistence(options);
 		try {
 			await persistence._writer.ready();
+			await persistence._writer.run(async (dataDir) => await persistence._loadSnapshot(dataDir));
 			return persistence;
 		} catch (error) {
 			await persistence.close();
@@ -53,94 +70,218 @@ export class FilePersistence implements PersistenceBackend {
 	}
 
 	public async saveThought(thought: ThoughtData): Promise<void> {
-		await this._measure('save_thought', async () => {
-			await this._writer.run(async (dataDir) => {
-				await this._ensureDirectories(dataDir);
-				const historyPath = join(dataDir, 'history.json');
-				const loadStartTime = Date.now();
-				let history: ThoughtData[];
-				try {
-					history =
-						(await this._loadArray<ThoughtData>(historyPath, ThoughtArraySchema, 'history')) ?? [];
-				} finally {
-					this._recordOperationDuration('load_history', loadStartTime);
-				}
-				history.push(thought);
-				if (history.length > this._maxHistorySize) {
-					history.splice(0, history.length - this._maxHistorySize);
-				}
-				await this._writer.publish(historyPath, JSON.stringify(history, null, 2));
-			});
+		assertThoughtScope('saveThought', GLOBAL_SESSION_ID, thought);
+		await this._saveThought(GLOBAL_SESSION_ID, thought);
+	}
+
+	public async saveThoughtForSession(sessionId: SessionId, thought: ThoughtData): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		assertThoughtScope('saveThoughtForSession', validatedSessionId, thought);
+		await this._saveThought(validatedSessionId, thought);
+	}
+
+	private async _saveThought(sessionId: SessionId, thought: ThoughtData): Promise<void> {
+		assertPersistableThoughts([thought], `${sessionId}/thoughts`);
+		await this._mutate('save_thought', (snapshot) => {
+			const current =
+				snapshot.thoughts.find((record) => record.sessionId === sessionId)?.thoughts ?? [];
+			const prospective = [...current, thought];
+			assertPersistableThoughtCollections(
+				[
+					{ sessionId, thoughts: prospective },
+					...snapshot.branches
+						.filter((record) => record.sessionId === sessionId)
+						.map((record) => ({ sessionId, thoughts: record.thoughts })),
+				],
+				`${sessionId}/thoughts`
+			);
+			const retained =
+				this._maxHistorySize > 0 ? prospective.slice(-this._maxHistorySize) : prospective;
+			return {
+				...snapshot,
+				thoughts: [
+					...snapshot.thoughts.filter((record) => record.sessionId !== sessionId),
+					{ sessionId, thoughts: retained },
+				],
+			};
 		});
 	}
 
 	public async loadHistory(): Promise<ThoughtData[]> {
-		return await this._measure('load_history', async () => {
-			return await this._writer.run(
-				async (dataDir) =>
-					(await this._loadArray<ThoughtData>(
-						join(dataDir, 'history.json'),
-						ThoughtArraySchema,
-						'history'
-					)) ?? []
-			);
-		});
+		return await this.loadHistoryForSession(GLOBAL_SESSION_ID);
+	}
+
+	public async loadHistoryForSession(sessionId: SessionId): Promise<ThoughtData[]> {
+		const validatedSessionId = asSessionId(sessionId);
+		return await this._read('load_history', (snapshot) => [
+			...(snapshot.thoughts.find((record) => record.sessionId === validatedSessionId)?.thoughts ??
+				[]),
+		]);
 	}
 
 	public async saveBranch(branchId: BranchId, thoughts: ThoughtData[]): Promise<void> {
-		await this._measure('save_branch', async () => {
-			if (!this._persistBranches) {
-				return;
-			}
+		const validatedBranchId = parsePersistenceBranchId(branchId, 'global/branches');
+		assertBranchScope('saveBranch', GLOBAL_SESSION_ID, validatedBranchId, thoughts);
+		await this._saveBranch(GLOBAL_SESSION_ID, validatedBranchId, thoughts);
+	}
+
+	public async saveBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId,
+		thoughts: readonly ThoughtData[]
+	): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		const validatedBranchId = parsePersistenceBranchId(branchId, `${validatedSessionId}/branches`);
+		assertBranchScope('saveBranchForSession', validatedSessionId, validatedBranchId, thoughts);
+		await this._saveBranch(validatedSessionId, validatedBranchId, thoughts);
+	}
+
+	private async _saveBranch(
+		sessionId: SessionId,
+		branchId: BranchId,
+		thoughts: readonly ThoughtData[]
+	): Promise<void> {
+		assertPersistableThoughtCollections(
+			[{ sessionId, thoughts }],
+			`${sessionId}/branches/${branchId}`
+		);
+		if (!this._persistBranches) {
 			await this._writer.run(async (dataDir) => {
-				await this._ensureDirectories(dataDir);
-				await this._writer.publish(
-					this._safePath(join(dataDir, 'branches'), branchId, 64),
-					JSON.stringify(thoughts, null, 2)
+				const snapshot = await this._loadSnapshot(dataDir);
+				assertPersistableThoughtCollections(
+					[
+						{
+							sessionId,
+							thoughts:
+								snapshot.thoughts.find((record) => record.sessionId === sessionId)?.thoughts ?? [],
+						},
+						...snapshot.branches
+							.filter((record) => record.sessionId === sessionId)
+							.map((record) => ({ sessionId, thoughts: record.thoughts })),
+						{ sessionId, thoughts },
+					],
+					`${sessionId}/branches/${branchId}`
 				);
 			});
-		});
+			return;
+		}
+		await this._mutate('save_branch', (snapshot) => ({
+			...snapshot,
+			branches: [
+				...snapshot.branches.filter(
+					(record) => record.sessionId !== sessionId || record.branchId !== branchId
+				),
+				{ sessionId, branchId, thoughts: [...thoughts] },
+			],
+		}));
 	}
 
 	public async loadBranch(branchId: BranchId): Promise<ThoughtData[] | undefined> {
-		return await this._measure('load_branch', async () => {
-			if (!this._persistBranches) {
-				return undefined;
-			}
-			return await this._writer.run(
-				async (dataDir) =>
-					await this._loadArray<ThoughtData>(
-						this._safePath(join(dataDir, 'branches'), branchId, 64),
-						ThoughtArraySchema,
-						'branch'
-					)
-			);
+		return await this.loadBranchForSession(GLOBAL_SESSION_ID, branchId);
+	}
+
+	public async loadBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId
+	): Promise<ThoughtData[] | undefined> {
+		if (!this._persistBranches) return undefined;
+		const validatedSessionId = asSessionId(sessionId);
+		const validatedBranchId = parsePersistenceBranchId(branchId, `${validatedSessionId}/branches`);
+		return await this._read('load_branch', (snapshot) => {
+			const thoughts = snapshot.branches.find(
+				(record) => record.sessionId === validatedSessionId && record.branchId === validatedBranchId
+			)?.thoughts;
+			return thoughts === undefined ? undefined : [...thoughts];
 		});
 	}
 
 	public async listBranches(): Promise<BranchId[]> {
-		return (await this.getBranchIds()).map((id) => asBranchId(id));
+		return await this.listBranchesForSession(GLOBAL_SESSION_ID);
+	}
+
+	public async listBranchesForSession(sessionId: SessionId): Promise<BranchId[]> {
+		if (!this._persistBranches) return [];
+		const validatedSessionId = asSessionId(sessionId);
+		return await this._read('list_branches', (snapshot) =>
+			snapshot.branches
+				.filter((record) => record.sessionId === validatedSessionId)
+				.map((record) => record.branchId)
+				.sort(compareCodePoint)
+		);
+	}
+
+	public async listSessions(): Promise<SessionId[]> {
+		return await this._read('list_sessions', sessionsInSnapshot);
 	}
 
 	public async clear(): Promise<void> {
-		await this._writer.run(async (dataDir) => {
-			await this._unlinkIfPresent(join(dataDir, 'history.json'));
-			if (this._persistBranches) {
-				await this._clearJsonFiles(join(dataDir, 'branches'));
-			}
-			await this._clearJsonFiles(join(dataDir, 'edges'));
-			await this._clearJsonFiles(join(dataDir, 'summaries'));
-		});
+		await this._mutate('clear', () => EMPTY_FILE_SNAPSHOT_V2);
+	}
+
+	public async clearSession(sessionId: SessionId): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		await this._mutate('clear_session', (snapshot) => ({
+			version: 2,
+			thoughts: snapshot.thoughts.filter((record) => record.sessionId !== validatedSessionId),
+			branches: snapshot.branches.filter((record) => record.sessionId !== validatedSessionId),
+			edges: snapshot.edges.filter((record) => record.sessionId !== validatedSessionId),
+			summaries: snapshot.summaries.filter((record) => record.sessionId !== validatedSessionId),
+		}));
+	}
+
+	public async saveEdges(sessionId: SessionId, edges: readonly Edge[]): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		assertEdgeScopes(validatedSessionId, edges);
+		await this._mutate('save_edges', (snapshot) => ({
+			...snapshot,
+			edges: [
+				...snapshot.edges.filter((record) => record.sessionId !== validatedSessionId),
+				...(edges.length === 0 ? [] : [{ sessionId: validatedSessionId, edges: [...edges] }]),
+			],
+		}));
+	}
+
+	public async loadEdges(sessionId: SessionId): Promise<Edge[]> {
+		const validatedSessionId = asSessionId(sessionId);
+		return await this._read('load_edges', (snapshot) => [
+			...(snapshot.edges.find((record) => record.sessionId === validatedSessionId)?.edges ?? []),
+		]);
+	}
+
+	public async listEdgeSessions(): Promise<SessionId[]> {
+		return await this._read('list_edge_sessions', (snapshot) =>
+			snapshot.edges.map((record) => record.sessionId).sort(compareCodePoint)
+		);
+	}
+
+	public async saveSummaries(sessionId: SessionId, summaries: readonly Summary[]): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		assertSummaryScopes(validatedSessionId, summaries);
+		await this._mutate('save_summaries', (snapshot) => ({
+			...snapshot,
+			summaries: [
+				...snapshot.summaries.filter((record) => record.sessionId !== validatedSessionId),
+				...(summaries.length === 0
+					? []
+					: [{ sessionId: validatedSessionId, summaries: [...summaries] }]),
+			],
+		}));
+	}
+
+	public async loadSummaries(sessionId: SessionId): Promise<Summary[]> {
+		const validatedSessionId = asSessionId(sessionId);
+		return await this._read('load_summaries', (snapshot) => [
+			...(snapshot.summaries.find((record) => record.sessionId === validatedSessionId)?.summaries ??
+				[]),
+		]);
 	}
 
 	public async healthy(): Promise<boolean> {
 		try {
-			await this._writer.run(async (dataDir) => await this._ensureDirectories(dataDir));
+			await this._writer.run(async (dataDir) => await this._loadSnapshot(dataDir));
 			return true;
 		} catch (error) {
-			if (error instanceof Error) {
-				return false;
-			}
+			if (error instanceof Error) return false;
 			throw error;
 		}
 	}
@@ -150,84 +291,67 @@ export class FilePersistence implements PersistenceBackend {
 	}
 
 	public async getBranchIds(): Promise<string[]> {
-		if (!this._persistBranches) {
-			return [];
-		}
-		return await this._writer.run(async (dataDir) => {
-			return await this._listJsonIds(join(dataDir, 'branches'));
-		});
+		return await this.listBranches();
 	}
 
 	public async close(): Promise<void> {
 		await this._writer.close();
 	}
 
-	public async saveEdges(sessionId: SessionId, edges: readonly Edge[]): Promise<void> {
-		await this._measure('save_edges', async () => {
+	private async _read<T>(operation: string, select: (snapshot: FileSnapshotV2) => T): Promise<T> {
+		return await this._measure(
+			operation,
+			async () =>
+				await this._writer.run(async (dataDir) => select(await this._loadSnapshot(dataDir)))
+		);
+	}
+
+	private async _mutate(
+		operation: string,
+		mutate: (snapshot: FileSnapshotV2) => FileSnapshotV2
+	): Promise<void> {
+		await this._measure(operation, async () => {
 			await this._writer.run(async (dataDir) => {
-				await this._ensureDirectories(dataDir);
-				const edgePath = this._safePath(join(dataDir, 'edges'), sessionId, 100);
-				if (edges.length === 0) {
-					await this._unlinkIfPresent(edgePath);
-					return;
-				}
-				const sorted = [...edges].sort((left, right) => left.createdAt - right.createdAt);
-				await this._writer.publish(edgePath, JSON.stringify(sorted, null, 2));
+				const snapshotPath = join(dataDir, SNAPSHOT_NAME);
+				const updated = mutate(await this._loadSnapshot(dataDir));
+				await this._writer.publish(snapshotPath, serializeFileSnapshotV2(updated, snapshotPath));
 			});
 		});
 	}
 
-	public async loadEdges(sessionId: SessionId): Promise<Edge[]> {
-		return await this._measure('load_edges', async () => {
-			return await this._writer.run(
-				async (dataDir) =>
-					(await this._loadArray<Edge>(
-						this._safePath(join(dataDir, 'edges'), sessionId, 100),
-						EdgeArraySchema,
-						'edges'
-					)) ?? []
-			);
-		});
+	private async _loadSnapshot(dataDir: string): Promise<FileSnapshotV2> {
+		const snapshotPath = join(dataDir, SNAPSHOT_NAME);
+		try {
+			return parseFileSnapshotV2(await readFile(snapshotPath, 'utf-8'), snapshotPath);
+		} catch (error) {
+			if (!isFileNotFound(error)) throw error;
+		}
+		const legacyArtifacts = await this._legacyArtifacts(dataDir);
+		if (legacyArtifacts.length > 0) {
+			throw new PersistenceImportRequiredError(dataDir, legacyArtifacts);
+		}
+		return EMPTY_FILE_SNAPSHOT_V2;
 	}
 
-	public async listEdgeSessions(): Promise<SessionId[]> {
-		return await this._writer.run(async (dataDir) => {
-			return (await this._listJsonIds(join(dataDir, 'edges'))).map((id) => asSessionId(id));
-		});
-	}
-
-	public async saveSummaries(sessionId: SessionId, summaries: readonly Summary[]): Promise<void> {
-		await this._measure('save_summaries', async () => {
-			await this._writer.run(async (dataDir) => {
-				await this._ensureDirectories(dataDir);
-				const summaryPath = this._safePath(join(dataDir, 'summaries'), sessionId, 100);
-				if (summaries.length === 0) {
-					await this._unlinkIfPresent(summaryPath);
-					return;
-				}
-				const sorted = [...summaries].sort((left, right) => left.createdAt - right.createdAt);
-				await this._writer.publish(summaryPath, JSON.stringify(sorted, null, 2));
-			});
-		});
-	}
-
-	public async loadSummaries(sessionId: SessionId): Promise<Summary[]> {
-		return await this._measure('load_summaries', async () => {
-			return await this._writer.run(async (dataDir) => {
-				const summaries =
-					(await this._loadArray<Summary>(
-						this._safePath(join(dataDir, 'summaries'), sessionId, 100),
-						SummaryArraySchema,
-						'summaries'
-					)) ?? [];
-				return summaries.sort((left, right) => left.createdAt - right.createdAt);
-			});
-		});
-	}
-
-	private _recordOperationDuration(operation: string, startTime: number): void {
-		const durationSeconds = (Date.now() - startTime) / 1000;
-		this._metrics?.histogram('persistence_op_duration_seconds', durationSeconds, { operation });
+	private async _legacyArtifacts(dataDir: string): Promise<string[]> {
+		const artifacts: string[] = [];
+		try {
+			await readFile(join(dataDir, 'history.json'), 'utf-8');
+			artifacts.push('history.json');
+		} catch (error) {
+			if (!isFileNotFound(error)) throw error;
+		}
+		for (const directory of LEGACY_DIRECTORIES) {
+			try {
+				const files = await readdir(join(dataDir, directory));
+				artifacts.push(
+					...files.filter((file) => file.endsWith('.json')).map((file) => `${directory}/${file}`)
+				);
+			} catch (error) {
+				if (!isFileNotFound(error)) throw error;
+			}
+		}
+		return artifacts.sort(compareCodePoint);
 	}
 
 	private async _measure<T>(operation: string, action: () => Promise<T>): Promise<T> {
@@ -235,93 +359,9 @@ export class FilePersistence implements PersistenceBackend {
 		try {
 			return await action();
 		} finally {
-			this._recordOperationDuration(operation, startTime);
-		}
-	}
-
-	private async _ensureDirectories(dataDir: string): Promise<void> {
-		if (this._persistBranches) {
-			await mkdir(join(dataDir, 'branches'), { recursive: true });
-		}
-		await mkdir(join(dataDir, 'edges'), { recursive: true });
-		await mkdir(join(dataDir, 'summaries'), { recursive: true });
-	}
-
-	private _safePath(directory: string, id: string, maxLength: number): string {
-		const validIdPattern = new RegExp(`^[a-zA-Z0-9_-]{1,${maxLength}}$`);
-		if (!validIdPattern.test(id)) {
-			throw new ValidationError(
-				'persistenceId',
-				`must be 1-${maxLength} alphanumeric characters, hyphens, or underscores only`
-			);
-		}
-		const resolved = resolve(directory, `${id}.json`);
-		if (!resolved.startsWith(`${resolve(directory)}${sep}`)) {
-			throw new ValidationError('persistenceId', 'path traversal detected');
-		}
-		return resolved;
-	}
-
-	private async _loadArray<T>(
-		path: string,
-		schema: v.GenericSchema<unknown, unknown[]>,
-		metricFile: string
-	): Promise<T[] | undefined> {
-		let content: string;
-		try {
-			content = await readFile(path, 'utf-8');
-		} catch (error) {
-			if (isFileNotFound(error)) {
-				return undefined;
-			}
-			throw error;
-		}
-
-		try {
-			const raw: unknown = JSON.parse(content);
-			return v.parse(schema, raw) as unknown as T[];
-		} catch (error) {
-			this._metrics?.counter('persistence_validation_errors', 1, { file: metricFile });
-			throw new PersistenceCorruptionError(path, error);
-		}
-	}
-
-	private async _unlinkIfPresent(path: string): Promise<void> {
-		try {
-			await unlink(path);
-		} catch (error) {
-			if (!isFileNotFound(error)) {
-				throw error;
-			}
-		}
-	}
-
-	private async _clearJsonFiles(directory: string): Promise<void> {
-		let files: string[];
-		try {
-			files = await readdir(directory);
-		} catch (error) {
-			if (isFileNotFound(error)) {
-				return;
-			}
-			throw error;
-		}
-		for (const file of files) {
-			if (file.endsWith('.json')) {
-				await unlink(join(directory, file));
-			}
-		}
-	}
-
-	private async _listJsonIds(directory: string): Promise<string[]> {
-		try {
-			const files = await readdir(directory);
-			return files.filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -5));
-		} catch (error) {
-			if (isFileNotFound(error)) {
-				return [];
-			}
-			throw new PersistenceCorruptionError(directory, error);
+			this._metrics?.histogram('persistence_op_duration_seconds', (Date.now() - startTime) / 1000, {
+				operation,
+			});
 		}
 	}
 }

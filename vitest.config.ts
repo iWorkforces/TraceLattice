@@ -13,7 +13,7 @@ export default defineConfig({
 		coverage: {
 			provider: 'v8',
 			reporter: ['text', 'json', 'html'],
-			exclude: ['**/*.test.ts', '**/types.ts', 'dist/**', 'node_modules/**'],
+			exclude: ['**/*.test.ts', '**/types.ts', 'dist/**', 'node_modules/**', 'src/__tests__/**'],
 			thresholds: {
 				branches: 90,
 				functions: 60,

@@ -7,7 +7,6 @@ export default defineConfig({
 			bundle: false,
 			dts: {
 				bundle: false,
-				tsconfigPath: './tsconfig.build.json',
 			},
 		},
 	],
@@ -15,6 +14,7 @@ export default defineConfig({
 		entry: {
 			index: ['./src/**/*.ts', '!./src/**/*.test.ts', '!./src/**/*.spec.ts', '!./src/__tests__/**'],
 		},
+		tsconfigPath: './tsconfig.build.json',
 	},
 	output: {
 		target: 'node',

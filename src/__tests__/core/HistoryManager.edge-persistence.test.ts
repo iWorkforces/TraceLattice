@@ -92,6 +92,18 @@ describe('HistoryManager edge persistence', () => {
 		await manager.shutdown();
 	});
 
+	it('does not register an empty edge snapshot for the first thought', async () => {
+		const persistence = new MemoryPersistence();
+		const saveEdgesSpy = vi.spyOn(persistence, 'saveEdges');
+		const { manager } = setup({ persistence });
+
+		manager.addThought(makeThought(1));
+		await manager._flushBuffer();
+
+		expect(saveEdgesSpy).not.toHaveBeenCalled();
+		await manager.shutdown();
+	});
+
 	it('loads edges into EdgeStore on loadFromPersistence', async () => {
 		const persistence = new MemoryPersistence();
 		const seedEdges: Edge[] = [

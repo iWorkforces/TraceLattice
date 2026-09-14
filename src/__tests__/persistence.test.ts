@@ -3,7 +3,7 @@ import { mkdirSync, rmSync, existsSync, readdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createTestThought } from './helpers/factories.js';
+import { createTestThought as createBaseTestThought } from './helpers/factories.js';
 import { asBranchId } from '../contracts/ids.js';
 import { MemoryPersistence } from '../persistence/MemoryPersistence.js';
 import { FilePersistence } from '../persistence/FilePersistence.js';
@@ -12,7 +12,14 @@ import type { PersistenceConfig } from '../contracts/PersistenceBackend.js';
 import type { IMetrics } from '../contracts/interfaces.js';
 import type { Edge } from '../core/graph/Edge.js';
 import { asSessionId, asThoughtId, type EdgeId } from '../contracts/ids.js';
-import { PersistenceCorruptionError } from '../errors.js';
+import { PersistenceCompatibilityError, PersistenceCorruptionError } from '../errors.js';
+import { parseFileSnapshotV2 } from '../persistence/FileSnapshotV2.js';
+
+let persistentThoughtSequence = 0;
+function createTestThought(overrides: Parameters<typeof createBaseTestThought>[0] = {}) {
+	persistentThoughtSequence += 1;
+	return createBaseTestThought({ id: `persistence-${persistentThoughtSequence}`, ...overrides });
+}
 
 describe('MemoryPersistence', () => {
 	let backend: MemoryPersistence;
@@ -267,7 +274,7 @@ describe('FilePersistence', () => {
 	});
 
 	describe('saveThought and loadHistory', () => {
-		it('characterizes the v1 split-file layout for sequential writes', async () => {
+		it('persists sequential writes in the canonical v2 snapshot', async () => {
 			const thought = createTestThought({ thought: 'History record' });
 			const branch = [createTestThought({ thought: 'Branch record' })];
 			const edge: Edge = {
@@ -283,16 +290,13 @@ describe('FilePersistence', () => {
 			await backend.saveBranch(asBranchId('branch-1'), branch);
 			await backend.saveEdges(asSessionId('session-1'), [edge]);
 
-			const history: unknown = JSON.parse(await readFile(join(testDir, 'history.json'), 'utf-8'));
-			const branchFile: unknown = JSON.parse(
-				await readFile(join(testDir, 'branches', 'branch-1.json'), 'utf-8')
-			);
-			const edgeFile: unknown = JSON.parse(
-				await readFile(join(testDir, 'edges', 'session-1.json'), 'utf-8')
-			);
-			expect(history).toEqual([thought]);
-			expect(branchFile).toEqual(branch);
-			expect(edgeFile).toEqual([edge]);
+			const snapshotPath = join(testDir, 'snapshot.json');
+			const snapshot = parseFileSnapshotV2(await readFile(snapshotPath, 'utf-8'), snapshotPath);
+			expect(snapshot.thoughts).toEqual([{ sessionId: '__global__', thoughts: [thought] }]);
+			expect(snapshot.branches).toEqual([
+				{ sessionId: '__global__', branchId: 'branch-1', thoughts: branch },
+			]);
+			expect(snapshot.edges).toEqual([{ sessionId: 'session-1', edges: [edge] }]);
 		});
 
 		it('characterizes sequential retention as the newest v1 records', async () => {
@@ -346,8 +350,8 @@ describe('FilePersistence', () => {
 			const { join } = await import('node:path');
 
 			// Write corrupted data
-			const historyPath = join(testDir, 'history.json');
-			await writeFile(historyPath, 'invalid json', 'utf-8');
+			const snapshotPath = join(testDir, 'snapshot.json');
+			await writeFile(snapshotPath, 'invalid json', 'utf-8');
 
 			await expect(backend.loadHistory()).rejects.toBeInstanceOf(PersistenceCorruptionError);
 		});
@@ -389,16 +393,8 @@ describe('FilePersistence', () => {
 		});
 
 		it('should reject corrupted branch with a typed error', async () => {
-			const { writeFile, mkdir } = await import('node:fs/promises');
-			const { join } = await import('node:path');
-
-			// Create branches directory
-			const branchesDir = join(testDir, 'branches');
-			await mkdir(branchesDir, { recursive: true });
-
-			// Write corrupted data
-			const branchPath = join(branchesDir, 'corrupted.json');
-			await writeFile(branchPath, 'invalid json', 'utf-8');
+			const { writeFile } = await import('node:fs/promises');
+			await writeFile(join(testDir, 'snapshot.json'), 'invalid json', 'utf-8');
 
 			await expect(backend.loadBranch(asBranchId('corrupted'))).rejects.toBeInstanceOf(
 				PersistenceCorruptionError
@@ -450,6 +446,54 @@ describe('FilePersistence', () => {
 			expect(history).toHaveLength(5);
 			expect(history[0]!.thought_number).toBe(6);
 			expect(history[4]!.thought_number).toBe(10);
+		});
+
+		it('treats maxHistorySize 0 as unlimited and persists a non-empty history record', async () => {
+			// Given
+			const unlimitedBackend = await FilePersistence.create({
+				dataDir: testDir,
+				maxHistorySize: 0,
+			});
+			const thoughts = [
+				createTestThought({ id: 'zero-limit-first', thought_number: 20 }),
+				createTestThought({ id: 'zero-limit-second', thought_number: 10 }),
+			];
+
+			try {
+				// When
+				for (const thought of thoughts) await unlimitedBackend.saveThought(thought);
+
+				// Then
+				const snapshotPath = join(testDir, 'snapshot.json');
+				const snapshot = parseFileSnapshotV2(await readFile(snapshotPath, 'utf-8'), snapshotPath);
+				expect(snapshot.thoughts).toEqual([{ sessionId: '__global__', thoughts }]);
+			} finally {
+				await unlimitedBackend.close();
+			}
+		});
+
+		it('treats negative maxHistorySize as unlimited and persists a non-empty history record', async () => {
+			// Given
+			const unlimitedBackend = await FilePersistence.create({
+				dataDir: testDir,
+				maxHistorySize: -1,
+			});
+			const thoughts = [
+				createTestThought({ id: 'negative-limit-first', thought_number: 2 }),
+				createTestThought({ id: 'negative-limit-second', thought_number: 1 }),
+			];
+
+			try {
+				// When
+				for (const thought of thoughts) await unlimitedBackend.saveThought(thought);
+
+				// Then
+				const snapshotPath = join(testDir, 'snapshot.json');
+				const snapshot = parseFileSnapshotV2(await readFile(snapshotPath, 'utf-8'), snapshotPath);
+				expect(snapshot.thoughts).toEqual([{ sessionId: '__global__', thoughts }]);
+			} finally {
+				await unlimitedBackend.close();
+			}
 		});
 	});
 
@@ -534,7 +578,7 @@ describe('FilePersistence', () => {
 					'Branch123',
 					'branch-01_test',
 					'a', // single char
-					'x'.repeat(64), // max length
+					'x'.repeat(50), // max length
 				];
 
 				for (const id of validBranchIds) {
@@ -584,15 +628,15 @@ describe('FilePersistence', () => {
 				expect(result).toBe(false);
 			});
 
-			it('should reject a malformed branch directory with a typed error', async () => {
-				// Create a backend with branches dir pointing to a file (not a directory)
-				// so readdir will fail
+			it('should reject malformed branch records in the v2 snapshot', async () => {
 				const { writeFile: wf } = await import('node:fs/promises');
-				const branchesDir = join(testDir, 'branches');
-				// Write a file where the branches directory should be
-				await wf(branchesDir, 'not-a-directory', 'utf-8');
+				await wf(
+					join(testDir, 'snapshot.json'),
+					JSON.stringify({ version: 2, thoughts: [], branches: {}, edges: [], summaries: [] }),
+					'utf-8'
+				);
 
-				await expect(backend.getBranchIds()).rejects.toBeInstanceOf(PersistenceCorruptionError);
+				await expect(backend.getBranchIds()).rejects.toBeInstanceOf(PersistenceCompatibilityError);
 			});
 
 			it('should allow close() to be called repeatedly', async () => {
@@ -633,24 +677,33 @@ describe('FilePersistence', () => {
 		});
 
 		describe('edge case data handling', () => {
-			it('should reject history containing non-array JSON', async () => {
-				const { writeFile: wf, mkdir: mk } = await import('node:fs/promises');
-				await mk(testDir, { recursive: true });
-				// Write valid JSON that is not an array
-				await wf(join(testDir, 'history.json'), JSON.stringify({ not: 'an array' }), 'utf-8');
+			it('should reject a non-array thought collection in the v2 snapshot', async () => {
+				const { writeFile: wf } = await import('node:fs/promises');
+				await wf(
+					join(testDir, 'snapshot.json'),
+					JSON.stringify({ version: 2, thoughts: {}, branches: [], edges: [], summaries: [] }),
+					'utf-8'
+				);
 
-				await expect(backend.loadHistory()).rejects.toBeInstanceOf(PersistenceCorruptionError);
+				await expect(backend.loadHistory()).rejects.toBeInstanceOf(PersistenceCompatibilityError);
 			});
 
-			it('should reject a branch containing non-array JSON', async () => {
-				const { writeFile: wf, mkdir: mk } = await import('node:fs/promises');
-				const branchesDir = join(testDir, 'branches');
-				await mk(branchesDir, { recursive: true });
-				// Write valid JSON that is not an array
-				await wf(join(branchesDir, 'not-array.json'), JSON.stringify('string-value'), 'utf-8');
+			it('should reject a non-array branch collection in the v2 snapshot', async () => {
+				const { writeFile: wf } = await import('node:fs/promises');
+				await wf(
+					join(testDir, 'snapshot.json'),
+					JSON.stringify({
+						version: 2,
+						thoughts: [],
+						branches: 'invalid',
+						edges: [],
+						summaries: [],
+					}),
+					'utf-8'
+				);
 
 				await expect(backend.loadBranch(asBranchId('not-array'))).rejects.toBeInstanceOf(
-					PersistenceCorruptionError
+					PersistenceCompatibilityError
 				);
 			});
 
@@ -884,7 +937,7 @@ describe('FilePersistence — edge persistence roundtrip', () => {
 			},
 		]);
 		const { writeFileSync } = await import('node:fs');
-		writeFileSync(join(testDir, 'edges', 'corrupt.json'), '{not valid json', 'utf-8');
+		writeFileSync(join(testDir, 'snapshot.json'), '{not valid json', 'utf-8');
 		await expect(backend.loadEdges(asSessionId('corrupt'))).rejects.toBeInstanceOf(
 			PersistenceCorruptionError
 		);

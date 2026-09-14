@@ -26,8 +26,9 @@
  * @module errors
  */
 
-import type { SessionId } from './contracts/ids.js';
-
+import type { SessionScopedPersistenceOperation } from './contracts/PersistenceBackend.js';
+import type { BranchId, SessionId } from './contracts/ids.js';
+import type { PersistenceWorkFailure } from './contracts/persistence-work.js';
 
 /**
  * All known error codes as a const object for exhaustive switching.
@@ -62,6 +63,12 @@ export const ERROR_CODES = {
 	PERSISTENCE_CORRUPTION: 'PERSISTENCE_CORRUPTION',
 	PERSISTENCE_PUBLICATION: 'PERSISTENCE_PUBLICATION',
 	PERSISTENCE_CLOSED: 'PERSISTENCE_CLOSED',
+	PERSISTENCE_DRAIN: 'PERSISTENCE_DRAIN',
+	PERSISTENCE_CAPABILITY_UNSUPPORTED: 'PERSISTENCE_CAPABILITY_UNSUPPORTED',
+	PERSISTENCE_SCOPE_MISMATCH: 'PERSISTENCE_SCOPE_MISMATCH',
+	PERSISTENCE_COMPATIBILITY: 'PERSISTENCE_COMPATIBILITY',
+	PERSISTENCE_IMPORT_REQUIRED: 'PERSISTENCE_IMPORT_REQUIRED',
+	PERSISTENCE_LEGACY_AMBIGUITY: 'PERSISTENCE_LEGACY_AMBIGUITY',
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
@@ -292,7 +299,7 @@ export class SkillDiscoveryError extends SequentialThinkingError {
 	constructor(directory: string, cause: Error) {
 		super(
 			`Failed to discover skills in ${directory}: ${cause.message}`,
-			ERROR_CODES.SKILL_DISCOVERY_FAILED,
+			ERROR_CODES.SKILL_DISCOVERY_FAILED
 		);
 		this.name = 'SkillDiscoveryError';
 		this.cause = cause;
@@ -327,7 +334,10 @@ export class HistoryLimitExceededError extends SequentialThinkingError {
 	 * ```
 	 */
 	constructor(currentSize: number, maxSize: number) {
-		super(`History size ${currentSize} exceeds limit ${maxSize}`, ERROR_CODES.HISTORY_LIMIT_EXCEEDED);
+		super(
+			`History size ${currentSize} exceeds limit ${maxSize}`,
+			ERROR_CODES.HISTORY_LIMIT_EXCEEDED
+		);
 		this.name = 'HistoryLimitExceededError';
 	}
 }
@@ -554,7 +564,7 @@ export class MaxSessionsReachedError extends SequentialThinkingError {
 	constructor(maxSessions: number) {
 		super(
 			`Max sessions (${maxSessions}) reached. Wait for a session to close or increase maxSessions.`,
-			ERROR_CODES.MAX_SESSIONS_REACHED,
+			ERROR_CODES.MAX_SESSIONS_REACHED
 		);
 		this.name = 'MaxSessionsReachedError';
 	}
@@ -765,10 +775,7 @@ export class LockTimeoutError extends SequentialThinkingError {
 	public readonly timeoutMs: number;
 
 	constructor(sessionId: SessionId, timeoutMs: number) {
-		super(
-			`Lock timeout for session '${sessionId}' after ${timeoutMs}ms`,
-			ERROR_CODES.LOCK_TIMEOUT,
-		);
+		super(`Lock timeout for session '${sessionId}' after ${timeoutMs}ms`, ERROR_CODES.LOCK_TIMEOUT);
 		this.name = 'LockTimeoutError';
 		this.sessionId = sessionId;
 		this.timeoutMs = timeoutMs;
@@ -793,7 +800,7 @@ export class SessionAccessDeniedError extends SequentialThinkingError {
 	constructor(sessionId: SessionId, expectedOwner: string, actualOwner?: string) {
 		super(
 			`Access denied to session '${sessionId}': owned by '${expectedOwner}', accessed by '${actualOwner ?? 'anonymous'}'`,
-			ERROR_CODES.SESSION_ACCESS_DENIED,
+			ERROR_CODES.SESSION_ACCESS_DENIED
 		);
 		this.name = 'SessionAccessDeniedError';
 		this.sessionId = sessionId;
@@ -863,12 +870,133 @@ export class PersistenceClosedError extends SequentialThinkingError {
 	}
 }
 
+/** Error raised when an explicit persistence drain has terminal write failures. */
+export class PersistenceDrainError extends SequentialThinkingError {
+	/** Failures captured when the drain generation settled. */
+	public readonly failures: readonly PersistenceWorkFailure[];
+
+	/**
+	 * Creates an aggregate persistence drain error.
+	 *
+	 * @param failures - Terminal failures from the completed drain generation
+	 */
+	constructor(failures: readonly PersistenceWorkFailure[]) {
+		super(
+			`Persistence drain failed with ${failures.length} terminal ${failures.length === 1 ? 'failure' : 'failures'}`,
+			ERROR_CODES.PERSISTENCE_DRAIN
+		);
+		this.name = 'PersistenceDrainError';
+		this.failures = Object.freeze([...failures]);
+	}
+}
+
+/** Durable namespace associated with a persistence write. */
+export type PersistenceScope = {
+	readonly sessionId: SessionId;
+	readonly branchId?: BranchId;
+};
+
+/** Operations whose payload ownership is validated before mutation. */
+export type PersistenceWriteOperation =
+	| 'saveThought'
+	| 'saveThoughtForSession'
+	| 'saveBranch'
+	| 'saveBranchForSession'
+	| 'saveEdges'
+	| 'saveSummaries';
+
+/** Error raised when a custom backend lacks the complete scoped capability. */
+export class PersistenceCapabilityError extends SequentialThinkingError {
+	public readonly operation: SessionScopedPersistenceOperation;
+
+	constructor(operation: SessionScopedPersistenceOperation) {
+		super(
+			`Persistence backend does not support required session operation '${operation}'`,
+			ERROR_CODES.PERSISTENCE_CAPABILITY_UNSUPPORTED
+		);
+		this.name = 'PersistenceCapabilityError';
+		this.operation = operation;
+	}
+}
+
+/** Error raised before a write whose payload belongs to another namespace. */
+export class PersistenceScopeMismatchError extends SequentialThinkingError {
+	public readonly operation: PersistenceWriteOperation;
+	public readonly expectedScope: PersistenceScope;
+	public readonly actualScopes: readonly PersistenceScope[];
+
+	constructor(
+		operation: PersistenceWriteOperation,
+		expectedScope: PersistenceScope,
+		actualScopes: readonly PersistenceScope[]
+	) {
+		super(
+			`Persistence payload scope does not match '${expectedScope.sessionId}' for ${operation}`,
+			ERROR_CODES.PERSISTENCE_SCOPE_MISMATCH
+		);
+		this.name = 'PersistenceScopeMismatchError';
+		this.operation = operation;
+		this.expectedScope = expectedScope;
+		this.actualScopes = [...actualScopes];
+	}
+}
+
+/** Error raised for well-formed but unsupported or drifted persisted data. */
+export class PersistenceCompatibilityError extends SequentialThinkingError {
+	public readonly sourcePath: string;
+	public readonly detail: string;
+	public override readonly cause: unknown;
+
+	constructor(sourcePath: string, detail: string, cause?: unknown) {
+		super(
+			`Persisted data at '${sourcePath}' is incompatible: ${detail}`,
+			ERROR_CODES.PERSISTENCE_COMPATIBILITY
+		);
+		this.name = 'PersistenceCompatibilityError';
+		this.sourcePath = sourcePath;
+		this.detail = detail;
+		this.cause = cause;
+	}
+}
+
+/** Error raised when legacy files require an explicit one-way import. */
+export class PersistenceImportRequiredError extends SequentialThinkingError {
+	public readonly sourcePath: string;
+	public readonly legacyArtifacts: readonly string[];
+
+	constructor(sourcePath: string, legacyArtifacts: readonly string[]) {
+		super(
+			`Legacy persistence at '${sourcePath}' requires explicit import`,
+			ERROR_CODES.PERSISTENCE_IMPORT_REQUIRED
+		);
+		this.name = 'PersistenceImportRequiredError';
+		this.sourcePath = sourcePath;
+		this.legacyArtifacts = [...legacyArtifacts];
+	}
+}
+
+/** Error raised when legacy bytes do not identify one durable namespace. */
+export class PersistenceLegacyAmbiguityError extends SequentialThinkingError {
+	public readonly sourcePath: string;
+	public readonly detail: string;
+
+	constructor(sourcePath: string, detail: string) {
+		super(
+			`Legacy persistence at '${sourcePath}' is ambiguous: ${detail}`,
+			ERROR_CODES.PERSISTENCE_LEGACY_AMBIGUITY
+		);
+		this.name = 'PersistenceLegacyAmbiguityError';
+		this.sourcePath = sourcePath;
+		this.detail = detail;
+	}
+}
+
 /**
  * Type guard to check if an error has a specific error code.
  */
 export function isErrorCode<C extends ErrorCode>(
 	err: unknown,
-	code: C,
+	code: C
 ): err is SequentialThinkingError & { readonly code: C } {
 	return err instanceof SequentialThinkingError && err.code === code;
 }

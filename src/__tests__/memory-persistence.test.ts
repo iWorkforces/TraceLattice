@@ -1,8 +1,22 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createTestThought } from './helpers/factories.js';
+import type { Summary } from '../core/compression/Summary.js';
+import type { Edge } from '../core/graph/Edge.js';
+import {
+	createTestEdgeId,
+	createTestSessionId,
+	createTestThought as createBaseTestThought,
+	createTestThoughtId,
+} from './helpers/factories.js';
 import { MemoryPersistence } from '../persistence/MemoryPersistence.js';
 
 import { asBranchId } from '../contracts/ids.js';
+
+let persistentThoughtSequence = 0;
+function createTestThought(overrides: Parameters<typeof createBaseTestThought>[0] = {}) {
+	persistentThoughtSequence += 1;
+	return createBaseTestThought({ id: `memory-${persistentThoughtSequence}`, ...overrides });
+}
+
 describe('MemoryPersistence', () => {
 	let backend: MemoryPersistence;
 
@@ -74,6 +88,42 @@ describe('MemoryPersistence', () => {
 			const history = await backend.loadHistory();
 			expect(history).toHaveLength(3);
 			expect(history.map((t) => t.thought)).toEqual(['A', 'B', 'C']);
+		});
+
+		it('rejects duplicate history IDs without mutating admitted history', async () => {
+			// Given
+			const thought = createTestThought({ id: 'duplicate-history' });
+			await backend.saveThought(thought);
+
+			// When
+			const outcomes = await Promise.allSettled([backend.saveThought(thought)]);
+			const history = await backend.loadHistory();
+
+			// Then
+			expect({ outcome: outcomes[0], history }).toMatchObject({
+				outcome: {
+					status: 'rejected',
+					reason: { code: 'PERSISTENCE_COMPATIBILITY' },
+				},
+				history: [thought],
+			});
+		});
+
+		it('preserves admission order when thought numbers are non-monotonic', async () => {
+			// Given
+			const thoughts = [30, 10, 20].map((thoughtNumber) =>
+				createTestThought({ id: `admitted-${thoughtNumber}`, thought_number: thoughtNumber })
+			);
+
+			// When
+			for (const thought of thoughts) await backend.saveThought(thought);
+
+			// Then
+			expect((await backend.loadHistory()).map(({ id }) => id)).toEqual([
+				'admitted-30',
+				'admitted-10',
+				'admitted-20',
+			]);
 		});
 
 		it('should trim oldest thoughts when maxSize exceeded', async () => {
@@ -187,6 +237,60 @@ describe('MemoryPersistence', () => {
 
 			const loaded = await backend.loadBranch(asBranchId('b1'));
 			expect(loaded).toHaveLength(1);
+		});
+
+		it('rejects duplicate IDs within one branch candidate', async () => {
+			// Given
+			const branchId = asBranchId('duplicate-branch');
+			const thought = createTestThought({ id: 'duplicate-branch-thought', branch_id: branchId });
+
+			// When / Then
+			await expect(backend.saveBranch(branchId, [thought, thought])).rejects.toMatchObject({
+				code: 'PERSISTENCE_COMPATIBILITY',
+			});
+		});
+
+		it('allows the same ID across history and branch when payloads are deeply equal', async () => {
+			// Given
+			const branchId = asBranchId('shared-equal');
+			const thought = createTestThought({ id: 'shared-equal-id', branch_id: branchId });
+			await backend.saveThought(thought);
+
+			// When
+			await backend.saveBranch(branchId, [thought]);
+
+			// Then
+			expect(await backend.loadBranch(branchId)).toEqual([thought]);
+		});
+
+		it('rejects conflicting ID reuse when history is admitted before branch', async () => {
+			// Given
+			const branchId = asBranchId('history-first');
+			await backend.saveThought(
+				createTestThought({ id: 'history-first-id', branch_id: branchId, thought: 'history' })
+			);
+
+			// When / Then
+			await expect(
+				backend.saveBranch(branchId, [
+					createTestThought({ id: 'history-first-id', branch_id: branchId, thought: 'branch' }),
+				])
+			).rejects.toMatchObject({ code: 'PERSISTENCE_COMPATIBILITY' });
+		});
+
+		it('rejects conflicting ID reuse when branch is admitted before history', async () => {
+			// Given
+			const branchId = asBranchId('branch-first');
+			await backend.saveBranch(branchId, [
+				createTestThought({ id: 'branch-first-id', branch_id: branchId, thought: 'branch' }),
+			]);
+
+			// When / Then
+			await expect(
+				backend.saveThought(
+					createTestThought({ id: 'branch-first-id', branch_id: branchId, thought: 'history' })
+				)
+			).rejects.toMatchObject({ code: 'PERSISTENCE_COMPATIBILITY' });
 		});
 	});
 
@@ -309,6 +413,129 @@ describe('MemoryPersistence', () => {
 			const history = await backend.loadHistory();
 			expect(history).toHaveLength(1);
 			expect(history[0]!.thought).toBe('persisted');
+		});
+	});
+
+	describe('edge persistence', () => {
+		it('rejects duplicate edge IDs without replacing the admitted collection', async () => {
+			const sessionId = createTestSessionId('duplicate-edge-session');
+			const seededEdges: Edge[] = [
+				{
+					id: createTestEdgeId('seed-edge-1'),
+					from: createTestThoughtId('seed-edge-from-1'),
+					to: createTestThoughtId('seed-edge-to-1'),
+					kind: 'sequence',
+					sessionId,
+					createdAt: 10,
+				},
+				{
+					id: createTestEdgeId('seed-edge-2'),
+					from: createTestThoughtId('seed-edge-from-2'),
+					to: createTestThoughtId('seed-edge-to-2'),
+					kind: 'branch',
+					sessionId,
+					createdAt: 20,
+				},
+			];
+			const duplicateId = createTestEdgeId('duplicate-edge');
+			const duplicateEdges: Edge[] = [
+				{
+					id: duplicateId,
+					from: createTestThoughtId('duplicate-edge-from-1'),
+					to: createTestThoughtId('duplicate-edge-to-1'),
+					kind: 'sequence',
+					sessionId,
+					createdAt: 30,
+				},
+				{
+					id: duplicateId,
+					from: createTestThoughtId('duplicate-edge-from-2'),
+					to: createTestThoughtId('duplicate-edge-to-2'),
+					kind: 'critiques',
+					sessionId,
+					createdAt: 40,
+				},
+			];
+			await backend.saveEdges(sessionId, seededEdges);
+
+			const outcomes = await Promise.allSettled([backend.saveEdges(sessionId, duplicateEdges)]);
+			const persisted = await backend.loadEdges(sessionId);
+
+			expect(persisted).toEqual(seededEdges);
+			expect(outcomes[0]).toMatchObject({
+				status: 'rejected',
+				reason: {
+					code: 'PERSISTENCE_COMPATIBILITY',
+					sourcePath: 'duplicate-edge-session/edges',
+					detail: "duplicate edge id 'duplicate-edge'",
+				},
+			});
+		});
+	});
+
+	describe('summary persistence', () => {
+		it('rejects duplicate summary IDs without replacing the admitted collection', async () => {
+			const sessionId = createTestSessionId('duplicate-summary-session');
+			const seededSummaries: Summary[] = [
+				{
+					id: 'seed-summary-1',
+					sessionId,
+					rootThoughtId: createTestThoughtId('seed-summary-root-1'),
+					coveredIds: [createTestThoughtId('seed-summary-covered-1')],
+					coveredRange: [1, 1],
+					topics: ['seed-one'],
+					aggregateConfidence: 0.7,
+					createdAt: 10,
+				},
+				{
+					id: 'seed-summary-2',
+					sessionId,
+					rootThoughtId: createTestThoughtId('seed-summary-root-2'),
+					coveredIds: [createTestThoughtId('seed-summary-covered-2')],
+					coveredRange: [2, 2],
+					topics: ['seed-two'],
+					aggregateConfidence: 0.8,
+					createdAt: 20,
+				},
+			];
+			const duplicateSummaries: Summary[] = [
+				{
+					id: 'duplicate-summary',
+					sessionId,
+					rootThoughtId: createTestThoughtId('duplicate-summary-root-1'),
+					coveredIds: [createTestThoughtId('duplicate-summary-covered-1')],
+					coveredRange: [3, 3],
+					topics: ['candidate-one'],
+					aggregateConfidence: 0.6,
+					createdAt: 30,
+				},
+				{
+					id: 'duplicate-summary',
+					sessionId,
+					rootThoughtId: createTestThoughtId('duplicate-summary-root-2'),
+					coveredIds: [createTestThoughtId('duplicate-summary-covered-2')],
+					coveredRange: [4, 4],
+					topics: ['candidate-two'],
+					aggregateConfidence: 0.5,
+					createdAt: 40,
+				},
+			];
+			await backend.saveSummaries(sessionId, seededSummaries);
+
+			const outcomes = await Promise.allSettled([
+				backend.saveSummaries(sessionId, duplicateSummaries),
+			]);
+			const persisted = await backend.loadSummaries(sessionId);
+
+			expect(persisted).toEqual(seededSummaries);
+			expect(outcomes[0]).toMatchObject({
+				status: 'rejected',
+				reason: {
+					code: 'PERSISTENCE_COMPATIBILITY',
+					sourcePath: 'duplicate-summary-session/summaries',
+					detail: "duplicate summary id 'duplicate-summary'",
+				},
+			});
 		});
 	});
 

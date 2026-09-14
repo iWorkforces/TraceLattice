@@ -110,6 +110,56 @@ export interface PersistenceBackend {
 	loadSummaries(sessionId: SessionId): Promise<Summary[]>;
 }
 
+/** Session-scoped persistence operations implemented as one indivisible capability. */
+export type SessionScopedPersistenceOperation =
+	| 'saveThoughtForSession'
+	| 'loadHistoryForSession'
+	| 'saveBranchForSession'
+	| 'loadBranchForSession'
+	| 'listBranchesForSession'
+	| 'listSessions'
+	| 'clearSession';
+
+/** Persistence contract for durable named-session isolation. */
+export interface SessionScopedPersistenceBackend extends PersistenceBackend {
+	saveThoughtForSession(sessionId: SessionId, thought: ThoughtData): Promise<void>;
+	loadHistoryForSession(sessionId: SessionId): Promise<ThoughtData[]>;
+	saveBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId,
+		thoughts: readonly ThoughtData[]
+	): Promise<void>;
+	loadBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId
+	): Promise<ThoughtData[] | undefined>;
+	listBranchesForSession(sessionId: SessionId): Promise<BranchId[]>;
+	listSessions(): Promise<SessionId[]>;
+	clearSession(sessionId: SessionId): Promise<void>;
+}
+
+/** Return whether a backend implements every session-scoped operation. */
+export function supportsSessionScopedPersistence(
+	backend: PersistenceBackend
+): backend is SessionScopedPersistenceBackend {
+	return (
+		'saveThoughtForSession' in backend &&
+		typeof backend.saveThoughtForSession === 'function' &&
+		'loadHistoryForSession' in backend &&
+		typeof backend.loadHistoryForSession === 'function' &&
+		'saveBranchForSession' in backend &&
+		typeof backend.saveBranchForSession === 'function' &&
+		'loadBranchForSession' in backend &&
+		typeof backend.loadBranchForSession === 'function' &&
+		'listBranchesForSession' in backend &&
+		typeof backend.listBranchesForSession === 'function' &&
+		'listSessions' in backend &&
+		typeof backend.listSessions === 'function' &&
+		'clearSession' in backend &&
+		typeof backend.clearSession === 'function'
+	);
+}
+
 export interface PersistenceConfig {
 	enabled?: boolean;
 	backend?: 'file' | 'sqlite' | 'memory';

@@ -1,182 +1,196 @@
 import type { ThoughtData } from '../core/thought.js';
 import type { Edge } from '../core/graph/Edge.js';
 import type { Summary } from '../core/compression/Summary.js';
-import type { PersistenceBackend } from '../contracts/PersistenceBackend.js';
-import { asBranchId, type BranchId, type SessionId } from '../contracts/ids.js';
+import type { SessionScopedPersistenceBackend } from '../contracts/PersistenceBackend.js';
+import { asSessionId, GLOBAL_SESSION_ID, type BranchId, type SessionId } from '../contracts/ids.js';
+import {
+	assertBranchScope,
+	assertEdgeScopes,
+	assertPersistableThoughtCollections,
+	assertSummaryScopes,
+	assertThoughtScope,
+	assertUniqueRecordIds,
+	compareCodePoint,
+	compareCreatedThenId,
+	parsePersistenceBranchId,
+	type PersistedThoughtCollection,
+} from './PersistenceScope.js';
 
-/**
- * Configuration options for MemoryPersistence.
- */
 export interface MemoryPersistenceOptions {
-	/**
-	 * Maximum number of thoughts to keep in memory.
-	 * Older thoughts are trimmed when limit is exceeded.
-	 * Set to 0 or undefined for unlimited.
-	 * @default undefined (unlimited)
-	 */
 	maxSize?: number;
+	maxHistorySize?: number;
+	persistBranches?: boolean;
 }
 
-/**
- * In-memory persistence backend for testing purposes.
- *
- * This backend stores all data in memory and provides no durability.
- * It's useful for testing and development where persistence is not needed.
- *
- * @example
- * ```typescript
- * // Unlimited history
- * const backend = new MemoryPersistence();
- *
- * // Limited to 1000 thoughts
- * const backend = new MemoryPersistence({ maxSize: 1000 });
- *
- * await backend.saveThought(thought);
- * const history = await backend.loadHistory();
- * ```
- */
-export class MemoryPersistence implements PersistenceBackend {
-	private _history: ThoughtData[] = [];
-	private _branches: Map<BranchId, ThoughtData[]> = new Map();
-	private _maxSize?: number;
-	private _edges: Map<SessionId, Edge[]> = new Map();
-	private _summaries: Map<SessionId, Summary[]> = new Map();
+export class MemoryPersistence implements SessionScopedPersistenceBackend {
+	private readonly _histories = new Map<SessionId, ThoughtData[]>();
+	private readonly _branches = new Map<SessionId, Map<BranchId, ThoughtData[]>>();
+	private readonly _edges = new Map<SessionId, Edge[]>();
+	private readonly _summaries = new Map<SessionId, Summary[]>();
+	private readonly _maxSize: number | undefined;
+	private readonly _persistBranches: boolean;
 
 	constructor(options: MemoryPersistenceOptions = {}) {
-		this._maxSize = options.maxSize && options.maxSize > 0 ? options.maxSize : undefined;
+		const configuredSize = options.maxHistorySize ?? options.maxSize;
+		this._maxSize = configuredSize !== undefined && configuredSize > 0 ? configuredSize : undefined;
+		this._persistBranches = options.persistBranches ?? true;
 	}
 
 	public async saveThought(thought: ThoughtData): Promise<void> {
-		this._history.push(thought);
+		await this.saveThoughtForSession(GLOBAL_SESSION_ID, thought, 'saveThought');
+	}
 
-		// Trim if maxSize is set and exceeded
-		if (this._maxSize !== undefined && this._history.length > this._maxSize) {
-			this._history = this._history.slice(-this._maxSize);
+	public async saveThoughtForSession(
+		sessionId: SessionId,
+		thought: ThoughtData,
+		operation: 'saveThought' | 'saveThoughtForSession' = 'saveThoughtForSession'
+	): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		assertThoughtScope(operation, validatedSessionId, thought);
+		const history = [...(this._histories.get(validatedSessionId) ?? []), thought];
+		const collections: PersistedThoughtCollection[] = [
+			{ sessionId: validatedSessionId, thoughts: history },
+		];
+		for (const branch of this._branches.get(validatedSessionId)?.values() ?? []) {
+			collections.push({ sessionId: validatedSessionId, thoughts: branch });
 		}
+		assertPersistableThoughtCollections(collections, `${validatedSessionId}/thoughts`);
+		this._histories.set(
+			validatedSessionId,
+			this._maxSize === undefined ? history : history.slice(-this._maxSize)
+		);
 	}
 
 	public async loadHistory(): Promise<ThoughtData[]> {
-		return [...this._history];
+		return await this.loadHistoryForSession(GLOBAL_SESSION_ID);
+	}
+
+	public async loadHistoryForSession(sessionId: SessionId): Promise<ThoughtData[]> {
+		return [...(this._histories.get(asSessionId(sessionId)) ?? [])];
 	}
 
 	public async saveBranch(branchId: BranchId, thoughts: ThoughtData[]): Promise<void> {
-		this._branches.set(branchId, [...thoughts]);
+		await this.saveBranchForSession(GLOBAL_SESSION_ID, branchId, thoughts, 'saveBranch');
+	}
+
+	public async saveBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId,
+		thoughts: readonly ThoughtData[],
+		operation: 'saveBranch' | 'saveBranchForSession' = 'saveBranchForSession'
+	): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		const validatedBranchId = parsePersistenceBranchId(branchId, `${validatedSessionId}/branches`);
+		assertBranchScope(operation, validatedSessionId, validatedBranchId, thoughts);
+		const branches = new Map(this._branches.get(validatedSessionId) ?? []);
+		branches.set(validatedBranchId, [...thoughts]);
+		const collections: PersistedThoughtCollection[] = [
+			{
+				sessionId: validatedSessionId,
+				thoughts: this._histories.get(validatedSessionId) ?? [],
+			},
+		];
+		for (const branch of branches.values()) {
+			collections.push({ sessionId: validatedSessionId, thoughts: branch });
+		}
+		assertPersistableThoughtCollections(
+			collections,
+			`${validatedSessionId}/branches/${validatedBranchId}`
+		);
+		if (!this._persistBranches) return;
+		this._branches.set(validatedSessionId, branches);
 	}
 
 	public async loadBranch(branchId: BranchId): Promise<ThoughtData[] | undefined> {
-		const branch = this._branches.get(branchId);
-		return branch ? [...branch] : undefined;
+		return await this.loadBranchForSession(GLOBAL_SESSION_ID, branchId);
+	}
+
+	public async loadBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId
+	): Promise<ThoughtData[] | undefined> {
+		if (!this._persistBranches) return undefined;
+		const validatedSessionId = asSessionId(sessionId);
+		const validatedBranchId = parsePersistenceBranchId(branchId, `${validatedSessionId}/branches`);
+		const branch = this._branches.get(validatedSessionId)?.get(validatedBranchId);
+		return branch === undefined ? undefined : [...branch];
 	}
 
 	public async listBranches(): Promise<BranchId[]> {
-		return this.getBranchIds().map((id) => asBranchId(id));
+		return await this.listBranchesForSession(GLOBAL_SESSION_ID);
 	}
 
-	/**
-	 * In-memory backend is always healthy.
-	 */
+	public async listBranchesForSession(sessionId: SessionId): Promise<BranchId[]> {
+		if (!this._persistBranches) return [];
+		return [...(this._branches.get(asSessionId(sessionId))?.keys() ?? [])].sort(compareCodePoint);
+	}
+
+	public async listSessions(): Promise<SessionId[]> {
+		const sessions = new Set<SessionId>();
+		for (const namespace of [this._histories, this._branches, this._edges, this._summaries]) {
+			for (const sessionId of namespace.keys()) sessions.add(sessionId);
+		}
+		return [...sessions].sort(compareCodePoint);
+	}
+
 	public async healthy(): Promise<boolean> {
 		return true;
 	}
 
-	/**
-	 * Clear all data from memory.
-	 */
 	public async clear(): Promise<void> {
-		this._history = [];
+		this._histories.clear();
 		this._branches.clear();
 		this._edges.clear();
 		this._summaries.clear();
 	}
 
-	/**
-	 * No resources to release for in-memory backend.
-	 */
-	public async close(): Promise<void> {
-		// No-op for in-memory backend
+	public async clearSession(sessionId: SessionId): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		this._histories.delete(validatedSessionId);
+		this._branches.delete(validatedSessionId);
+		this._edges.delete(validatedSessionId);
+		this._summaries.delete(validatedSessionId);
 	}
 
-	/**
-	 * Save edges for a session, replacing any previously saved edges.
-	 *
-	 * @param sessionId - The session whose edges to persist
-	 * @param edges - Array of edges to save
-	 */
+	public async close(): Promise<void> {}
+
 	public async saveEdges(sessionId: SessionId, edges: readonly Edge[]): Promise<void> {
-		if (edges.length === 0) {
-			this._edges.delete(sessionId);
-		} else {
-			this._edges.set(sessionId, [...edges]);
-		}
+		const validatedSessionId = asSessionId(sessionId);
+		assertEdgeScopes(validatedSessionId, edges);
+		assertUniqueRecordIds(edges, `${validatedSessionId}/edges`, 'edge');
+		if (edges.length === 0) this._edges.delete(validatedSessionId);
+		else this._edges.set(validatedSessionId, [...edges].sort(compareCreatedThenId));
 	}
 
-	/**
-	 * Load edges for a session from memory.
-	 * Returns edges sorted by createdAt ascending.
-	 *
-	 * @param sessionId - The session whose edges to load
-	 * @returns Array of persisted edges, sorted by createdAt
-	 */
 	public async loadEdges(sessionId: SessionId): Promise<Edge[]> {
-		const edges = this._edges.get(sessionId);
-		if (!edges) return [];
-		return [...edges].sort((a, b) => a.createdAt - b.createdAt);
+		return [...(this._edges.get(asSessionId(sessionId)) ?? [])].sort(compareCreatedThenId);
 	}
 
-	/**
-	 * List all session IDs that have persisted edges in memory.
-	 *
-	 * @returns Array of session identifiers with persisted edges
-	 */
 	public async listEdgeSessions(): Promise<SessionId[]> {
-		return Array.from(this._edges.keys());
+		return [...this._edges.keys()].sort(compareCodePoint);
 	}
 
-	/**
-	 * Save summaries for a session, replacing any previously saved summaries.
-	 *
-	 * @param sessionId - The session whose summaries to persist
-	 * @param summaries - Array of summaries to save
-	 */
 	public async saveSummaries(sessionId: SessionId, summaries: readonly Summary[]): Promise<void> {
-		if (summaries.length === 0) {
-			this._summaries.delete(sessionId);
-		} else {
-			this._summaries.set(sessionId, [...summaries]);
-		}
+		const validatedSessionId = asSessionId(sessionId);
+		assertSummaryScopes(validatedSessionId, summaries);
+		assertUniqueRecordIds(summaries, `${validatedSessionId}/summaries`, 'summary');
+		if (summaries.length === 0) this._summaries.delete(validatedSessionId);
+		else this._summaries.set(validatedSessionId, [...summaries].sort(compareCreatedThenId));
 	}
 
-	/**
-	 * Load summaries for a session from memory.
-	 * Returns summaries sorted by createdAt ascending.
-	 *
-	 * @param sessionId - The session whose summaries to load
-	 * @returns Array of persisted summaries, sorted by createdAt
-	 */
 	public async loadSummaries(sessionId: SessionId): Promise<Summary[]> {
-		const summaries = this._summaries.get(sessionId);
-		if (!summaries) return [];
-		return [...summaries].sort((a, b) => a.createdAt - b.createdAt);
+		return [...(this._summaries.get(asSessionId(sessionId)) ?? [])].sort(compareCreatedThenId);
 	}
 
-	/**
-	 * Get the current number of thoughts in memory.
-	 */
 	public getHistorySize(): number {
-		return this._history.length;
+		return this._histories.get(GLOBAL_SESSION_ID)?.length ?? 0;
 	}
 
-	/**
-	 * Get the current number of branches in memory.
-	 */
 	public getBranchCount(): number {
-		return this._branches.size;
+		return this._branches.get(GLOBAL_SESSION_ID)?.size ?? 0;
 	}
 
-	/**
-	 * Get all branch IDs.
-	 */
 	public getBranchIds(): BranchId[] {
-		return Array.from(this._branches.keys());
+		return [...(this._branches.get(GLOBAL_SESSION_ID)?.keys() ?? [])].sort(compareCodePoint);
 	}
 }

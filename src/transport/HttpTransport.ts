@@ -31,6 +31,11 @@ import {
 	sendJsonRpcResponse,
 } from './HttpHelpers.js';
 import { runWithContext } from '../context/RequestContext.js';
+import {
+	AcceptedWorkTracker,
+	LifecycleFailureReporter,
+	ResponseFinalizer,
+} from './HttpRequestLifecycle.js';
 
 export interface HttpTransportOptions extends TransportOptions {
 	/**
@@ -92,7 +97,9 @@ export interface HttpTransportOptions extends TransportOptions {
  * - 503: Server Not Ready
  */
 export class HttpTransport extends BaseTransport implements ITransport {
-	get kind(): TransportKind { return 'http'; }
+	get kind(): TransportKind {
+		return 'http';
+	}
 	private _server: ReturnType<typeof createServer>;
 	private _mcpServer: McpServer | null = null;
 	private _requestTimeout: number;
@@ -103,6 +110,9 @@ export class HttpTransport extends BaseTransport implements ITransport {
 	private _path: string;
 	private _metrics?: IMetrics;
 	private _metricsProvider: (() => string) | null;
+	private readonly _lifecycleFailureReporter: LifecycleFailureReporter;
+	private readonly _acceptedWork: AcceptedWorkTracker;
+	private _stopPromise: Promise<void> | null = null;
 
 	constructor(options: HttpTransportOptions = {}) {
 		super(options);
@@ -113,7 +123,19 @@ export class HttpTransport extends BaseTransport implements ITransport {
 		this._path = options.path ?? '/messages';
 		this._metrics = options.metrics;
 		this._metricsProvider = options.metricsProvider ?? null;
-		this._server = createServer((req, res) => this._handleRequest(req, res));
+		this._lifecycleFailureReporter = new LifecycleFailureReporter((error) => {
+			this.log('error', 'HTTP request lifecycle failed', { error: getErrorMessage(error) });
+		});
+		this._acceptedWork = new AcceptedWorkTracker(this._lifecycleFailureReporter);
+		this._server = createServer((req, res) => {
+			const responseFinalizer = new ResponseFinalizer(res, this._lifecycleFailureReporter);
+			void this._handleRequest(req, res).catch((error: unknown) => {
+				this._lifecycleFailureReporter.report(error);
+				responseFinalizer.finalize((response) => {
+					sendJsonRpcError(response, 500, -32603, 'Internal error', null, getErrorMessage(error));
+				});
+			});
+		});
 	}
 
 	private _requireMcpServer(): McpServer {
@@ -135,11 +157,29 @@ export class HttpTransport extends BaseTransport implements ITransport {
 	 */
 	async connect(mcpServer: McpServer): Promise<void> {
 		this._mcpServer = mcpServer;
-		return new Promise((resolve) => {
-			this._server.listen(this._port, this._host, () => {
+		const server = this._server;
+		return new Promise((resolve, reject) => {
+			const cleanup = (): void => {
+				server.off('error', onError);
+				server.off('listening', onListening);
+			};
+			const onError = (error: Error): void => {
+				cleanup();
+				reject(error);
+			};
+			const onListening = (): void => {
+				cleanup();
 				this.log('info', `HTTP transport listening on http://${this._host}:${this._port}`);
 				resolve();
-			});
+			};
+			server.once('error', onError);
+			server.once('listening', onListening);
+			try {
+				server.listen(this._port, this._host);
+			} catch (error) {
+				cleanup();
+				reject(error);
+			}
 		});
 	}
 
@@ -219,7 +259,10 @@ export class HttpTransport extends BaseTransport implements ITransport {
 		if (req.method === 'GET' && req.url === '/ready') return this.handleReadinessEndpoint(res);
 
 		// MCP endpoint
-		if (req.method === 'POST' && req.url === this._path) return this._handlePostRequest(req, res);
+		if (req.method === 'POST' && req.url === this._path) {
+			this._acceptedWork.track(this._handlePostRequest(req, res));
+			return;
+		}
 
 		// 404
 		this._trackError('not_found');
@@ -235,11 +278,13 @@ export class HttpTransport extends BaseTransport implements ITransport {
 	private async _handlePostRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
 		this._requestCount++;
 		this._activeRequests++;
+		const responseFinalizer = new ResponseFinalizer(res, this._lifecycleFailureReporter);
 
 		const timeout = setTimeout(() => {
-			this._activeRequests--;
 			this._trackError('timeout');
-			sendJsonRpcError(res, 500, -32603, 'Request timeout');
+			responseFinalizer.finalize((response) => {
+				sendJsonRpcError(response, 500, -32603, 'Request timeout');
+			});
 		}, this._requestTimeout);
 
 		try {
@@ -247,10 +292,10 @@ export class HttpTransport extends BaseTransport implements ITransport {
 			const body = await readRequestBody(req, maxBodySize);
 
 			if (body === null) {
-				clearTimeout(timeout);
-				this._activeRequests--;
 				this._trackError('payload_too_large');
-				sendJsonRpcError(res, 413, -32000, 'Request body too large');
+				responseFinalizer.finalize((response) => {
+					sendJsonRpcError(response, 413, -32000, 'Request body too large');
+				});
 				return;
 			}
 
@@ -258,68 +303,65 @@ export class HttpTransport extends BaseTransport implements ITransport {
 			try {
 				rawBody = JSON.parse(body) as unknown;
 			} catch {
-				clearTimeout(timeout);
-				this._activeRequests--;
 				this._trackError('parse_error');
-				sendJsonRpcError(res, 200, -32700, 'Parse error');
+				responseFinalizer.finalize((response) => {
+					sendJsonRpcError(response, 200, -32700, 'Parse error');
+				});
 				return;
 			}
 
 			const parseResult = safeParse(JsonRpcRequestSchema, rawBody);
-			const rawId = (rawBody && typeof rawBody === 'object' && 'id' in rawBody) ? (rawBody as { id?: unknown }).id ?? null : null;
+			const rawId =
+				rawBody && typeof rawBody === 'object' && 'id' in rawBody
+					? ((rawBody as { id?: unknown }).id ?? null)
+					: null;
 			if (!parseResult.success) {
-				clearTimeout(timeout);
-				this._activeRequests--;
 				this._trackError('validation');
-				sendJsonRpcError(
-					res,
-					200,
-					-32600,
-					'Invalid Request',
-					rawId as string | number | null,
-					parseResult.issues
-				);
+				responseFinalizer.finalize((response) => {
+					sendJsonRpcError(
+						response,
+						200,
+						-32600,
+						'Invalid Request',
+						rawId as string | number | null,
+						parseResult.issues
+					);
+				});
 				return;
 			}
 			const jsonRpcRequest = parseResult.output;
 
 			if (!this._mcpServer) {
-				clearTimeout(timeout);
-				this._activeRequests--;
 				this._trackError('server_not_ready');
-				sendJsonRpcError(res, 200, -32603, 'Server not ready', jsonRpcRequest.id ?? null);
+				responseFinalizer.finalize((response) => {
+					sendJsonRpcError(response, 200, -32603, 'Server not ready', jsonRpcRequest.id ?? null);
+				});
 				return;
 			}
 
 			const owner = randomUUID();
-			const response = await runWithContext(
-				{ requestId: randomUUID(), owner },
-				() => this._requireMcpServer().receive(jsonRpcRequest as Parameters<McpServer['receive']>[0], {
+			const response = await runWithContext({ requestId: randomUUID(), owner }, () =>
+				this._requireMcpServer().receive(jsonRpcRequest as Parameters<McpServer['receive']>[0], {
 					sessionInfo: {},
 				})
 			);
 
-			clearTimeout(timeout);
-			this._activeRequests--;
-
-			if (response) {
-				sendJsonRpcResponse(res, response);
-			} else {
-				res.writeHead(204);
-				res.end();
-			}
+			responseFinalizer.finalize((httpResponse) => {
+				if (response) {
+					sendJsonRpcResponse(httpResponse, response);
+				} else {
+					httpResponse.writeHead(204);
+					httpResponse.end();
+				}
+			});
 		} catch (error) {
+			this._trackError('internal_error');
+			responseFinalizer.finalize((response) => {
+				sendJsonRpcError(response, 200, -32603, 'Internal error', null, getErrorMessage(error));
+			});
+		} finally {
 			clearTimeout(timeout);
 			this._activeRequests--;
-			this._trackError('internal_error');
-			sendJsonRpcError(
-				res,
-				200,
-				-32603,
-				'Internal error',
-				null,
-				getErrorMessage(error)
-			);
 		}
 	}
 
@@ -333,16 +375,31 @@ export class HttpTransport extends BaseTransport implements ITransport {
 	/**
 	 * Stops transport server.
 	 */
-	async stop(): Promise<void> {
+	stop(): Promise<void> {
+		if (this._stopPromise) return this._stopPromise;
 		this._isShuttingDown = true;
 		this._stopRateLimitCleanup();
 
-		return new Promise((resolve) => {
-			this._server.close(() => {
-				this.log('info', 'HTTP transport stopped');
-				resolve();
-			});
+		const server = this._server;
+		const serverClosed = server.listening
+			? new Promise<void>((resolve, reject) => {
+					server.close((error) => {
+						if (error) {
+							reject(error);
+							return;
+						}
+						resolve();
+					});
+				})
+			: Promise.resolve();
+		const stopPromise = Promise.all([serverClosed, this._acceptedWork.join()]).then(() => {
+			this.log('info', 'HTTP transport stopped');
 		});
+		this._stopPromise = stopPromise;
+		void stopPromise.catch(() => {
+			if (this._stopPromise === stopPromise) this._stopPromise = null;
+		});
+		return stopPromise;
 	}
 }
 

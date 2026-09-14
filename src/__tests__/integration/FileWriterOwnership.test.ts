@@ -20,9 +20,16 @@ import {
 	PersistencePublicationError,
 } from '../../errors.js';
 import { FilePersistence } from '../../persistence/FilePersistence.js';
+import { parseFileSnapshotV2 } from '../../persistence/FileSnapshotV2.js';
 import { nodeFileWriterOperations } from '../../persistence/FileWriter.js';
 import { assertNever } from '../../utils.js';
-import { createTestThought } from '../helpers/factories.js';
+import { createTestThought as createBaseTestThought } from '../helpers/factories.js';
+
+let persistentThoughtSequence = 0;
+function createTestThought(overrides: Parameters<typeof createBaseTestThought>[0] = {}) {
+	persistentThoughtSequence += 1;
+	return createBaseTestThought({ id: `file-writer-${persistentThoughtSequence}`, ...overrides });
+}
 
 const CHILD_DIRECTORY = process.env['TRACELATTICE_FILE_WRITER_CHILD_DIR'];
 const CHILD_READY = 'TRACELATTICE_FILE_WRITER_READY';
@@ -294,8 +301,8 @@ if (CHILD_DIRECTORY) {
 			const seed = new FilePersistence({ dataDir });
 			await seed.saveThought(createTestThought({ id: 'stable' }));
 			await seed.close();
-			const historyPath = join(dataDir, 'history.json');
-			const previousBytes = await readFile(historyPath, 'utf-8');
+			const snapshotPath = join(dataDir, 'snapshot.json');
+			const previousBytes = await readFile(snapshotPath, 'utf-8');
 			const backend = new FilePersistence({
 				dataDir,
 				writerOperations: {
@@ -314,7 +321,7 @@ if (CHILD_DIRECTORY) {
 				await expect(backend.saveThought(createTestThought({ id: 'new' }))).rejects.toMatchObject({
 					stage: 'temporary-write',
 				});
-				expect(await readFile(historyPath, 'utf-8')).toBe(previousBytes);
+				expect(await readFile(snapshotPath, 'utf-8')).toBe(previousBytes);
 			} finally {
 				await backend.close();
 				await rm(dataDir, { recursive: true, force: true });
@@ -327,8 +334,8 @@ if (CHILD_DIRECTORY) {
 			const seed = new FilePersistence({ dataDir });
 			await seed.saveThought(createTestThought({ id: 'stable' }));
 			await seed.close();
-			const historyPath = join(dataDir, 'history.json');
-			const previousBytes = await readFile(historyPath, 'utf-8');
+			const snapshotPath = join(dataDir, 'snapshot.json');
+			const previousBytes = await readFile(snapshotPath, 'utf-8');
 			const backend = new FilePersistence({
 				dataDir,
 				writerOperations: {
@@ -344,7 +351,7 @@ if (CHILD_DIRECTORY) {
 				await expect(backend.saveThought(createTestThought({ id: 'new' }))).rejects.toMatchObject({
 					stage: 'atomic-replacement',
 				});
-				expect(await readFile(historyPath, 'utf-8')).toBe(previousBytes);
+				expect(await readFile(snapshotPath, 'utf-8')).toBe(previousBytes);
 				expect((await readdir(dataDir)).some((path) => path.endsWith('.tmp'))).toBe(false);
 			} finally {
 				await backend.close();
@@ -355,9 +362,9 @@ if (CHILD_DIRECTORY) {
 		it('reports corrupt input without changing its bytes', async () => {
 			// Given
 			const dataDir = await mkdtemp(join(tmpdir(), 'tracelattice-corrupt-input-'));
-			const historyPath = join(dataDir, 'history.json');
+			const snapshotPath = join(dataDir, 'snapshot.json');
 			const corruptBytes = '{not-json';
-			await writeFile(historyPath, corruptBytes, 'utf-8');
+			await writeFile(snapshotPath, corruptBytes, 'utf-8');
 			const backend = new FilePersistence({ dataDir });
 
 			try {
@@ -365,7 +372,7 @@ if (CHILD_DIRECTORY) {
 				await expect(
 					backend.saveThought(createTestThought({ id: 'must-not-replace-corruption' }))
 				).rejects.toBeInstanceOf(PersistenceCorruptionError);
-				expect(await readFile(historyPath, 'utf-8')).toBe(corruptBytes);
+				expect(await readFile(snapshotPath, 'utf-8')).toBe(corruptBytes);
 			} finally {
 				await backend.close();
 				await rm(dataDir, { recursive: true, force: true });
@@ -410,8 +417,9 @@ if (CHILD_DIRECTORY) {
 				expect(closeSettled).toBe(false);
 				resumePublication.resolve();
 				await Promise.all([firstSave, secondSave, closing]);
-				const stored: unknown = JSON.parse(await readFile(join(dataDir, 'history.json'), 'utf-8'));
-				expect(stored).toEqual([first, second]);
+				const snapshotPath = join(dataDir, 'snapshot.json');
+				const stored = parseFileSnapshotV2(await readFile(snapshotPath, 'utf-8'), snapshotPath);
+				expect(stored.thoughts).toEqual([{ sessionId: '__global__', thoughts: [first, second] }]);
 				await expect(
 					backend.saveThought(createTestThought({ id: 'after-close' }))
 				).rejects.toBeInstanceOf(PersistenceClosedError);

@@ -49,6 +49,7 @@ import type { ERROR_CODES, ErrorCode } from '../errors.js';
  *  - PersistenceCorruptionError → PERSISTENCE_CORRUPTION
  *  - PersistencePublicationError → PERSISTENCE_PUBLICATION
  *  - PersistenceClosedError    → PERSISTENCE_CLOSED
+ *  - PersistenceDrainError     → PERSISTENCE_DRAIN
  *
  * Direct `SequentialThinkingError` usages (no dedicated subclass):
  *  - DUPLICATE_SUMMARY (thrown by `core/compression/InMemorySummaryStore.ts`)
@@ -82,6 +83,12 @@ type _AllSubclassCodes =
 	| 'PERSISTENCE_CORRUPTION'
 	| 'PERSISTENCE_PUBLICATION'
 	| 'PERSISTENCE_CLOSED'
+	| 'PERSISTENCE_DRAIN'
+	| 'PERSISTENCE_CAPABILITY_UNSUPPORTED'
+	| 'PERSISTENCE_SCOPE_MISMATCH'
+	| 'PERSISTENCE_COMPATIBILITY'
+	| 'PERSISTENCE_IMPORT_REQUIRED'
+	| 'PERSISTENCE_LEGACY_AMBIGUITY'
 	| 'DUPLICATE_SUMMARY';
 
 type _ErrorCodeValues = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];

@@ -2,11 +2,12 @@ import { asSessionId } from '../contracts/ids.js';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { ABSOLUTE_MAX_HISTORY_SIZE, HistoryManager } from '../core/HistoryManager.js';
 import { EdgeStore } from '../core/graph/EdgeStore.js';
-import type { PersistenceBackend } from '../contracts/PersistenceBackend.js';
+import type { SessionScopedPersistenceBackend } from '../contracts/PersistenceBackend.js';
 import { createTestThought } from './helpers/factories.js';
 import { useFakeTimers, useRealTimers } from './helpers/timers.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import type { ThoughtData } from '../core/thought.js';
+import { PersistenceDrainError } from '../errors.js';
 
 import { asBranchId, type BranchId } from '../contracts/ids.js';
 import type { SessionId } from '../contracts/ids.js';
@@ -15,9 +16,11 @@ interface HistoryManagerTestAccess {
 	_maxHistorySize: number;
 }
 
-class MockPersistence implements PersistenceBackend {
+class MockPersistence implements SessionScopedPersistenceBackend {
 	private _history: ThoughtData[] = [];
 	private _branches: Record<BranchId, ThoughtData[]> = {} as Record<BranchId, ThoughtData[]>;
+	private readonly _sessionHistory = new Map<SessionId, ThoughtData[]>();
+	private readonly _sessionBranches = new Map<SessionId, Map<BranchId, ThoughtData[]>>();
 	saveThoughtFailCount = 0;
 	healthyResult = true;
 	clearFail = false;
@@ -35,6 +38,20 @@ class MockPersistence implements PersistenceBackend {
 		return [...this._history];
 	}
 
+	async saveThoughtForSession(sessionId: SessionId, thought: ThoughtData): Promise<void> {
+		if (this.saveThoughtFailCount > 0) {
+			this.saveThoughtFailCount--;
+			throw new Error('Persistence save failed');
+		}
+		const history = this._sessionHistory.get(sessionId) ?? [];
+		history.push(thought);
+		this._sessionHistory.set(sessionId, history);
+	}
+
+	async loadHistoryForSession(sessionId: SessionId): Promise<ThoughtData[]> {
+		return [...(this._sessionHistory.get(sessionId) ?? [])];
+	}
+
 	async saveBranch(branchId: BranchId, thoughts: ThoughtData[]): Promise<void> {
 		if (this.saveBranchFailCount > 0) {
 			this.saveBranchFailCount--;
@@ -47,8 +64,41 @@ class MockPersistence implements PersistenceBackend {
 		return this._branches[branchId] ? [...this._branches[branchId]] : undefined;
 	}
 
+	async saveBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId,
+		thoughts: readonly ThoughtData[]
+	): Promise<void> {
+		if (this.saveBranchFailCount > 0) {
+			this.saveBranchFailCount--;
+			throw new Error('Branch save failed');
+		}
+		const branches = this._sessionBranches.get(sessionId) ?? new Map<BranchId, ThoughtData[]>();
+		branches.set(branchId, [...thoughts]);
+		this._sessionBranches.set(sessionId, branches);
+	}
+
+	async loadBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId
+	): Promise<ThoughtData[] | undefined> {
+		const branch = this._sessionBranches.get(sessionId)?.get(branchId);
+		return branch === undefined ? undefined : [...branch];
+	}
+
 	async listBranches(): Promise<BranchId[]> {
 		return Object.keys(this._branches) as BranchId[];
+	}
+
+	async listBranchesForSession(sessionId: SessionId): Promise<BranchId[]> {
+		const branches = this._sessionBranches.get(sessionId);
+		return branches === undefined ? [] : Array.from(branches.keys());
+	}
+
+	async listSessions(): Promise<SessionId[]> {
+		return Array.from(
+			new Set<SessionId>([...this._sessionHistory.keys(), ...this._sessionBranches.keys()])
+		);
 	}
 
 	async clear(): Promise<void> {
@@ -57,6 +107,13 @@ class MockPersistence implements PersistenceBackend {
 		}
 		this._history = [];
 		this._branches = {};
+		this._sessionHistory.clear();
+		this._sessionBranches.clear();
+	}
+
+	async clearSession(sessionId: SessionId): Promise<void> {
+		this._sessionHistory.delete(sessionId);
+		this._sessionBranches.delete(sessionId);
 	}
 
 	async healthy(): Promise<boolean> {
@@ -288,9 +345,13 @@ describe('HistoryManager', () => {
 			expect(await persistence.loadHistory()).toHaveLength(0);
 		});
 
-		it('should guard against concurrent flushes', async () => {
-			useFakeTimers();
+		it('should expose the shared coordinator promise to concurrent flush joiners', async () => {
 			const persistence = new MockPersistence();
+			let releaseWrite: (() => void) | undefined;
+			const writeGate = new Promise<void>((resolve) => {
+				releaseWrite = resolve;
+			});
+			persistence.saveThought = async () => writeGate;
 			const manager = new HistoryManager({
 				persistence,
 				persistenceBufferSize: 100,
@@ -301,8 +362,9 @@ describe('HistoryManager', () => {
 			const flush1 = manager._flushBuffer();
 			const flush2 = manager._flushBuffer();
 
+			expect(flush2).toBe(flush1);
+			releaseWrite?.();
 			await Promise.all([flush1, flush2]);
-			expect(await persistence.loadHistory()).toHaveLength(1);
 		});
 	});
 
@@ -323,21 +385,23 @@ describe('HistoryManager', () => {
 			expect(await persistence.loadHistory()).toHaveLength(1);
 		});
 
-		it('should re-queue failed items after exhausting retries', async () => {
-			useFakeTimers();
+		it('should surface attributable terminal failures after exhausting retries', async () => {
 			const persistence = new MockPersistence();
 			persistence.saveThoughtFailCount = 999;
 			const manager = new HistoryManager({
 				persistence,
-				persistenceBufferSize: 1,
+				persistenceBufferSize: 100,
 				persistenceFlushInterval: 60000,
-				persistenceMaxRetries: 1,
+				persistenceMaxRetries: 0,
 			});
+			const globalSession = asSessionId('__global__');
 
 			manager.addThought(createTestThought({ thought_number: 1 }));
-			await vi.advanceTimersByTimeAsync(0);
-			await vi.waitFor(() => expect(manager.getWriteBufferLength()).toBe(1));
-			expect(await persistence.loadHistory()).toHaveLength(0);
+
+			await expect(manager.drainSession(globalSession)).rejects.toMatchObject({
+				name: 'PersistenceDrainError',
+				failures: [{ kind: 'thought', sessionId: globalSession, attempts: 1 }],
+			});
 		});
 
 		it('should emit persistenceError event on exhausted retries', async () => {
@@ -363,37 +427,44 @@ describe('HistoryManager', () => {
 			await vi.advanceTimersByTimeAsync(0);
 			await vi.waitFor(() => expect(events).toHaveLength(1));
 
-			expect(events[0]!.operation).toBe('flushBuffer');
-			expect(events[0]!.error.message).toContain('Failed to persist');
+			expect(events[0]).toMatchObject({
+				operation: 'flushBuffer',
+				error: {
+					name: 'PersistenceDrainError',
+					failures: [{ kind: 'thought', sessionId: asSessionId('__global__'), attempts: 1 }],
+				},
+			});
+			expect(events[0]?.error).toBeInstanceOf(PersistenceDrainError);
 		});
 	});
 
 	describe('Backpressure', () => {
-		it('should not crash when buffer is full and flushing', async () => {
-			useFakeTimers();
+		it('should retain work accepted while a capacity flush is blocked', async () => {
 			const persistence = new MockPersistence();
-			persistence.saveThoughtFailCount = 999;
+			let releaseWrite: (() => void) | undefined;
+			const writeGate = new Promise<void>((resolve) => {
+				releaseWrite = resolve;
+			});
+			persistence.saveThought = async () => writeGate;
 			const manager = new HistoryManager({
 				persistence,
 				persistenceBufferSize: 1,
 				persistenceFlushInterval: 60000,
-				persistenceMaxRetries: 0,
 			});
 
 			manager.addThought(createTestThought({ thought_number: 1 }));
-			await vi.advanceTimersByTimeAsync(0);
-			await vi.waitFor(() => expect(manager.getWriteBufferLength()).toBe(1));
-
 			manager.addThought(createTestThought({ thought_number: 2 }));
 			manager.addThought(createTestThought({ thought_number: 3 }));
 
 			expect(manager.getHistoryLength()).toBe(3);
-			expect(manager.getWriteBufferLength()).toBeGreaterThan(0);
+			expect(manager.getWriteBufferLength()).toBe(3);
+			releaseWrite?.();
+			await manager.shutdown();
 		});
 	});
 
 	describe('Branch persistence', () => {
-		it('should persist branches fire-and-forget', async () => {
+		it('should persist branches through the coordinator drain', async () => {
 			const persistence = new MockPersistence();
 			const manager = new HistoryManager({ persistence });
 
@@ -405,26 +476,32 @@ describe('HistoryManager', () => {
 				})
 			);
 
-			await new Promise((r) => setTimeout(r, 0));
+			await manager.drainSession(asSessionId('__global__'));
 			const loaded = await persistence.loadBranch(asBranchId('branch-1'));
 			expect(loaded).toBeDefined();
 			expect(loaded).toHaveLength(1);
 		});
 
-		it('should not crash when branch persistence fails', async () => {
+		it('should attribute terminal branch persistence failures to the owning session', async () => {
 			const persistence = new MockPersistence();
 			persistence.saveBranchFailCount = 999;
-			const manager = new HistoryManager({ persistence });
+			const manager = new HistoryManager({ persistence, persistenceMaxRetries: 0 });
+			const globalSession = asSessionId('__global__');
+			const branchId = asBranchId('branch-1');
 
 			manager.addThought(
 				createTestThought({
 					thought_number: 1,
 					branch_from_thought: 1,
-					branch_id: asBranchId('branch-1'),
+					branch_id: branchId,
 				})
 			);
 
-			expect(manager.getBranch(asBranchId('branch-1'))).toHaveLength(1);
+			expect(manager.getBranch(branchId)).toHaveLength(1);
+			await expect(manager.drainSession(globalSession)).rejects.toMatchObject({
+				name: 'PersistenceDrainError',
+				failures: [{ kind: 'branch', sessionId: globalSession, key: branchId, attempts: 1 }],
+			});
 		});
 	});
 
@@ -550,6 +627,18 @@ describe('HistoryManager', () => {
 			expect(manager.getWriteBufferLength()).toBe(0);
 			manager.addThought(createTestThought({ thought_number: 1 }));
 			expect(manager.getWriteBufferLength()).toBe(1);
+		});
+
+		it('should register summary snapshots with the session drain coordinator', async () => {
+			const persistence = new MockPersistence();
+			const saveSummaries = vi.spyOn(persistence, 'saveSummaries');
+			const manager = new HistoryManager({ persistence });
+			const sessionId = asSessionId('summary-session');
+
+			manager.bufferSummaries(sessionId, []);
+			await manager.drainSession(sessionId);
+
+			expect(saveSummaries).toHaveBeenCalledWith(sessionId, []);
 		});
 	});
 
@@ -838,7 +927,8 @@ describe('HistoryManager', () => {
 			await manager.shutdown();
 
 			expect(manager.getWriteBufferLength()).toBe(0);
-			expect(await persistence.loadHistory()).toHaveLength(2);
+			expect(await persistence.loadHistoryForSession(asSessionId('a'))).toHaveLength(1);
+			expect(await persistence.loadHistoryForSession(asSessionId('b'))).toHaveLength(1);
 		});
 
 		it('clearSession removes specific session data', () => {
@@ -924,7 +1014,7 @@ describe('HistoryManager — uncovered branches', () => {
 		it('should log backpressure warning when buffer is full and flush is in progress', async () => {
 			useFakeTimers();
 			const persistence = new MockPersistence();
-			// Make saveThought hang so _isFlushing stays true
+			// Hold the first write so the coordinator keeps one drain generation active.
 			let resolveSave!: () => void;
 			const savePromise = new Promise<void>((resolve) => { resolveSave = resolve; });
 			persistence.saveThought = async () => { await savePromise; };
@@ -936,18 +1026,14 @@ describe('HistoryManager — uncovered branches', () => {
 				logger: mockLogger,
 			});
 
-			// Thought 1: pushes to buffer (len=1), triggers _flushBuffer.
-			// _flushBuffer splices buffer (len→0), sets _isFlushing=true, hangs on saveThought.
+			// Thought 1 reaches capacity and starts the blocked generation.
 			manager.addThought(createTestThought({ thought_number: 1 }));
 			await vi.advanceTimersByTimeAsync(0);
 
-			// Thought 2: pushes to buffer (len=1 again), triggers _flushBuffer.
-			// _flushBuffer sees _isFlushing=true → returns immediately.
-			// Buffer stays at len=1.
+			// Later capacity triggers join that generation while accepted work remains queued.
 			manager.addThought(createTestThought({ thought_number: 2 }));
 
-			// Thought 3: _bufferForPersistence checks buffer.length(1) >= 1 && _isFlushing(true)
-			// → backpressure log fires!
+			// The next acceptance observes a full coordinator-owned queue and logs backpressure.
 			manager.addThought(createTestThought({ thought_number: 3 }));
 
 			expect(mockLogger.info).toHaveBeenCalledWith(
@@ -958,7 +1044,7 @@ describe('HistoryManager — uncovered branches', () => {
 				})
 			);
 
-			// Unblock the flush
+			// Unblock the joined generation.
 			resolveSave();
 			await vi.advanceTimersByTimeAsync(0);
 			await manager.shutdown();
@@ -1130,7 +1216,7 @@ describe('HistoryManager — uncovered branches', () => {
 	});
 
 	describe('persistence saveEdges failure isolation', () => {
-		it('saveEdges throwing does not prevent saveThought from succeeding', async () => {
+		it('surfaces edge failure after independent thought writes succeed', async () => {
 			const persistence = new MockPersistence();
 			// Override saveEdges to always throw
 			let edgeSaveAttempts = 0;
@@ -1145,17 +1231,20 @@ describe('HistoryManager — uncovered branches', () => {
 				dagEdges: true,
 				persistenceBufferSize: 100,
 				persistenceFlushInterval: 60000,
+				persistenceMaxRetries: 0,
 			});
+			const sessionId = asSessionId('x');
 
 			manager.addThought(createTestThought({ thought_number: 1, session_id: 'x', id: 'x-1' }));
 			manager.addThought(createTestThought({ thought_number: 2, session_id: 'x', id: 'x-2' }));
-			await manager.shutdown();
+			await expect(manager.shutdown()).rejects.toMatchObject({
+				name: 'PersistenceDrainError',
+				failures: [{ kind: 'edge', sessionId, attempts: 1 }],
+			});
 
-			// Thoughts must be persisted even though saveEdges threw
-			const persisted = await persistence.loadHistory();
+			const persisted = await persistence.loadHistoryForSession(sessionId);
 			expect(persisted).toHaveLength(2);
-			// Edge save was attempted at least once and threw — caught silently
-			expect(edgeSaveAttempts).toBeGreaterThan(0);
+			expect(edgeSaveAttempts).toBe(1);
 		});
 
 		it('saveThought failure does not block subsequent edge save attempts', async () => {
@@ -1172,15 +1261,21 @@ describe('HistoryManager — uncovered branches', () => {
 				dagEdges: true,
 				persistenceBufferSize: 100,
 				persistenceFlushInterval: 60000,
-				persistenceMaxRetries: 1,
+				persistenceMaxRetries: 0,
 			});
+			const sessionId = asSessionId('y');
 
 			manager.addThought(createTestThought({ thought_number: 1, session_id: 'y', id: 'y-1' }));
 			manager.addThought(createTestThought({ thought_number: 2, session_id: 'y', id: 'y-2' }));
-			await manager.shutdown();
+			await expect(manager.shutdown()).rejects.toMatchObject({
+				name: 'PersistenceDrainError',
+				failures: [
+					{ kind: 'thought', sessionId, attempts: 1 },
+					{ kind: 'thought', sessionId, attempts: 1 },
+				],
+			});
 
-			// Even with thought-save failures, edges still attempted to be saved
-			expect(edgeAttempts).toBeGreaterThan(0);
+			expect(edgeAttempts).toBe(1);
 		});
 	});
 });

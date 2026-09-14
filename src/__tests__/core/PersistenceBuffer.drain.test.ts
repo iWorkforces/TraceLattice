@@ -1,0 +1,913 @@
+// allow: SIZE_OK - Task 8's contract matrix is intentionally colocated in its one authorized test file.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type {
+	PersistenceBackend,
+	SessionScopedPersistenceBackend,
+} from '../../contracts/PersistenceBackend.js';
+import {
+	GLOBAL_SESSION_ID,
+	asBranchId,
+	asEdgeId,
+	asSessionId,
+	asThoughtId,
+	type BranchId,
+	type SessionId,
+} from '../../contracts/ids.js';
+import type { Summary } from '../../core/compression/Summary.js';
+import type { Edge } from '../../core/graph/Edge.js';
+import { EdgeStore } from '../../core/graph/EdgeStore.js';
+import {
+	PersistenceBuffer,
+	type BufferedSession,
+	type PersistenceEventEmitter,
+} from '../../core/PersistenceBuffer.js';
+import type { PersistenceDelay } from '../../core/PersistenceWriter.js';
+import type { ThoughtData } from '../../core/thought.js';
+import { createTestThought } from '../helpers/factories.js';
+
+interface Deferred {
+	readonly promise: Promise<void>;
+	readonly resolve: () => void;
+}
+
+type PromiseOutcome =
+	{ readonly status: 'fulfilled' } | { readonly status: 'rejected'; readonly reason: unknown };
+
+interface ThoughtWrite {
+	readonly sessionId: SessionId | undefined;
+	readonly thought: ThoughtData;
+}
+
+interface BranchWrite {
+	readonly sessionId: SessionId | undefined;
+	readonly branchId: BranchId;
+	readonly thoughts: readonly ThoughtData[];
+}
+
+interface SnapshotWrite<T> {
+	readonly sessionId: SessionId;
+	readonly snapshot: readonly T[];
+}
+
+interface PersistenceHandlers {
+	readonly thought?: (write: ThoughtWrite) => Promise<void>;
+	readonly branch?: (write: BranchWrite) => Promise<void>;
+	readonly edges?: (write: SnapshotWrite<Edge>) => Promise<void>;
+	readonly summaries?: (write: SnapshotWrite<Summary>) => Promise<void>;
+}
+
+class ExpectedWriteError extends Error {
+	public constructor(message: string) {
+		super(message);
+		this.name = 'ExpectedWriteError';
+	}
+}
+
+class CoordinatorFault extends Error {
+	public constructor() {
+		super('coordinator fault');
+		this.name = 'CoordinatorFault';
+	}
+}
+
+class RecordingPersistence implements SessionScopedPersistenceBackend {
+	public readonly thoughtWrites: ThoughtWrite[] = [];
+	public readonly branchWrites: BranchWrite[] = [];
+	public readonly edgeWrites: SnapshotWrite<Edge>[] = [];
+	public readonly summaryWrites: SnapshotWrite<Summary>[] = [];
+	public readonly legacyThoughts: ThoughtData[] = [];
+	public readonly scopedThoughts: ThoughtWrite[] = [];
+	public readonly legacyBranches: BranchWrite[] = [];
+	public readonly scopedBranches: BranchWrite[] = [];
+
+	public constructor(private readonly _handlers: PersistenceHandlers = {}) {}
+
+	public async saveThought(thought: ThoughtData): Promise<void> {
+		const write = { sessionId: undefined, thought };
+		this.legacyThoughts.push(thought);
+		this.thoughtWrites.push(write);
+		await this._handlers.thought?.(write);
+	}
+
+	public async saveThoughtForSession(sessionId: SessionId, thought: ThoughtData): Promise<void> {
+		const write = { sessionId, thought };
+		this.scopedThoughts.push(write);
+		this.thoughtWrites.push(write);
+		await this._handlers.thought?.(write);
+	}
+
+	public async loadHistory(): Promise<ThoughtData[]> {
+		return [];
+	}
+
+	public async loadHistoryForSession(_sessionId: SessionId): Promise<ThoughtData[]> {
+		return [];
+	}
+
+	public async saveBranch(branchId: BranchId, thoughts: ThoughtData[]): Promise<void> {
+		const write = { sessionId: undefined, branchId, thoughts: [...thoughts] };
+		this.legacyBranches.push(write);
+		this.branchWrites.push(write);
+		await this._handlers.branch?.(write);
+	}
+
+	public async saveBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId,
+		thoughts: readonly ThoughtData[]
+	): Promise<void> {
+		const write = { sessionId, branchId, thoughts: [...thoughts] };
+		this.scopedBranches.push(write);
+		this.branchWrites.push(write);
+		await this._handlers.branch?.(write);
+	}
+
+	public async loadBranch(_branchId: BranchId): Promise<ThoughtData[] | undefined> {
+		return undefined;
+	}
+
+	public async loadBranchForSession(
+		_sessionId: SessionId,
+		_branchId: BranchId
+	): Promise<ThoughtData[] | undefined> {
+		return undefined;
+	}
+
+	public async listBranches(): Promise<BranchId[]> {
+		return [];
+	}
+
+	public async listBranchesForSession(_sessionId: SessionId): Promise<BranchId[]> {
+		return [];
+	}
+
+	public async listSessions(): Promise<SessionId[]> {
+		return [];
+	}
+
+	public async healthy(): Promise<boolean> {
+		return true;
+	}
+
+	public async clear(): Promise<void> {}
+
+	public async clearSession(_sessionId: SessionId): Promise<void> {}
+
+	public async close(): Promise<void> {}
+
+	public async saveEdges(sessionId: SessionId, edges: readonly Edge[]): Promise<void> {
+		const write = { sessionId, snapshot: [...edges] };
+		this.edgeWrites.push(write);
+		await this._handlers.edges?.(write);
+	}
+
+	public async loadEdges(_sessionId: SessionId): Promise<Edge[]> {
+		return [];
+	}
+
+	public async listEdgeSessions(): Promise<SessionId[]> {
+		return [];
+	}
+
+	public async saveSummaries(sessionId: SessionId, summaries: readonly Summary[]): Promise<void> {
+		const write = { sessionId, snapshot: [...summaries] };
+		this.summaryWrites.push(write);
+		await this._handlers.summaries?.(write);
+	}
+
+	public async loadSummaries(_sessionId: SessionId): Promise<Summary[]> {
+		return [];
+	}
+}
+
+interface Harness {
+	readonly buffer: PersistenceBuffer<BufferedSession>;
+	readonly sessions: Map<SessionId, BufferedSession>;
+	readonly edgeStore: EdgeStore;
+}
+
+interface HarnessOptions {
+	readonly persistence: PersistenceBackend;
+	readonly maxRetries?: number;
+	readonly bufferSize?: number;
+	readonly flushInterval?: number;
+	readonly edgeStore?: EdgeStore;
+	readonly eventEmitter?: PersistenceEventEmitter;
+	readonly getSessions?: () => Map<SessionId, BufferedSession>;
+	readonly delay?: PersistenceDelay;
+}
+
+const activeBuffers: PersistenceBuffer<BufferedSession>[] = [];
+const deferredReleases: Array<() => void> = [];
+
+function createDeferred(): Deferred {
+	let release = (): void => {};
+	const promise = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	deferredReleases.push(release);
+	return { promise, resolve: release };
+}
+
+function createHarness(options: HarnessOptions): Harness {
+	const sessions = new Map<SessionId, BufferedSession>();
+	sessions.set(GLOBAL_SESSION_ID, { writeBuffer: [] });
+	const edgeStore = options.edgeStore ?? new EdgeStore();
+	const buffer = new PersistenceBuffer<BufferedSession>({
+		persistence: options.persistence,
+		bufferSize: options.bufferSize ?? 100,
+		flushInterval: options.flushInterval ?? 1_000,
+		maxRetries: options.maxRetries ?? 0,
+		defaultSessionId: GLOBAL_SESSION_ID,
+		getSessions: options.getSessions ?? (() => sessions),
+		getDefaultSession: () => getSession(sessions, GLOBAL_SESSION_ID),
+		edgeStore,
+		eventEmitter: options.eventEmitter,
+		delay: options.delay,
+	});
+	activeBuffers.push(buffer);
+	return { buffer, sessions, edgeStore };
+}
+
+function getSession(
+	sessions: Map<SessionId, BufferedSession>,
+	sessionId: SessionId
+): BufferedSession {
+	const existing = sessions.get(sessionId);
+	if (existing !== undefined) return existing;
+	const created = { writeBuffer: [] };
+	sessions.set(sessionId, created);
+	return created;
+}
+
+function drain(buffer: PersistenceBuffer<BufferedSession>): Promise<void> {
+	return buffer.drain();
+}
+
+function drainSession(
+	buffer: PersistenceBuffer<BufferedSession>,
+	sessionId: SessionId
+): Promise<void> {
+	return buffer.drainSession(sessionId);
+}
+
+function acceptThought(harness: Harness, sessionId: SessionId, thoughtNumber: number): void {
+	const thought = createTestThought({
+		id: `${sessionId}-thought-${thoughtNumber}`,
+		session_id: sessionId,
+		thought_number: thoughtNumber,
+	});
+	acceptThoughtData(harness, sessionId, thought);
+}
+
+function acceptThoughtData(harness: Harness, sessionId: SessionId, thought: ThoughtData): void {
+	harness.buffer.bufferThought(sessionId, thought);
+}
+
+function acceptBranch(
+	buffer: PersistenceBuffer<BufferedSession>,
+	sessionId: SessionId,
+	branchId: BranchId,
+	thoughts: readonly ThoughtData[]
+): void {
+	buffer.bufferBranch(sessionId, branchId, thoughts);
+}
+
+function acceptEdges(harness: Harness, sessionId: SessionId, edges: readonly Edge[]): void {
+	harness.buffer.bufferEdges(sessionId, edges);
+}
+
+function acceptSummaries(
+	buffer: PersistenceBuffer<BufferedSession>,
+	sessionId: SessionId,
+	summaries: readonly Summary[]
+): void {
+	buffer.bufferSummaries(sessionId, summaries);
+}
+
+function edge(sessionId: SessionId, suffix: string, createdAt: number): Edge {
+	return {
+		id: asEdgeId(`edge-${suffix}`),
+		from: asThoughtId(`from-${suffix}`),
+		to: asThoughtId(`to-${suffix}`),
+		kind: 'sequence',
+		sessionId,
+		createdAt,
+	};
+}
+
+function summary(sessionId: SessionId, suffix: string): Summary {
+	return {
+		id: `summary-${suffix}`,
+		sessionId,
+		rootThoughtId: asThoughtId(`root-${suffix}`),
+		coveredIds: [asThoughtId(`covered-${suffix}`)],
+		coveredRange: [1, 1],
+		topics: ['persistence'],
+		aggregateConfidence: 0.8,
+		createdAt: 1,
+	};
+}
+
+function settle(promise: Promise<void>): Promise<PromiseOutcome> {
+	return promise.then(
+		() => ({ status: 'fulfilled' }),
+		(reason: unknown) => ({ status: 'rejected', reason })
+	);
+}
+
+function settlementProbe(promise: Promise<void>): () => boolean {
+	let settled = false;
+	void promise.then(
+		() => {
+			settled = true;
+		},
+		() => {
+			settled = true;
+		}
+	);
+	return () => settled;
+}
+
+async function flushMicrotasks(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+}
+
+beforeEach(() => {
+	vi.useFakeTimers({ shouldAdvanceTime: false });
+});
+
+afterEach(async () => {
+	for (const buffer of activeBuffers.splice(0)) buffer.stopFlushTimer();
+	for (const release of deferredReleases.splice(0)) release();
+	await vi.runAllTimersAsync();
+	vi.clearAllTimers();
+	vi.useRealTimers();
+});
+
+describe('PersistenceBuffer joinable drain generation', () => {
+	it('returns exact shared identity for drain, flush, and drain joiners', async () => {
+		// Given
+		const gate = createDeferred();
+		const persistence = new RecordingPersistence({ thought: async () => gate.promise });
+		const harness = createHarness({ persistence });
+		acceptThought(harness, GLOBAL_SESSION_ID, 1);
+
+		// When
+		const first = drain(harness.buffer);
+		const second = harness.buffer.flush();
+		const third = drain(harness.buffer);
+
+		// Then
+		try {
+			expect(first).toBe(second);
+			expect(second).toBe(third);
+		} finally {
+			gate.resolve();
+			await Promise.all([settle(first), settle(second), settle(third)]);
+		}
+	});
+
+	it('keeps every joiner pending while the first backend write is blocked', async () => {
+		// Given
+		const gate = createDeferred();
+		const persistence = new RecordingPersistence({ thought: async () => gate.promise });
+		const harness = createHarness({ persistence });
+		acceptThought(harness, GLOBAL_SESSION_ID, 1);
+
+		// When
+		const first = drain(harness.buffer);
+		const second = harness.buffer.flush();
+		const third = drain(harness.buffer);
+		const probes = [settlementProbe(first), settlementProbe(second), settlementProbe(third)];
+		await flushMicrotasks();
+
+		// Then
+		try {
+			expect(probes.map((probe) => probe())).toEqual([false, false, false]);
+		} finally {
+			gate.resolve();
+			await Promise.all([settle(first), settle(second), settle(third)]);
+		}
+	});
+
+	it('settles late accepted work before the active generation resolves', async () => {
+		// Given
+		const gate = createDeferred();
+		const persistence = new RecordingPersistence({
+			thought: async () => {
+				if (persistence.thoughtWrites.length === 1) await gate.promise;
+			},
+		});
+		const harness = createHarness({ persistence });
+		acceptThoughtData(
+			harness,
+			GLOBAL_SESSION_ID,
+			createTestThought({ id: 'shared-acceptance-id', thought_number: 1 })
+		);
+
+		// When
+		const generation = settle(drain(harness.buffer));
+		await flushMicrotasks();
+		acceptThoughtData(
+			harness,
+			GLOBAL_SESSION_ID,
+			createTestThought({ id: 'shared-acceptance-id', thought_number: 2 })
+		);
+		gate.resolve();
+		const outcome = await generation;
+
+		// Then
+		expect(outcome).toEqual({ status: 'fulfilled' });
+		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([1, 2]);
+	});
+});
+
+describe('PersistenceBuffer bounded attributable retries', () => {
+	it('removes successes once and retains only terminal failures for an explicit later generation', async () => {
+		// Given
+		const sessionId = asSessionId('partial-session');
+		let failSecond = true;
+		const persistence = new RecordingPersistence({
+			thought: async ({ thought }) => {
+				if (thought.thought_number === 2 && failSecond) throw new ExpectedWriteError('second');
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		acceptThought(harness, sessionId, 1);
+		acceptThought(harness, sessionId, 2);
+		acceptThought(harness, sessionId, 3);
+
+		// When
+		const first = await settle(drain(harness.buffer));
+		failSecond = false;
+		const second = await settle(drain(harness.buffer));
+
+		// Then
+		expect(first).toMatchObject({
+			status: 'rejected',
+			reason: {
+				name: 'PersistenceDrainError',
+				code: 'PERSISTENCE_DRAIN',
+				failures: [{ sessionId, kind: 'thought', attempts: 1 }],
+			},
+		});
+		expect(second).toEqual({ status: 'fulfilled' });
+		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([
+			1, 2, 3, 2,
+		]);
+	});
+
+	it('uses the same named SessionId and only scoped persistence methods for every retry', async () => {
+		// Given
+		const sessionId = asSessionId('named-retry');
+		const persistence = new RecordingPersistence({
+			thought: async ({ sessionId: actualSessionId }) => {
+				if (actualSessionId === undefined) throw new ExpectedWriteError('legacy method');
+				if (persistence.scopedThoughts.length === 1) throw new ExpectedWriteError('retry once');
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 1 });
+		acceptThought(harness, sessionId, 1);
+
+		// When
+		const outcomePromise = settle(drain(harness.buffer));
+		await vi.runAllTimersAsync();
+		const outcome = await outcomePromise;
+
+		// Then
+		expect(outcome).toEqual({ status: 'fulfilled' });
+		expect(persistence.scopedThoughts.map((write) => write.sessionId)).toEqual([
+			sessionId,
+			sessionId,
+		]);
+		expect(persistence.legacyThoughts).toHaveLength(0);
+	});
+
+	it('rejects with a typed failure after exactly maxRetries plus one attempts and retains work', async () => {
+		// Given
+		const sessionId = asSessionId('bounded-retry');
+		const failure = new ExpectedWriteError('always fails');
+		const persistence = new RecordingPersistence({
+			thought: async () => {
+				throw failure;
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 2 });
+		acceptThought(harness, sessionId, 1);
+
+		// When
+		const outcomePromise = settle(drain(harness.buffer));
+		await vi.runAllTimersAsync();
+		const outcome = await outcomePromise;
+
+		// Then
+		expect(persistence.thoughtWrites).toHaveLength(3);
+		expect(outcome).toMatchObject({
+			status: 'rejected',
+			reason: {
+				name: 'PersistenceDrainError',
+				code: 'PERSISTENCE_DRAIN',
+				failures: [{ sessionId, kind: 'thought', attempts: 3, cause: failure }],
+			},
+		});
+	});
+
+	it('does not let timer generations reattempt exhausted work until an explicit drain rearms it', async () => {
+		// Given
+		const sessionId = asSessionId('timer-exhaustion');
+		const persistence = new RecordingPersistence({
+			thought: async () => {
+				throw new ExpectedWriteError('terminal');
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0, flushInterval: 100 });
+		acceptThought(harness, sessionId, 1);
+		harness.buffer.startFlushTimer();
+
+		// When
+		const first = await settle(drain(harness.buffer));
+		await vi.advanceTimersByTimeAsync(500);
+		const attemptsBeforeRearm = persistence.thoughtWrites.length;
+		harness.buffer.stopFlushTimer();
+		const second = await settle(drain(harness.buffer));
+
+		// Then
+		expect(first.status).toBe('rejected');
+		expect(attemptsBeforeRearm).toBe(1);
+		expect(second.status).toBe('rejected');
+		expect(persistence.thoughtWrites).toHaveLength(2);
+	});
+
+	it('does not let a capacity trigger reattempt exhausted work without explicit rearm', async () => {
+		// Given
+		const sessionId = asSessionId('capacity-exhaustion');
+		const persistence = new RecordingPersistence({
+			thought: async ({ thought }) => {
+				if (thought.thought_number === 1) throw new ExpectedWriteError('terminal');
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0, bufferSize: 1 });
+		acceptThought(harness, sessionId, 1);
+		await flushMicrotasks();
+
+		// When
+		acceptThought(harness, sessionId, 2);
+		await flushMicrotasks();
+
+		// Then
+		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([1, 2]);
+	});
+});
+
+describe('PersistenceBuffer auxiliary-only work', () => {
+	it('drains edge-only work without requiring a thought', async () => {
+		// Given
+		const sessionId = asSessionId('edge-only');
+		const failure = new ExpectedWriteError('edge failure');
+		const persistence = new RecordingPersistence({
+			edges: async () => {
+				throw failure;
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		acceptEdges(harness, sessionId, [edge(sessionId, 'only', 1)]);
+
+		// When
+		const outcome = await settle(drain(harness.buffer));
+
+		// Then
+		expect(persistence.edgeWrites).toHaveLength(1);
+		expect(outcome).toMatchObject({
+			status: 'rejected',
+			reason: {
+				name: 'PersistenceDrainError',
+				failures: [{ sessionId, kind: 'edge', attempts: 1, cause: failure }],
+			},
+		});
+	});
+
+	it('drains branch-only work through the scoped branch method and rejects exhaustion', async () => {
+		// Given
+		const sessionId = asSessionId('branch-only');
+		const branchId = asBranchId('branch-a');
+		const failure = new ExpectedWriteError('branch failure');
+		const persistence = new RecordingPersistence({
+			branch: async () => {
+				throw failure;
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		acceptBranch(harness.buffer, sessionId, branchId, [
+			createTestThought({ id: 'branch-thought', session_id: sessionId }),
+		]);
+
+		// When
+		const outcome = await settle(drain(harness.buffer));
+
+		// Then
+		expect(persistence.scopedBranches).toHaveLength(1);
+		expect(persistence.legacyBranches).toHaveLength(0);
+		expect(outcome).toMatchObject({
+			status: 'rejected',
+			reason: {
+				name: 'PersistenceDrainError',
+				failures: [{ sessionId, kind: 'branch', key: branchId, attempts: 1, cause: failure }],
+			},
+		});
+	});
+
+	it('drains summary-only work and rejects exhaustion', async () => {
+		// Given
+		const sessionId = asSessionId('summary-only');
+		const failure = new ExpectedWriteError('summary failure');
+		const persistence = new RecordingPersistence({
+			summaries: async () => {
+				throw failure;
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		acceptSummaries(harness.buffer, sessionId, [summary(sessionId, 'only')]);
+
+		// When
+		const outcome = await settle(drain(harness.buffer));
+
+		// Then
+		expect(persistence.summaryWrites).toHaveLength(1);
+		expect(outcome).toMatchObject({
+			status: 'rejected',
+			reason: {
+				name: 'PersistenceDrainError',
+				failures: [{ sessionId, kind: 'summary', attempts: 1, cause: failure }],
+			},
+		});
+	});
+
+	it('captures a shallow branch snapshot at acceptance time', async () => {
+		// Given
+		const sessionId = asSessionId('branch-snapshot');
+		const branchId = asBranchId('branch-snapshot');
+		const original = createTestThought({ id: 'original', session_id: sessionId });
+		const mutableInput = [original];
+		const persistence = new RecordingPersistence();
+		const harness = createHarness({ persistence });
+		acceptBranch(harness.buffer, sessionId, branchId, mutableInput);
+		mutableInput.push(createTestThought({ id: 'late-mutation', session_id: sessionId }));
+
+		// When
+		const outcome = await settle(drain(harness.buffer));
+
+		// Then
+		expect(outcome).toEqual({ status: 'fulfilled' });
+		expect(persistence.branchWrites[0]?.thoughts).toEqual([original]);
+	});
+});
+
+describe('PersistenceBuffer versioned auxiliary acknowledgements', () => {
+	it('does not let stale v1 success clear v2 and writes v2 in the same generation', async () => {
+		// Given
+		const sessionId = asSessionId('edge-version-success');
+		const gate = createDeferred();
+		const persistence = new RecordingPersistence({
+			edges: async () => {
+				if (persistence.edgeWrites.length === 1) await gate.promise;
+			},
+		});
+		const harness = createHarness({ persistence });
+		const v1 = [edge(sessionId, 'v1', 1)];
+		const v2 = [...v1, edge(sessionId, 'v2', 2)];
+		acceptThought(harness, sessionId, 1);
+		acceptEdges(harness, sessionId, v1);
+
+		// When
+		const generation = settle(drain(harness.buffer));
+		await flushMicrotasks();
+		acceptEdges(harness, sessionId, v2);
+		gate.resolve();
+		const outcome = await generation;
+
+		// Then
+		expect(outcome).toEqual({ status: 'fulfilled' });
+		expect(persistence.edgeWrites.map((write) => write.snapshot.map((item) => item.id))).toEqual([
+			v1.map((item) => item.id),
+			v2.map((item) => item.id),
+		]);
+	});
+
+	it('does not let stale v1 failure fail v2 when v2 succeeds in the same generation', async () => {
+		// Given
+		const sessionId = asSessionId('edge-version-failure');
+		const gate = createDeferred();
+		const persistence = new RecordingPersistence({
+			edges: async () => {
+				if (persistence.edgeWrites.length === 1) {
+					await gate.promise;
+					throw new ExpectedWriteError('stale v1 failure');
+				}
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		const v1 = [edge(sessionId, 'failure-v1', 1)];
+		const v2 = [...v1, edge(sessionId, 'failure-v2', 2)];
+		acceptThought(harness, sessionId, 1);
+		acceptEdges(harness, sessionId, v1);
+
+		// When
+		const generation = settle(drain(harness.buffer));
+		await flushMicrotasks();
+		acceptEdges(harness, sessionId, v2);
+		gate.resolve();
+		const outcome = await generation;
+
+		// Then
+		expect(outcome).toEqual({ status: 'fulfilled' });
+		expect(persistence.edgeWrites.map((write) => write.snapshot.length)).toEqual([1, 2]);
+	});
+});
+
+describe('PersistenceBuffer session-filtered barriers', () => {
+	it('joins an active global generation and includes A work accepted while B is blocked', async () => {
+		// Given
+		const sessionA = asSessionId('join-session-a');
+		const sessionB = asSessionId('join-session-b');
+		const gate = createDeferred();
+		const persistence = new RecordingPersistence({
+			thought: async ({ thought }) => {
+				if (thought.session_id === sessionB) await gate.promise;
+			},
+		});
+		const harness = createHarness({ persistence });
+		acceptThought(harness, sessionB, 1);
+		const globalDrain = settle(drain(harness.buffer));
+		await flushMicrotasks();
+
+		// When
+		const sessionDrain = drainSession(harness.buffer, sessionA);
+		const sessionSettled = settlementProbe(sessionDrain);
+		acceptThought(harness, sessionA, 1);
+		await flushMicrotasks();
+		const settledBeforeRelease = sessionSettled();
+		gate.resolve();
+		const [globalOutcome, sessionOutcome] = await Promise.all([globalDrain, settle(sessionDrain)]);
+
+		// Then
+		expect(settledBeforeRelease).toBe(false);
+		expect(globalOutcome).toEqual({ status: 'fulfilled' });
+		expect(sessionOutcome).toEqual({ status: 'fulfilled' });
+		expect(persistence.thoughtWrites.map((write) => write.thought.session_id)).toEqual([
+			sessionB,
+			sessionA,
+		]);
+	});
+
+	it('resolves A projection when only B fails while the global generation rejects', async () => {
+		// Given
+		const sessionA = asSessionId('projection-a');
+		const sessionB = asSessionId('projection-b');
+		const persistence = new RecordingPersistence({
+			thought: async ({ thought }) => {
+				if (thought.session_id === sessionB) throw new ExpectedWriteError('B failed');
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		acceptThought(harness, sessionA, 1);
+		acceptThought(harness, sessionB, 1);
+
+		// When
+		const globalDrain = settle(drain(harness.buffer));
+		const sessionDrain = settle(drainSession(harness.buffer, sessionA));
+		const [globalOutcome, sessionOutcome] = await Promise.all([globalDrain, sessionDrain]);
+
+		// Then
+		expect(globalOutcome).toMatchObject({ status: 'rejected' });
+		expect(sessionOutcome).toEqual({ status: 'fulfilled' });
+	});
+
+	it('rejects A with only A failures and rearms retained A work on a later session drain', async () => {
+		// Given
+		const sessionA = asSessionId('failure-a');
+		const sessionB = asSessionId('failure-b');
+		let failA = true;
+		const persistence = new RecordingPersistence({
+			thought: async ({ thought }) => {
+				if (thought.session_id === sessionA && failA) throw new ExpectedWriteError('A failed');
+				if (thought.session_id === sessionB) throw new ExpectedWriteError('B failed');
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		acceptThought(harness, sessionA, 1);
+		acceptThought(harness, sessionB, 1);
+
+		// When
+		const first = await settle(drainSession(harness.buffer, sessionA));
+		failA = false;
+		const second = await settle(drainSession(harness.buffer, sessionA));
+
+		// Then
+		expect(first).toMatchObject({
+			status: 'rejected',
+			reason: {
+				name: 'PersistenceDrainError',
+				failures: [{ sessionId: sessionA, kind: 'thought', attempts: 1 }],
+			},
+		});
+		expect(second).toEqual({ status: 'fulfilled' });
+		expect(
+			persistence.thoughtWrites.filter((write) => write.thought.session_id === sessionA)
+		).toHaveLength(2);
+	});
+
+	it('propagates an unrelated coordinator fault unchanged', async () => {
+		// Given
+		const sessionId = asSessionId('coordinator-session');
+		const fault = new CoordinatorFault();
+		const persistence = new RecordingPersistence({
+			thought: async () => {
+				throw new ExpectedWriteError('retry once');
+			},
+		});
+		const harness = createHarness({
+			persistence,
+			maxRetries: 1,
+			delay: async () => {
+				throw fault;
+			},
+		});
+		acceptThought(harness, sessionId, 1);
+
+		// When
+		const outcome = await settle(drainSession(harness.buffer, sessionId));
+
+		// Then
+		expect(outcome).toEqual({ status: 'rejected', reason: fault });
+	});
+
+	it('keeps a reset-like continuation pending until accepted A work settles', async () => {
+		// Given
+		const sessionId = asSessionId('reset-order');
+		const gate = createDeferred();
+		const persistence = new RecordingPersistence({ thought: async () => gate.promise });
+		const harness = createHarness({ persistence });
+		acceptThought(harness, sessionId, 1);
+		let continuationRan = false;
+
+		// When
+		const continuation = drainSession(harness.buffer, sessionId).then(() => {
+			continuationRan = true;
+		});
+		await flushMicrotasks();
+		const ranBeforeRelease = continuationRan;
+		gate.resolve();
+		await settle(continuation);
+
+		// Then
+		expect(ranBeforeRelease).toBe(false);
+		expect(continuationRan).toBe(true);
+	});
+});
+
+describe('PersistenceBuffer background joiner regression', () => {
+	it('does not duplicate writes or failure observations for timer and capacity joiners', async () => {
+		// Given
+		const sessionId = asSessionId('background-joiners');
+		const gate = createDeferred();
+		const events: Error[] = [];
+		const persistence = new RecordingPersistence({
+			thought: async () => {
+				if (persistence.thoughtWrites.length === 1) await gate.promise;
+				throw new ExpectedWriteError('generation failure');
+			},
+		});
+		const harness = createHarness({
+			persistence,
+			maxRetries: 0,
+			bufferSize: 1,
+			flushInterval: 100,
+			eventEmitter: {
+				emit(_event, payload) {
+					events.push(payload.error);
+					return true;
+				},
+			},
+		});
+		acceptThought(harness, sessionId, 1);
+		harness.buffer.startFlushTimer();
+		await vi.advanceTimersByTimeAsync(300);
+
+		// When
+		acceptThought(harness, sessionId, 2);
+		const joined = settle(drain(harness.buffer));
+		harness.buffer.stopFlushTimer();
+		gate.resolve();
+		await vi.advanceTimersByTimeAsync(0);
+		const outcome = await joined;
+
+		// Then
+		expect(outcome.status).toBe('rejected');
+		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([1, 2]);
+		expect(events).toHaveLength(1);
+	});
+});

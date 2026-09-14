@@ -25,6 +25,7 @@ import {
 	type DehydrationOptions,
 	type HydratedEntry,
 } from './compression/DehydrationPolicy.js';
+import type { Summary } from './compression/Summary.js';
 import { EdgeEmitter } from './graph/EdgeEmitter.js';
 import type { IHistoryManager } from './IHistoryManager.js';
 import { PersistenceBuffer, type PersistenceEventEmitter } from './PersistenceBuffer.js';
@@ -177,8 +178,28 @@ export class HistoryManager implements IHistoryManager {
 	}
 
 	/** @internal Public for backward-compatible test coupling. */
-	public async _flushBuffer(): Promise<void> {
-		await this._persistenceBuffer?.flush();
+	public _flushBuffer(): Promise<void> {
+		return this._persistenceBuffer?.flush() ?? Promise.resolve();
+	}
+
+	/**
+	 * Drains accepted persistence work and projects terminal failures to one session.
+	 *
+	 * @param sessionId - Authoritative session whose persistence barrier to await.
+	 * @returns A promise that settles when the session's accepted work settles.
+	 */
+	public drainSession(sessionId: SessionId): Promise<void> {
+		return this._persistenceBuffer?.drainSession(sessionId) ?? Promise.resolve();
+	}
+
+	/**
+	 * Registers the latest summary snapshot for coordinator-owned persistence.
+	 *
+	 * @param sessionId - Authoritative session that owns the summaries.
+	 * @param summaries - Complete current summary snapshot for the session.
+	 */
+	public bufferSummaries(sessionId: SessionId, summaries: readonly Summary[]): void {
+		this._persistenceBuffer?.bufferSummaries(sessionId, summaries);
 	}
 
 	/** EdgeStore instance, if configured. Used by ThoughtProcessor for StrategyContext. */
@@ -240,7 +261,8 @@ export class HistoryManager implements IHistoryManager {
 	 * caches tools/skills, trims, branches, emits DAG edges, and buffers for persistence.
 	 */
 	public addThought(thought: ThoughtData): void {
-		const session = this._getSession(thought.session_id, this._getCurrentOwner());
+		const sessionId = asSessionId(thought.session_id ?? HistoryManager.DEFAULT_SESSION);
+		const session = this._getSession(sessionId, this._getCurrentOwner());
 		this._metrics?.counter(
 			'thought_requests_total',
 			1,
@@ -273,6 +295,10 @@ export class HistoryManager implements IHistoryManager {
 
 		if (thought.branch_from_thought && thought.branch_id) {
 			this._addToSessionBranch(session, thought.branch_id, thought);
+			const branchSnapshot = session.branches[thought.branch_id];
+			if (branchSnapshot !== undefined) {
+				this._persistenceBuffer?.bufferBranch(sessionId, thought.branch_id, branchSnapshot);
+			}
 		}
 
 		// Track merge operations for analytics
@@ -286,11 +312,19 @@ export class HistoryManager implements IHistoryManager {
 		}
 
 		// Emit DAG edges (no-op unless edgeStore + dagEdges flag both enabled)
+		const edgeCountBefore = this._edgeStore?.size(sessionId) ?? 0;
 		this._edgeEmitter.emitEdgesForThought(session, thought);
+		if (
+			this._edgeStore &&
+			this._persistenceBuffer &&
+			this._edgeStore.size(sessionId) > edgeCountBefore
+		) {
+			this._persistenceBuffer.bufferEdges(sessionId, this._edgeStore.edgesForSession(sessionId));
+		}
 
 		// Buffer thought for persistence (no-op when persistence disabled)
 		if (this._persistenceBuffer) {
-			this._persistenceBuffer.bufferThought(session, thought);
+			this._persistenceBuffer.bufferThought(sessionId, thought);
 		}
 	}
 
@@ -312,7 +346,11 @@ export class HistoryManager implements IHistoryManager {
 		}
 	}
 
-	private _addToSessionBranch(session: SessionState, branchId: BranchId, thought: ThoughtData): void {
+	private _addToSessionBranch(
+		session: SessionState,
+		branchId: BranchId,
+		thought: ThoughtData
+	): void {
 		if (!session.branches[branchId]) {
 			session.branches[branchId] = [];
 		}
@@ -321,16 +359,6 @@ export class HistoryManager implements IHistoryManager {
 
 		if (Object.keys(session.branches).length > this._maxBranches) {
 			this._cleanupSessionBranches(session);
-		}
-
-		// Persist branch to backend if enabled
-		if (this._persistenceEnabled && this._persistence) {
-			this._persistence.saveBranch(branchId, session.branches[branchId]).catch((err) => {
-				this.log('Failed to persist branch', {
-					branchId,
-					error: getErrorMessage(err),
-				});
-			});
 		}
 	}
 
@@ -349,9 +377,10 @@ export class HistoryManager implements IHistoryManager {
 	}
 
 	private _trimSessionBranchSize(session: SessionState, branchId: BranchId): void {
-		if ((session.branches[branchId] ?? []).length > this._maxBranchSize) {
-			const removed = session.branches[branchId]!.length - this._maxBranchSize;
-			session.branches[branchId] = session.branches[branchId]!.slice(-this._maxBranchSize);
+		const branch = session.branches[branchId];
+		if (branch !== undefined && branch.length > this._maxBranchSize) {
+			const removed = branch.length - this._maxBranchSize;
+			session.branches[branchId] = branch.slice(-this._maxBranchSize);
 			this.log(`Trimmed branch '${branchId}': removed ${removed} old thoughts`, {
 				branchId,
 				removed,
@@ -562,12 +591,8 @@ export class HistoryManager implements IHistoryManager {
 		await this._flushBuffer();
 	}
 
-	/** Total write buffer length across all sessions. */
+	/** Number of coordinator-owned thought writes not yet acknowledged successful. */
 	public getWriteBufferLength(): number {
-		let total = 0;
-		for (const session of this._sessions.values()) {
-			total += session.writeBuffer.length;
-		}
-		return total;
+		return this._persistenceBuffer?.pendingThoughtCount ?? 0;
 	}
 }
