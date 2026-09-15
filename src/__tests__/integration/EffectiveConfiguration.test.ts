@@ -174,8 +174,21 @@ describe('effective runtime configuration', () => {
 		expect(server.config.toolInterleaveSweepMs).toBe(2468);
 		expect(response.expires_at - startedAt).toBe(1234);
 		vi.advanceTimersByTime(1234);
-		expect(store.size('effective-ttl')).toBe(1);
-		vi.advanceTimersByTime(1234);
+		const expired = await server.processThought({
+			thought: 'result at exact expiry',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			session_id: 'effective-ttl',
+			thought_type: 'tool_observation',
+			continuation_token: response.continuation_token,
+		});
+
+		expect(JSON.parse(expired.content[0]?.text ?? '{}')).toMatchObject({
+			code: 'SUSPENSION_EXPIRED',
+			status: 'failed',
+		});
+		expect(server.history.getHistory('effective-ttl')).toHaveLength(1);
 		expect(store.size('effective-ttl')).toBe(0);
 	});
 
