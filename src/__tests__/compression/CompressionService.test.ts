@@ -8,6 +8,7 @@ import { InMemorySummaryStore } from '../../core/compression/InMemorySummaryStor
 import { EdgeStore } from '../../core/graph/EdgeStore.js';
 import { generateUlid } from '../../core/ids.js';
 import type { HistorySessionSnapshot, IHistoryManager } from '../../core/IHistoryManager.js';
+import type { ThoughtReferenceResolution } from '../../core/ThoughtReferenceIndex.js';
 import type { ThoughtData } from '../../core/thought.js';
 import type { ConfidenceSignals } from '../../core/reasoning.js';
 import type { Edge } from '../../core/graph/Edge.js';
@@ -49,6 +50,9 @@ class FakeHistoryManager implements IHistoryManager {
 	constructor(private readonly _thoughts: ThoughtData[] = []) {}
 	addThought(t: ThoughtData): void {
 		this._thoughts.push(t);
+	}
+	resolveThoughtReference(): ThoughtReferenceResolution {
+		return { kind: 'missing' };
 	}
 	getHistory(): ThoughtData[] {
 		return this._thoughts;

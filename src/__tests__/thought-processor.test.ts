@@ -258,6 +258,9 @@ describe('ThoughtProcessor', () => {
 		it('should return error response when processing fails', async () => {
 			// Create a HistoryManager that throws on addThought
 			class ThrowingHistoryManager implements IHistoryManager {
+				resolveThoughtReference() {
+					return { kind: 'missing' as const };
+				}
 				addThought(): void {
 					throw new Error('Database error');
 				}
@@ -1100,7 +1103,7 @@ describe('ThoughtProcessor', () => {
 	});
 
 	describe('cross-field reference validation', () => {
-		it('rejects a dangling scalar reference before branch registration', async () => {
+		it('drops a dangling scalar reference before branch registration', async () => {
 			const result = await processor.process({
 				thought: 'Strict scalar reference',
 				thought_number: 1,
@@ -1110,15 +1113,14 @@ describe('ThoughtProcessor', () => {
 				register_branch_id: 'future',
 			});
 
-			expect(result).toMatchObject({ isError: true });
-			expect(JSON.parse(result.content[0]!.text)).toMatchObject({
-				code: 'VALIDATION_ERROR',
-				status: 'failed',
-			});
-			expect(mockHistory.getBranchIds()).toEqual([]);
+			expect(result.isError).toBeUndefined();
+			expect(JSON.parse(result.content[0]!.text).warnings).toEqual([
+				'Dropped dangling verification_target: 1 (history has 0 thoughts)',
+			]);
+			expect(mockHistory.getBranchIds()).toEqual([asBranchId('future')]);
 		});
 
-		it('rejects dangling thought-list references before branch registration', async () => {
+		it('filters dangling thought-list references before branch registration', async () => {
 			const result = await processor.process({
 				thought: 'Strict list reference',
 				thought_number: 1,
@@ -1128,12 +1130,11 @@ describe('ThoughtProcessor', () => {
 				register_branch_id: 'future',
 			});
 
-			expect(result).toMatchObject({ isError: true });
-			expect(JSON.parse(result.content[0]!.text)).toMatchObject({
-				code: 'VALIDATION_ERROR',
-				status: 'failed',
-			});
-			expect(mockHistory.getBranchIds()).toEqual([]);
+			expect(result.isError).toBeUndefined();
+			expect(JSON.parse(result.content[0]!.text).warnings).toEqual([
+				'Filtered dangling synthesis_sources: [1] (history has 0 thoughts)',
+			]);
+			expect(mockHistory.getBranchIds()).toEqual([asBranchId('future')]);
 		});
 
 		it('rejects dangling branch references before branch registration', async () => {
@@ -1812,6 +1813,9 @@ describe('ThoughtProcessor — uncovered branches', () => {
 		it('should handle non-Error thrown in process catch branch', async () => {
 			// Create a HistoryManager that throws a non-Error value
 			class StringThrowingHistoryManager implements IHistoryManager {
+				resolveThoughtReference() {
+					return { kind: 'missing' as const };
+				}
 				addThought(): void {
 					throw 'string failure';
 				}
