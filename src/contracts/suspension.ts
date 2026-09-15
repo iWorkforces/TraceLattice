@@ -8,7 +8,7 @@
  * @module contracts/suspension
  */
 
-import type { SessionId, SuspensionToken } from './ids.js';
+import type { SessionId, SuspensionToken, ThoughtId } from './ids.js';
 
 /**
  * A single pending tool-call suspension record.
@@ -24,6 +24,8 @@ export interface SuspensionRecord {
 	readonly sessionId: SessionId;
 	/** Thought number of the originating `tool_call` thought. */
 	readonly toolCallThoughtNumber: number;
+	/** Stable identity of the originating `tool_call` thought. */
+	readonly toolCallThoughtId: ThoughtId;
 	/** Name of the tool to invoke. */
 	readonly toolName: string;
 	/** Arguments supplied to the tool. */
@@ -47,6 +49,7 @@ export interface SuspensionRecord {
  * const rec = store.suspend({
  *   sessionId: 's1',
  *   toolCallThoughtNumber: 3,
+ *   toolCallThoughtId: 'thought-3',
  *   toolName: 'search',
  *   toolArguments: { q: 'foo' },
  *   expiresAt: Date.now() + 60_000,
@@ -73,6 +76,7 @@ export interface ISuspensionStore {
 	 * const rec = store.suspend({
 	 *   sessionId: 's1',
 	 *   toolCallThoughtNumber: 2,
+	 *   toolCallThoughtId: 'thought-2',
 	 *   toolName: 'search',
 	 *   toolArguments: {},
 	 *   ttlMs: 30_000,
@@ -124,7 +128,7 @@ export interface ISuspensionStore {
 	 * @example
 	 * ```typescript
 	 * const record = await store.compareAndAdmit(token, sessionId, (candidate) => {
-	 *   history.addThought({ ...observation, _resumedFrom: candidate.toolCallThoughtNumber });
+	 *   history.addThought(observation, { toolInvocationSourceThoughtId: candidate.toolCallThoughtId });
 	 * });
 	 * ```
 	 */

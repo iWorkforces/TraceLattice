@@ -44,6 +44,7 @@ const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
  * const rec = store.suspend({
  *   sessionId: 's1',
  *   toolCallThoughtNumber: 3,
+ *   toolCallThoughtId: 'thought-3',
  *   toolName: 'search',
  *   toolArguments: { q: 'foo' },
  *   expiresAt: 0,
@@ -77,6 +78,7 @@ export class InMemorySuspensionStore implements ISuspensionStore {
 			token,
 			sessionId: record.sessionId,
 			toolCallThoughtNumber: record.toolCallThoughtNumber,
+			toolCallThoughtId: record.toolCallThoughtId,
 			toolName: record.toolName,
 			toolArguments: record.toolArguments,
 			createdAt,
