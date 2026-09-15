@@ -6,8 +6,7 @@ import { InMemorySuspensionStore } from '../../core/tools/InMemorySuspensionStor
 import { SequentialStrategy } from '../../core/reasoning/strategies/SequentialStrategy.js';
 import { MockHistoryManager, createMockToolRegistry } from '../helpers/factories.js';
 import type { FeatureFlags } from '../../contracts/features.js';
-import type { ThoughtData } from '../../core/thought.js';
-import { asSessionId, type SuspensionToken } from '../../contracts/ids.js';
+import { asSessionId, asThoughtId, type SuspensionToken } from '../../contracts/ids.js';
 
 function makeFeatures(overrides: Partial<FeatureFlags> = {}): FeatureFlags {
 	return {
@@ -141,7 +140,7 @@ describe('ThoughtProcessor — tool interleave', () => {
 		expect(items[1]!.thought_type).toBe('tool_observation');
 	});
 
-	it('tool_observation attaches _resumedFrom referencing the tool_call thought_number', async () => {
+	it('tool_observation does not expose transient numeric resume metadata', async () => {
 		const { processor, history } = makeProcessor(store);
 		const callResult = await processor.process({
 			thought: 'invoke',
@@ -163,8 +162,8 @@ describe('ThoughtProcessor — tool interleave', () => {
 			continuation_token: token,
 		});
 
-		const obs = history.getHistory()[1] as ThoughtData & { _resumedFrom?: number };
-		expect(obs._resumedFrom).toBe(7);
+		const obs = history.getHistory()[1];
+		expect('_resumedFrom' in (obs ?? {})).toBe(false);
 	});
 
 	it('tool_observation with an unknown token returns SuspensionNotFoundError', async () => {
@@ -188,6 +187,7 @@ describe('ThoughtProcessor — tool interleave', () => {
 		const expired = store.suspend({
 			sessionId: asSessionId('__global__'),
 			toolCallThoughtNumber: 1,
+			toolCallThoughtId: asThoughtId('expired-call'),
 			toolName: 'search',
 			toolArguments: {},
 			ttlMs: 100,
@@ -442,9 +442,8 @@ describe('ThoughtProcessor — tool interleave', () => {
 				'tool_call',
 				'tool_observation',
 			]);
-			// Both observations recorded their resume targets
-			expect((items[1] as ThoughtData & { _resumedFrom?: number })._resumedFrom).toBe(1);
-			expect((items[3] as ThoughtData & { _resumedFrom?: number })._resumedFrom).toBe(3);
+			expect('_resumedFrom' in (items[1] ?? {})).toBe(false);
+			expect('_resumedFrom' in (items[3] ?? {})).toBe(false);
 			// Both suspensions were consumed (single-use)
 			expect(store.size()).toBe(0);
 		});

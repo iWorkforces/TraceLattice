@@ -15,6 +15,7 @@ import type { ToolRecommendation } from '../../types/tool.js';
 import type { SkillRecommendation } from '../../types/skill.js';
 import type { StepRecommendation } from '../../core/step.js';
 import type { HistorySessionSnapshot, IHistoryManager } from '../../core/IHistoryManager.js';
+import { ThoughtReferenceIndex } from '../../core/ThoughtReferenceIndex.js';
 import type { ThoughtFormatter } from '../../core/ThoughtFormatter.js';
 
 // === Branded ID Helpers ===
@@ -175,6 +176,7 @@ export class MockHistoryManager implements IHistoryManager {
 	>();
 	private _clearCallCount = 0;
 	private _resetCallCount = 0;
+	private readonly _referenceIndex = new ThoughtReferenceIndex();
 	private static readonly DEFAULT = '__global__';
 
 	private _getSession(sessionId?: string) {
@@ -193,8 +195,16 @@ export class MockHistoryManager implements IHistoryManager {
 	addThought(thought: ThoughtData): void {
 		const s = this._getSession(thought.session_id);
 		s.history.push(thought);
+		this._referenceIndex.add(
+			asSessionId(thought.session_id ?? MockHistoryManager.DEFAULT),
+			thought
+		);
 		if (thought.available_mcp_tools) s.mcpTools = thought.available_mcp_tools;
 		if (thought.available_skills) s.skills = thought.available_skills;
+	}
+
+	resolveThoughtReference(sessionId: SessionId, thoughtNumber: number) {
+		return this._referenceIndex.resolve(sessionId, thoughtNumber);
 	}
 
 	getHistory(sessionId?: string): ThoughtData[] {
@@ -225,17 +235,20 @@ export class MockHistoryManager implements IHistoryManager {
 	clear(sessionId?: string): void {
 		const key = sessionId ?? MockHistoryManager.DEFAULT;
 		this._sessions.delete(key);
+		this._referenceIndex.clearSession(asSessionId(key));
 		this._clearCallCount++;
 	}
 
 	async resetSession(sessionId: string, clearAuxiliaryState?: () => void): Promise<void> {
 		this._sessions.delete(sessionId);
+		this._referenceIndex.clearSession(asSessionId(sessionId));
 		clearAuxiliaryState?.();
 		this._resetCallCount++;
 	}
 
 	async resetAll(clearAuxiliaryState?: () => void): Promise<void> {
 		this._sessions.clear();
+		this._referenceIndex.clearAll();
 		clearAuxiliaryState?.();
 		this._resetCallCount++;
 	}
