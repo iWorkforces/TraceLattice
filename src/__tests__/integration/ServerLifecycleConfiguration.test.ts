@@ -6,9 +6,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConfigLoader } from '../../config/ConfigLoader.js';
 import { InMemorySuspensionStore } from '../../core/tools/InMemorySuspensionStore.js';
 import { Container } from '../../di/Container.js';
-import { ConfigurationError } from '../../errors.js';
+import { ConfigurationError, PersistenceUnavailableError } from '../../errors.js';
 import { createServer, type ToolAwareSequentialThinkingServer } from '../../lib.js';
 import { MemoryPersistence } from '../../persistence/MemoryPersistence.js';
+import { asSessionId } from '../../contracts/ids.js';
 import { SkillRegistry } from '../../registry/SkillRegistry.js';
 import { ServerConfig } from '../../ServerConfig.js';
 import { SkillWatcher } from '../../watchers/SkillWatcher.js';
@@ -59,6 +60,80 @@ afterEach(async () => {
 });
 
 describe('configuration startup resource safety', () => {
+	it('T10-L01 rejects unhealthy restore and closes the backend before becoming ready', async () => {
+		// Given
+		const unhealthy = vi.spyOn(MemoryPersistence.prototype, 'healthy').mockResolvedValue(false);
+		const close = vi.spyOn(MemoryPersistence.prototype, 'close');
+		const config = new ServerConfig({
+			persistence: { enabled: true, backend: 'memory' },
+			features: { toolInterleave: false },
+		});
+
+		// When
+		const creation = createServer({ config, autoDiscover: false });
+
+		// Then
+		await expect(creation).rejects.toBeInstanceOf(PersistenceUnavailableError);
+		expect(unhealthy).toHaveBeenCalledOnce();
+		expect(close).toHaveBeenCalledOnce();
+	});
+
+	it('T10-L02 propagates restore reads and closes the backend before becoming ready', async () => {
+		// Given
+		const failure = new Error('injected list failure');
+		vi.spyOn(MemoryPersistence.prototype, 'listSessions').mockRejectedValue(failure);
+		const close = vi.spyOn(MemoryPersistence.prototype, 'close');
+		const config = new ServerConfig({
+			persistence: { enabled: true, backend: 'memory' },
+			features: { toolInterleave: false },
+		});
+
+		// When
+		const creation = createServer({ config, autoDiscover: false });
+
+		// Then
+		await expect(creation).rejects.toBe(failure);
+		expect(close).toHaveBeenCalledOnce();
+	});
+
+	it('T10-L03 propagates a thrown health check and closes the backend', async () => {
+		// Given
+		const failure = new Error('injected health failure');
+		vi.spyOn(MemoryPersistence.prototype, 'healthy').mockRejectedValue(failure);
+		const close = vi.spyOn(MemoryPersistence.prototype, 'close');
+		const config = new ServerConfig({
+			persistence: { enabled: true, backend: 'memory' },
+			features: { toolInterleave: false },
+		});
+
+		// When
+		const creation = createServer({ config, autoDiscover: false });
+
+		// Then
+		await expect(creation).rejects.toBe(failure);
+		expect(close).toHaveBeenCalledOnce();
+	});
+
+	it('T10-L04 propagates a partition load failure and closes the backend', async () => {
+		// Given
+		const failure = new Error('injected partition load failure');
+		vi.spyOn(MemoryPersistence.prototype, 'listSessions').mockResolvedValue([
+			asSessionId('restore-session'),
+		]);
+		vi.spyOn(MemoryPersistence.prototype, 'loadHistoryForSession').mockRejectedValue(failure);
+		const close = vi.spyOn(MemoryPersistence.prototype, 'close');
+		const config = new ServerConfig({
+			persistence: { enabled: true, backend: 'memory' },
+			features: { toolInterleave: false },
+		});
+
+		// When
+		const creation = createServer({ config, autoDiscover: false });
+
+		// Then
+		await expect(creation).rejects.toBe(failure);
+		expect(close).toHaveBeenCalledOnce();
+	});
 	it.each([
 		['bogus strategy', 'TRACELATTICE_FEATURES_REASONING_STRATEGY', 'bogus'],
 		['trailing numeric garbage', 'TRACELATTICE_TOOL_INTERLEAVE_TTL_MS', '1234garbage'],
@@ -117,9 +192,7 @@ describe('configuration startup resource safety', () => {
 	it('preserves construction and backend-close failures together', async () => {
 		const constructionFailure = new Error('injected container construction failure');
 		const closeFailure = new Error('injected backend close failure');
-		const closeSpy = vi
-			.spyOn(MemoryPersistence.prototype, 'close')
-			.mockRejectedValue(closeFailure);
+		const closeSpy = vi.spyOn(MemoryPersistence.prototype, 'close').mockRejectedValue(closeFailure);
 		vi.spyOn(Container.prototype, 'registerInstance').mockImplementationOnce(() => {
 			throw constructionFailure;
 		});
@@ -178,10 +251,7 @@ describe('watcher cleanup ownership', () => {
 			autoDiscover: false,
 			loadFromPersistence: false,
 		});
-		const suspensionStop = vi.spyOn(
-			server.getContainer().resolve('suspensionStore'),
-			'stop'
-		);
+		const suspensionStop = vi.spyOn(server.getContainer().resolve('suspensionStore'), 'stop');
 		const historyShutdown = vi.spyOn(server.history, 'shutdown');
 		const persistence = server.getContainer().resolve('Persistence');
 		if (persistence === null) throw new TypeError('Expected configured memory persistence');
@@ -258,10 +328,7 @@ describe('watcher cleanup ownership', () => {
 			autoDiscover: false,
 			loadFromPersistence: false,
 		});
-		const suspensionStop = vi.spyOn(
-			server.getContainer().resolve('suspensionStore'),
-			'stop'
-		);
+		const suspensionStop = vi.spyOn(server.getContainer().resolve('suspensionStore'), 'stop');
 		const historyShutdown = vi.spyOn(server.history, 'shutdown');
 		const persistence = server.getContainer().resolve('Persistence');
 		if (persistence === null) throw new TypeError('Expected configured memory persistence');

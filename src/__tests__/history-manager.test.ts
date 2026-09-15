@@ -8,7 +8,11 @@ import { createTestThought } from './helpers/factories.js';
 import { useFakeTimers, useRealTimers } from './helpers/timers.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import type { ThoughtData } from '../core/thought.js';
-import { AsyncResetRequiredError, PersistenceDrainError } from '../errors.js';
+import {
+	AsyncResetRequiredError,
+	PersistenceDrainError,
+	PersistenceUnavailableError,
+} from '../errors.js';
 
 import { asBranchId, type BranchId } from '../contracts/ids.js';
 import type { SessionId } from '../contracts/ids.js';
@@ -50,6 +54,7 @@ class MockPersistence implements SessionScopedPersistenceBackend {
 	}
 
 	async loadHistoryForSession(sessionId: SessionId): Promise<ThoughtData[]> {
+		if (sessionId === asSessionId('__global__')) return [...this._history];
 		return [...(this._sessionHistory.get(sessionId) ?? [])];
 	}
 
@@ -83,6 +88,10 @@ class MockPersistence implements SessionScopedPersistenceBackend {
 		sessionId: SessionId,
 		branchId: BranchId
 	): Promise<ThoughtData[] | undefined> {
+		if (sessionId === asSessionId('__global__')) {
+			const branch = this._branches[branchId];
+			return branch === undefined ? undefined : [...branch];
+		}
 		const branch = this._sessionBranches.get(sessionId)?.get(branchId);
 		return branch === undefined ? undefined : [...branch];
 	}
@@ -92,14 +101,20 @@ class MockPersistence implements SessionScopedPersistenceBackend {
 	}
 
 	async listBranchesForSession(sessionId: SessionId): Promise<BranchId[]> {
+		if (sessionId === asSessionId('__global__')) return Object.keys(this._branches) as BranchId[];
 		const branches = this._sessionBranches.get(sessionId);
 		return branches === undefined ? [] : Array.from(branches.keys());
 	}
 
 	async listSessions(): Promise<SessionId[]> {
-		return Array.from(
-			new Set<SessionId>([...this._sessionHistory.keys(), ...this._sessionBranches.keys()])
-		);
+		const sessions = new Set<SessionId>([
+			...this._sessionHistory.keys(),
+			...this._sessionBranches.keys(),
+		]);
+		if (this._history.length > 0 || Object.keys(this._branches).length > 0) {
+			sessions.add(asSessionId('__global__'));
+		}
+		return Array.from(sessions);
 	}
 
 	async clear(): Promise<void> {
@@ -533,13 +548,15 @@ describe('HistoryManager', () => {
 			expect(manager.getBranchIds()).toContain('branch-1');
 		});
 
-		it('should skip load when persistence backend is unhealthy', async () => {
+		it('T10-L03 should reject load when persistence backend is unhealthy', async () => {
 			const persistence = new MockPersistence();
 			persistence.healthyResult = false;
 			await persistence.saveThought(createTestThought({ thought_number: 1 }));
 
 			const manager = new HistoryManager({ persistence });
-			await manager.loadFromPersistence();
+			await expect(manager.loadFromPersistence()).rejects.toBeInstanceOf(
+				PersistenceUnavailableError
+			);
 			expect(manager.getHistoryLength()).toBe(0);
 		});
 
@@ -562,12 +579,14 @@ describe('HistoryManager', () => {
 			expect(manager.getHistory()[0]!.thought_number).toBe(6);
 		});
 
-		it('should handle load errors gracefully', async () => {
+		it('T10-L04 should propagate unhealthy persistence without mutation', async () => {
 			const persistence = new MockPersistence();
 			persistence.healthyResult = false;
 
 			const manager = new HistoryManager({ persistence });
-			await manager.loadFromPersistence();
+			await expect(manager.loadFromPersistence()).rejects.toBeInstanceOf(
+				PersistenceUnavailableError
+			);
 			expect(manager.getHistoryLength()).toBe(0);
 		});
 	});
@@ -1170,11 +1189,12 @@ describe('HistoryManager — uncovered branches', () => {
 		});
 	});
 
-	describe('loadFromPersistence error catch (line 677)', () => {
-		it('should catch and log when persistence throws during load', async () => {
+	describe('loadFromPersistence failure propagation', () => {
+		it('T10-I05 should propagate Error failures during scoped load', async () => {
 			const persistence = new MockPersistence();
 			// healthy returns true, but loadHistory throws
-			persistence.loadHistory = async () => {
+			persistence.listSessions = async () => [asSessionId('__global__')];
+			persistence.loadHistoryForSession = async () => {
 				throw new Error('Disk I/O error');
 			};
 			const mockLogger = {
@@ -1187,18 +1207,15 @@ describe('HistoryManager — uncovered branches', () => {
 			} as Logger;
 			const manager = new HistoryManager({ persistence, logger: mockLogger });
 
-			await manager.loadFromPersistence();
-
-			expect(mockLogger.info).toHaveBeenCalledWith(
-				'Failed to load from persistence',
-				expect.objectContaining({ error: 'Disk I/O error' })
-			);
+			await expect(manager.loadFromPersistence()).rejects.toThrow('Disk I/O error');
+			expect(mockLogger.info).not.toHaveBeenCalled();
 			expect(manager.getHistoryLength()).toBe(0);
 		});
 
-		it('should catch non-Error throws during load', async () => {
+		it('T10-I06 should propagate non-Error failures during scoped load', async () => {
 			const persistence = new MockPersistence();
-			persistence.loadHistory = async () => {
+			persistence.listSessions = async () => [asSessionId('__global__')];
+			persistence.loadHistoryForSession = async () => {
 				throw 'string error';
 			};
 			const mockLogger = {
@@ -1211,12 +1228,8 @@ describe('HistoryManager — uncovered branches', () => {
 			} as Logger;
 			const manager = new HistoryManager({ persistence, logger: mockLogger });
 
-			await manager.loadFromPersistence();
-
-			expect(mockLogger.info).toHaveBeenCalledWith(
-				'Failed to load from persistence',
-				expect.objectContaining({ error: 'string error' })
-			);
+			await expect(manager.loadFromPersistence()).rejects.toBe('string error');
+			expect(mockLogger.info).not.toHaveBeenCalled();
 		});
 	});
 

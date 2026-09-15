@@ -15,12 +15,7 @@
 import type { IEdgeStore, IMetrics, ISessionLock } from '../contracts/interfaces.js';
 import { asSessionId, GLOBAL_SESSION_ID, type BranchId, type SessionId } from '../contracts/ids.js';
 import type { ISummaryStore } from '../contracts/summary.js';
-import {
-	AsyncResetRequiredError,
-	ValidationError,
-	SessionAccessDeniedError,
-	getErrorMessage,
-} from '../errors.js';
+import { AsyncResetRequiredError, ValidationError, SessionAccessDeniedError } from '../errors.js';
 import { NullLogger } from '../logger/NullLogger.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import type { PersistenceBackend } from '../contracts/PersistenceBackend.js';
@@ -35,6 +30,7 @@ import type { HistorySessionSnapshot, IHistoryManager } from './IHistoryManager.
 import { PersistenceBuffer, type PersistenceEventEmitter } from './PersistenceBuffer.js';
 import { SessionManager } from './SessionManager.js';
 import { SessionResetCoordinator } from './SessionResetCoordinator.js';
+import { stagePersistenceRestore, type RestoredSession } from './PersistenceRestore.js';
 import type { ThoughtData } from './thought.js';
 import { getOwner } from '../context/RequestContext.js';
 
@@ -51,6 +47,8 @@ interface SessionState {
 	registeredBranches: Set<BranchId>;
 	/** Owner identifier set on first owner-aware access. Immutable thereafter. */
 	owner?: string;
+	/** Non-persisted startup provenance used to block unverified network ownership. */
+	provenance?: 'restored';
 }
 
 export interface HistoryManagerConfig {
@@ -251,6 +249,9 @@ export class HistoryManager implements IHistoryManager {
 			this._sessions.set(key, session);
 			this._sessionManager.evictExcessSessions(this._sessions);
 		} else if (owner !== undefined) {
+			if (session.provenance === 'restored') {
+				throw new SessionAccessDeniedError(key, 'unavailable', owner);
+			}
 			if (session.owner !== undefined && session.owner !== owner) {
 				throw new SessionAccessDeniedError(key, session.owner, owner);
 			}
@@ -265,7 +266,7 @@ export class HistoryManager implements IHistoryManager {
 		return session;
 	}
 
-	private _createSessionState(owner?: string): SessionState {
+	private _createSessionState(owner?: string, provenance?: 'restored'): SessionState {
 		return {
 			thought_history: [],
 			branches: {},
@@ -275,6 +276,7 @@ export class HistoryManager implements IHistoryManager {
 			lastAccessedAt: Date.now(),
 			registeredBranches: new Set<BranchId>(),
 			owner,
+			provenance,
 		};
 	}
 
@@ -283,6 +285,9 @@ export class HistoryManager implements IHistoryManager {
 		owner: string | undefined
 	): string | undefined {
 		const sessionOwner = this._sessions.get(sessionId)?.owner;
+		if (owner !== undefined && this._sessions.get(sessionId)?.provenance === 'restored') {
+			throw new SessionAccessDeniedError(sessionId, 'unavailable', owner);
+		}
 		if (owner !== undefined && sessionOwner !== undefined && sessionOwner !== owner) {
 			throw new SessionAccessDeniedError(sessionId, sessionOwner, owner);
 		}
@@ -573,70 +578,46 @@ export class HistoryManager implements IHistoryManager {
 		return this._sessions.size;
 	}
 
-	/** Loads history from persistence into the global session. Call at init. */
+	private _restoredState(restored: RestoredSession): SessionState {
+		const session = this._createSessionState(undefined, 'restored');
+		for (let index = restored.history.length - 1; index >= 0; index--) {
+			const thought = restored.history[index];
+			if (thought === undefined) continue;
+			if (session.availableMcpTools === undefined && thought.available_mcp_tools !== undefined) {
+				session.availableMcpTools = [...thought.available_mcp_tools];
+			}
+			if (session.availableSkills === undefined && thought.available_skills !== undefined) {
+				session.availableSkills = [...thought.available_skills];
+			}
+			if (session.availableMcpTools !== undefined && session.availableSkills !== undefined) break;
+		}
+		session.thought_history = restored.history.slice(-this._maxHistorySize);
+		for (const branch of restored.branches.slice(-this._maxBranches)) {
+			session.branches[branch.branchId] = branch.thoughts.slice(-this._maxBranchSize);
+		}
+		return session;
+	}
+
+	/** Loads and atomically commits every authoritative persistence namespace. Call at init. */
 	public async loadFromPersistence(): Promise<void> {
 		if (!this._persistenceEnabled || !this._persistence) {
 			return;
 		}
 
-		try {
-			const isHealthy = await this._persistence.healthy();
-			if (!isHealthy) {
-				this.log('Persistence backend not healthy, skipping load');
-				return;
-			}
+		const restored = await stagePersistenceRestore(this._persistence);
+		const sessions = restored.sessions.map(
+			(session) => [session.sessionId, this._restoredState(session)] as const
+		);
 
-			const globalSession = this._getSession();
-
-			const history = await this._persistence.loadHistory();
-			if (history.length > 0) {
-				globalSession.thought_history = history.slice(-this._maxHistorySize);
-				this.log(`Loaded ${globalSession.thought_history.length} thoughts from persistence`);
-			}
-
-			const branchIds = await this._persistence.listBranches();
-			for (const branchId of branchIds) {
-				const branchData = await this._persistence.loadBranch(branchId);
-				if (branchData) {
-					globalSession.branches[branchId] = branchData.slice(-this._maxBranchSize);
-				}
-			}
-			this.log(`Loaded ${Object.keys(globalSession.branches).length} branches from persistence`);
-
-			// Load edges if EdgeStore is configured — restore for ALL persisted sessions
-			if (this._edgeStore) {
-				try {
-					const edgeSessions = await this._persistence.listEdgeSessions();
-					let totalEdges = 0;
-					for (const sessionId of edgeSessions) {
-						const edges = await this._persistence.loadEdges(sessionId);
-						for (const edge of edges) {
-							try {
-								this._edgeStore.addEdge(edge);
-								totalEdges++;
-							} catch (edgeErr) {
-								this.log('Failed to restore edge', {
-									edgeId: edge.id,
-									sessionId,
-									error: getErrorMessage(edgeErr),
-								});
-							}
-						}
-					}
-					this.log(
-						`Loaded ${totalEdges} edges across ${edgeSessions.length} sessions from persistence`
-					);
-				} catch (edgeError) {
-					this.log('Failed to load edges from persistence', {
-						error: getErrorMessage(edgeError),
-					});
-				}
-			}
-		} catch (error) {
-			this.log('Failed to load from persistence', {
-				error: getErrorMessage(error),
-			});
+		this._edgeStore?.clearAll();
+		this._summaryStore?.clearAll();
+		this._sessions.clear();
+		for (const [sessionId, session] of sessions) this._sessions.set(sessionId, session);
+		for (const session of restored.sessions) {
+			for (const edge of session.edges) this._edgeStore?.addEdge(edge);
+			for (const summary of session.summaries) this._summaryStore?.add(summary);
 		}
+		this.log(`Restored ${restored.sessions.length} persistence namespaces`);
 	}
 
 	public isPersistenceEnabled(): boolean {
