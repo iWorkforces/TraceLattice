@@ -106,6 +106,35 @@ export interface ISuspensionStore {
 	resume(token: string): SuspensionRecord | null;
 
 	/**
+	 * Atomically validate and admit one suspended continuation.
+	 *
+	 * Operations sharing a token are serialized. The record must exist, remain
+	 * unexpired, and belong to `expectedSessionId`. Session mismatches are
+	 * reported as not found without consuming the record. `admit` runs
+	 * synchronously inside the token critical section; the record is consumed
+	 * only after the callback returns successfully.
+	 *
+	 * @param token - Opaque continuation token returned from {@link suspend}.
+	 * @param expectedSessionId - Canonical session presenting the continuation.
+	 * @param admit - Synchronous history-admission callback.
+	 * @returns The admitted and consumed suspension record.
+	 * @throws {SuspensionNotFoundError} If the token is missing or belongs to another session.
+	 * @throws {SuspensionExpiredError} If the token expires at or before admission.
+	 *
+	 * @example
+	 * ```typescript
+	 * const record = await store.compareAndAdmit(token, sessionId, (candidate) => {
+	 *   history.addThought({ ...observation, _resumedFrom: candidate.toolCallThoughtNumber });
+	 * });
+	 * ```
+	 */
+	compareAndAdmit(
+		token: SuspensionToken,
+		expectedSessionId: SessionId,
+		admit: (record: SuspensionRecord) => void
+	): Promise<SuspensionRecord>;
+
+	/**
 	 * Non-destructive lookup of a suspension by token.
 	 *
 	 * Does not remove expired records. Returns `null` if the token is
