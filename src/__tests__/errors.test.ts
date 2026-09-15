@@ -15,6 +15,8 @@ import {
 	SessionNotFoundError,
 	MaxSessionsReachedError,
 	PoolTerminatedError,
+	PersistenceCompatibilityError,
+	PersistenceUnavailableError,
 	ValidationError,
 } from '../errors.js';
 import { asSessionId } from '../contracts/ids.js';
@@ -195,5 +197,22 @@ describe('PoolTerminatedError', () => {
 		expect(error.message).toBe('ConnectionPool has been terminated');
 		expect(error.code).toBe('POOL_TERMINATED');
 		expect(error.name).toBe('PoolTerminatedError');
+	});
+});
+
+describe('Persistence startup errors', () => {
+	it('uses distinct stable codes when unavailable and incompatible failures differ', () => {
+		// Given
+		const sourcePath = '/data/snapshot.json';
+		const detail = 'unsupported schema';
+
+		// When
+		const unavailable = new PersistenceUnavailableError();
+		const compatibility = new PersistenceCompatibilityError(sourcePath, detail);
+
+		// Then
+		expect(unavailable.code).toBe('PERSISTENCE_UNAVAILABLE');
+		expect(compatibility.code).toBe('PERSISTENCE_COMPATIBILITY');
+		expect(unavailable.code).not.toBe(compatibility.code);
 	});
 });

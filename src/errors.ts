@@ -69,6 +69,7 @@ export const ERROR_CODES = {
 	ASYNC_RESET_REQUIRED: 'ASYNC_RESET_REQUIRED',
 	PERSISTENCE_CAPABILITY_UNSUPPORTED: 'PERSISTENCE_CAPABILITY_UNSUPPORTED',
 	PERSISTENCE_SCOPE_MISMATCH: 'PERSISTENCE_SCOPE_MISMATCH',
+	PERSISTENCE_UNAVAILABLE: 'PERSISTENCE_UNAVAILABLE',
 	PERSISTENCE_COMPATIBILITY: 'PERSISTENCE_COMPATIBILITY',
 	PERSISTENCE_IMPORT_REQUIRED: 'PERSISTENCE_IMPORT_REQUIRED',
 	PERSISTENCE_LEGACY_AMBIGUITY: 'PERSISTENCE_LEGACY_AMBIGUITY',
@@ -841,6 +842,17 @@ export class PersistenceCorruptionError extends SequentialThinkingError {
 		this.name = 'PersistenceCorruptionError';
 		this.path = path;
 		this.cause = cause;
+	}
+}
+
+/** Error raised when startup cannot read from an unhealthy persistence backend. */
+export class PersistenceUnavailableError extends SequentialThinkingError {
+	constructor() {
+		super(
+			'Persistence backend is unavailable during startup restore',
+			ERROR_CODES.PERSISTENCE_UNAVAILABLE
+		);
+		this.name = 'PersistenceUnavailableError';
 	}
 }
 
