@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { ConnectionPool, createConnectionPool } from '../pool/ConnectionPool.js';
+import { readFile } from 'node:fs/promises';
+import ts from 'typescript';
+import { ConnectionPool, Session, createConnectionPool } from '../pool/ConnectionPool.js';
 import type { ThoughtData } from '../core/thought.js';
 import { asSessionId } from '../contracts/ids.js';
+import { NullLogger } from '../logger/NullLogger.js';
+import { SessionNotActiveError, SessionNotFoundError } from '../errors.js';
+import type { SessionRunResult } from '../pool/IConnectionPool.js';
 
 const createMockServer = () => ({
 	processThought: vi.fn().mockResolvedValue({
@@ -11,6 +16,17 @@ const createMockServer = () => ({
 });
 
 const createMockServerFactory = () => vi.fn().mockImplementation(async () => createMockServer());
+
+function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+	let resolvePromise: (() => void) | undefined;
+	const promise = new Promise<void>((resolve) => {
+		resolvePromise = resolve;
+	});
+	return {
+		promise,
+		resolve: () => resolvePromise?.(),
+	};
+}
 
 describe('ConnectionPool', () => {
 	let pool: ConnectionPool;
@@ -152,7 +168,7 @@ describe('ConnectionPool', () => {
 			expect(result.content).toEqual([{ type: 'text', text: 'Test response' }]);
 		});
 
-		it('should throw error for non-existent session', async () => {
+		it('throws the typed missing-session error for direct processing', async () => {
 			const thought: ThoughtData = {
 				thought: 'test',
 				thought_number: 1,
@@ -160,9 +176,95 @@ describe('ConnectionPool', () => {
 				next_thought_needed: false,
 			};
 
-			await expect(async () => await pool.process(asSessionId('non-existent'), thought)).rejects.toThrow(
-				'Session not found'
+			await expect(pool.process(asSessionId('non-existent'), thought)).rejects.toBeInstanceOf(
+				SessionNotFoundError
 			);
+		});
+
+		it('keeps accepted work alive while close rejects later admission', async () => {
+			const processing = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			const stop = vi.fn();
+			const admittingPool = new ConnectionPool({
+				autoCleanup: false,
+				serverFactory: async () => ({
+					processThought: async () => {
+						started.resolve();
+						await processing.promise;
+						return { content: [{ type: 'text', text: 'accepted' }] };
+					},
+					stop,
+				}),
+			});
+			const sessionId = await admittingPool.createSession();
+			const accepted = admittingPool.runWithSession(sessionId, (session) =>
+				session.processThought({
+					thought: 'accepted before close',
+					thought_number: 1,
+					total_thoughts: 1,
+					next_thought_needed: false,
+				})
+			);
+			await started.promise;
+			const close = admittingPool.closeSession(sessionId);
+			const rejectedCallback = vi.fn(async () => 'unexpected');
+
+			await expect(admittingPool.runWithSession(sessionId, rejectedCallback)).resolves.toEqual({
+				status: 'inactive',
+			});
+			expect(rejectedCallback).not.toHaveBeenCalled();
+			expect(stop).not.toHaveBeenCalled();
+
+			processing.resolve();
+			await expect(accepted).resolves.toEqual({
+				status: 'completed',
+				value: { content: [{ type: 'text', text: 'accepted' }] },
+			});
+			await close;
+			expect(stop).toHaveBeenCalledTimes(1);
+			await expect(admittingPool.runWithSession(sessionId, rejectedCallback)).resolves.toEqual({
+				status: 'missing',
+			});
+			await admittingPool.terminate();
+		});
+
+		it('throws the typed inactive-session error while direct processing is closing', async () => {
+			const operationGate = deferred();
+			const started = deferred();
+			const typedPool = new ConnectionPool({
+				autoCleanup: false,
+				serverFactory: async () => ({
+					processThought: async () => {
+						started.resolve();
+						await operationGate.promise;
+						return { content: [] };
+					},
+					stop: (): void => undefined,
+				}),
+			});
+			const sessionId = await typedPool.createSession();
+			const processing = typedPool.process(sessionId, {
+				thought: 'pending',
+				thought_number: 1,
+				total_thoughts: 1,
+				next_thought_needed: false,
+			});
+			await started.promise;
+			const close = typedPool.closeSession(sessionId);
+
+			await expect(
+				typedPool.process(sessionId, {
+					thought: 'late',
+					thought_number: 1,
+					total_thoughts: 1,
+					next_thought_needed: false,
+				})
+			).rejects.toBeInstanceOf(SessionNotActiveError);
+
+			operationGate.resolve();
+			await processing;
+			await close;
+			await typedPool.terminate();
 		});
 	});
 
@@ -178,9 +280,9 @@ describe('ConnectionPool', () => {
 		});
 
 		it('should throw error for non-existent session', async () => {
-			await expect(async () => await pool.closeSession(asSessionId('non-existent'))).rejects.toThrow(
-				'Session not found'
-			);
+			await expect(
+				async () => await pool.closeSession(asSessionId('non-existent'))
+			).rejects.toThrow('Session not found');
 		});
 
 		it('should allow reusing session slot after closing', async () => {
@@ -199,6 +301,34 @@ describe('ConnectionPool', () => {
 			expect(smallPool.getStats().totalSessions).toBe(1);
 
 			await smallPool.terminate();
+		});
+
+		it('removes routing before awaiting one shared child stop', async () => {
+			const stopGate = deferred();
+			const stop = vi.fn(() => stopGate.promise);
+			const closingPool = new ConnectionPool({
+				autoCleanup: false,
+				serverFactory: async () => ({
+					processThought: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
+					stop,
+				}),
+			});
+			const sessionId = await closingPool.createSession();
+
+			const firstClose = closingPool.closeSession(sessionId);
+			const concurrentClose = closingPool.closeSession(sessionId);
+
+			expect(concurrentClose).toBe(firstClose);
+			expect(closingPool.getSessionInfo(sessionId)).toBeUndefined();
+			expect(closingPool.getStats().totalSessions).toBe(0);
+			expect(stop).toHaveBeenCalledTimes(1);
+			expect(
+				await Promise.race([firstClose.then(() => 'closed'), Promise.resolve('pending')])
+			).toBe('pending');
+
+			stopGate.resolve();
+			await firstClose;
+			await closingPool.terminate();
 		});
 	});
 
@@ -338,6 +468,80 @@ describe('ConnectionPool', () => {
 				'ConnectionPool has been terminated'
 			);
 		});
+
+		it('joins concurrent termination and aggregates every child stop failure', async () => {
+			const firstGate = deferred();
+			const secondGate = deferred();
+			const firstFailure = new Error('first child stop failed');
+			const secondFailure = new Error('second child stop failed');
+			const stops = [
+				vi.fn(() => firstGate.promise.then(() => Promise.reject(firstFailure))),
+				vi.fn(() => secondGate.promise.then(() => Promise.reject(secondFailure))),
+			];
+			let childIndex = 0;
+			const terminatingPool = new ConnectionPool({
+				autoCleanup: false,
+				serverFactory: async () => {
+					const stop = stops[childIndex++];
+					if (!stop) {
+						throw new RangeError('Missing child stop fixture');
+					}
+					return {
+						processThought: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
+						stop,
+					};
+				},
+			});
+			await terminatingPool.createSession();
+			await terminatingPool.createSession();
+
+			const firstTerminate = terminatingPool.terminate();
+			const concurrentTerminate = terminatingPool.terminate();
+
+			expect(concurrentTerminate).toBe(firstTerminate);
+			expect(terminatingPool.getStats().totalSessions).toBe(0);
+			expect(stops[0]).toHaveBeenCalledTimes(1);
+			expect(stops[1]).toHaveBeenCalledTimes(1);
+			expect(
+				await Promise.race([firstTerminate.then(() => 'closed'), Promise.resolve('pending')])
+			).toBe('pending');
+
+			firstGate.resolve();
+			secondGate.resolve();
+			const outcome = await Promise.allSettled([firstTerminate, concurrentTerminate]);
+			expect(outcome[0]).toMatchObject({
+				status: 'rejected',
+				reason: { errors: [firstFailure, secondFailure] },
+			});
+			expect(outcome[1]).toEqual(outcome[0]);
+		});
+
+		it('reports a pending-created child stop failure through shared termination', async () => {
+			const factory = Promise.withResolvers<ReturnType<typeof createMockServer>>();
+			const stopFailure = new Error('pending child stop failed');
+			const stop = vi.fn(() => Promise.reject(stopFailure));
+			const terminatingPool = new ConnectionPool({
+				autoCleanup: false,
+				serverFactory: () => factory.promise,
+			});
+			const create = terminatingPool.createSession();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+
+			const terminate = terminatingPool.terminate();
+			factory.resolve({
+				processThought: vi.fn().mockResolvedValue({ content: [] }),
+				stop,
+			});
+			const [createOutcome, terminateOutcome] = await Promise.allSettled([create, terminate]);
+
+			expect(createOutcome).toMatchObject({ status: 'rejected', reason: stopFailure });
+			expect(terminateOutcome).toMatchObject({
+				status: 'rejected',
+				reason: { errors: [stopFailure] },
+			});
+			expect(stop).toHaveBeenCalledTimes(1);
+			expect(terminatingPool.getStats().totalSessions).toBe(0);
+		});
 	});
 
 	describe('createConnectionPool factory', () => {
@@ -369,6 +573,244 @@ describe('ConnectionPool', () => {
 
 			customPool.terminate();
 		});
+	});
+});
+
+describe('ConnectionPool callback-scoped admission', () => {
+	it('exports only the required callback-owned admission contract', async () => {
+		const contractText = await readFile(
+			new URL('../pool/IConnectionPool.ts', import.meta.url),
+			'utf8'
+		);
+		const source = ts.createSourceFile(
+			'IConnectionPool.ts',
+			contractText,
+			ts.ScriptTarget.Latest,
+			true,
+			ts.ScriptKind.TS
+		);
+		const declarationNames = source.statements.flatMap((statement) => {
+			if (
+				ts.isTypeAliasDeclaration(statement) ||
+				ts.isInterfaceDeclaration(statement) ||
+				ts.isClassDeclaration(statement)
+			) {
+				return statement.name ? [statement.name.text] : [];
+			}
+			return [];
+		});
+		const poolContract = source.statements.find(
+			(statement): statement is ts.InterfaceDeclaration =>
+				ts.isInterfaceDeclaration(statement) && statement.name.text === 'IConnectionPool'
+		);
+		const runMethod = poolContract?.members.find(
+			(member): member is ts.MethodSignature =>
+				ts.isMethodSignature(member) && member.name.getText(source) === 'runWithSession'
+		);
+
+		expect(declarationNames).not.toContain('SessionLease');
+		expect(declarationNames).not.toContain('SessionAdmission');
+		expect(declarationNames).toContain('SessionRunResult');
+		expect(runMethod?.questionToken).toBeUndefined();
+		expect(runMethod?.type?.getText(source)).toBe('Promise<SessionRunResult<T>>');
+		expect(Object.getOwnPropertyNames(ConnectionPool.prototype)).not.toContain('admitSession');
+		expect(typeof ConnectionPool.prototype.runWithSession).toBe('function');
+	});
+
+	it('starts an ignored operation synchronously and releases shutdown after it settles', async () => {
+		const operationGate = deferred();
+		const started = vi.fn();
+		const stop = vi.fn();
+		const pool = new ConnectionPool({
+			autoCleanup: false,
+			serverFactory: async () => ({
+				processThought: async () => ({ content: [] }),
+				stop,
+			}),
+		});
+		const sessionId = await pool.createSession();
+
+		void pool.runWithSession(sessionId, async () => {
+			started();
+			await operationGate.promise;
+			return 'settled';
+		});
+		expect(started).toHaveBeenCalledTimes(1);
+		const close = pool.closeSession(sessionId);
+		expect(stop).not.toHaveBeenCalled();
+
+		operationGate.resolve();
+		await close;
+		expect(stop).toHaveBeenCalledTimes(1);
+		await pool.terminate();
+	});
+
+	it('holds termination only until the pending callback settles and stops once', async () => {
+		const operationGate = deferred();
+		const operationStarted = deferred();
+		const stop = vi.fn();
+		const pool = new ConnectionPool({
+			autoCleanup: false,
+			serverFactory: async () => ({ processThought: async () => ({ content: [] }), stop }),
+		});
+		const sessionId = await pool.createSession();
+		void pool.runWithSession(sessionId, async () => {
+			operationStarted.resolve();
+			await operationGate.promise;
+			return 'settled';
+		});
+		await operationStarted.promise;
+
+		const firstTerminate = pool.terminate();
+		const duplicateTerminate = pool.terminate();
+		expect(duplicateTerminate).toBe(firstTerminate);
+		expect(stop).not.toHaveBeenCalled();
+
+		operationGate.resolve();
+		await firstTerminate;
+		expect(stop).toHaveBeenCalledTimes(1);
+	});
+
+	it('propagates the callback error by identity and still permits shutdown', async () => {
+		const sentinel = new Error('callback sentinel');
+		const stop = vi.fn();
+		const pool = new ConnectionPool({
+			autoCleanup: false,
+			serverFactory: async () => ({ processThought: async () => ({ content: [] }), stop }),
+		});
+		const sessionId = await pool.createSession();
+
+		await expect(
+			pool.runWithSession(sessionId, async () => {
+				throw sentinel;
+			})
+		).rejects.toBe(sentinel);
+		await expect(pool.terminate()).resolves.toBeUndefined();
+		expect(stop).toHaveBeenCalledTimes(1);
+	});
+
+	it('reuses the exact captured child for same-ID nesting without extending the drain', async () => {
+		const operationGate = deferred();
+		const nestedFinished = deferred();
+		const stop = vi.fn();
+		const child = {
+			processThought: vi.fn(async () => ({ content: [{ type: 'text' as const, text: 'nested' }] })),
+			stop,
+		};
+		const pool = new ConnectionPool({ autoCleanup: false, serverFactory: async () => child });
+		const sessionId = await pool.createSession();
+
+		const outer = pool.runWithSession(sessionId, async (outerChild) => {
+			const nested = await pool.runWithSession(sessionId, async (nestedChild) => {
+				expect(nestedChild).toBe(outerChild);
+				return pool.process(sessionId, {
+					thought: 'nested',
+					thought_number: 1,
+					total_thoughts: 1,
+					next_thought_needed: false,
+				});
+			});
+			expect(nested).toEqual({
+				status: 'completed',
+				value: { content: [{ type: 'text', text: 'nested' }] },
+			});
+			nestedFinished.resolve();
+			await operationGate.promise;
+			return 'outer';
+		});
+		await nestedFinished.promise;
+		const close = pool.closeSession(sessionId);
+		expect(stop).not.toHaveBeenCalled();
+
+		operationGate.resolve();
+		await expect(outer).resolves.toEqual({ status: 'completed', value: 'outer' });
+		await close;
+		expect(stop).toHaveBeenCalledTimes(1);
+		await pool.terminate();
+	});
+
+	it('admits a different-ID nested operation against its own child', async () => {
+		const children = [
+			{ processThought: async () => ({ content: [] }), stop: vi.fn() },
+			{ processThought: async () => ({ content: [] }), stop: vi.fn() },
+		];
+		const pool = new ConnectionPool({
+			autoCleanup: false,
+			serverFactory: async () => {
+				const child = children.shift();
+				if (!child) throw new RangeError('Missing child fixture');
+				return child;
+			},
+		});
+		const firstId = await pool.createSession();
+		const secondId = await pool.createSession();
+
+		const result = await pool.runWithSession(firstId, async (firstChild) =>
+			pool.runWithSession(secondId, async (secondChild) => {
+				expect(secondChild).not.toBe(firstChild);
+				return 'second';
+			})
+		);
+
+		expect(result).toEqual({
+			status: 'completed',
+			value: { status: 'completed', value: 'second' },
+		});
+		await pool.terminate();
+	});
+
+	it('rejects a stale ALS descendant after its captured child has closed', async () => {
+		const trigger = deferred();
+		const descendant = Promise.withResolvers<SessionRunResult<string>>();
+		const callback = vi.fn(async () => 'unexpected');
+		const pool = new ConnectionPool({
+			autoCleanup: false,
+			serverFactory: async () => ({ processThought: async () => ({ content: [] }), stop: vi.fn() }),
+		});
+		const sessionId = await pool.createSession();
+
+		await pool.runWithSession(sessionId, async () => {
+			void trigger.promise.then(async () => {
+				descendant.resolve(await pool.runWithSession(sessionId, callback));
+			});
+			return 'outer';
+		});
+		await pool.closeSession(sessionId);
+		trigger.resolve();
+
+		await expect(descendant.promise).resolves.toEqual({ status: 'missing' });
+		expect(callback).not.toHaveBeenCalled();
+		await pool.terminate();
+	});
+});
+
+describe('Session close lifecycle', () => {
+	it('returns one promise and awaits the child stop exactly once', async () => {
+		const stopGate = deferred();
+		const stop = vi.fn(() => stopGate.promise);
+		const session = new Session(
+			asSessionId('session-controlled'),
+			{
+				processThought: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
+				stop,
+			},
+			60_000,
+			new NullLogger()
+		);
+
+		const firstClose = session.close();
+		const concurrentClose = session.close();
+
+		expect(concurrentClose).toBe(firstClose);
+		expect(session.isActive).toBe(false);
+		expect(stop).toHaveBeenCalledTimes(1);
+		expect(await Promise.race([firstClose.then(() => 'closed'), Promise.resolve('pending')])).toBe(
+			'pending'
+		);
+
+		stopGate.resolve();
+		await firstClose;
+		expect(stop).toHaveBeenCalledTimes(1);
 	});
 });
 
