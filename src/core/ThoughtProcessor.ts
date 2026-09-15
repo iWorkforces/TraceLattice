@@ -29,8 +29,6 @@ import {
 	InvalidBacktrackError,
 	InvalidToolCallError,
 	SequentialThinkingError,
-	SuspensionExpiredError,
-	SuspensionNotFoundError,
 	UnknownToolError,
 	ValidationError,
 } from '../errors.js';
@@ -463,10 +461,10 @@ export class ThoughtProcessor {
 		// Tool-interleave resume path: consume the suspension and continue the
 		// normal pipeline (addThought → format → evaluate → strategy).
 		if (validated.thought_type === 'tool_observation' && this._suspensionStore) {
-			this._handleToolObservation(validated);
+			await this._handleToolObservation(validated, sessionId);
+		} else {
+			this.historyManager.addThought(checkedInput);
 		}
-
-		this.historyManager.addThought(checkedInput);
 
 		const formattedThought = this.thoughtFormatter.formatThought(checkedInput);
 		this.log(formattedThought, { sessionId });
@@ -842,23 +840,19 @@ export class ThoughtProcessor {
 	}
 
 	/**
-	 * Resume from a tool_observation, consuming the suspension record.
-	 * Distinguishes missing vs expired via peek().
+	 * Resume from a tool_observation and atomically admit it before consuming the record.
 	 * @private
 	 */
-	private _handleToolObservation(input: ToolObservationThought): void {
+	private async _handleToolObservation(
+		input: ToolObservationThought,
+		sessionId: SessionId
+	): Promise<void> {
 		if (!this._suspensionStore) {
 			throw new ValidationError('thought_type', 'tool_observation requires suspensionStore');
 		}
-		const token = input.continuation_token;
-		const peeked = this._suspensionStore.peek(token);
-		if (peeked && peeked.expiresAt <= Date.now()) {
-			throw new SuspensionExpiredError('Suspension token expired: ' + token);
-		}
-		const record = this._suspensionStore.resume(token);
-		if (!record) {
-			throw new SuspensionNotFoundError('Suspension token not found: ' + token);
-		}
-		(input as ResumableThought)._resumedFrom = record.toolCallThoughtNumber;
+		await this._suspensionStore.compareAndAdmit(input.continuation_token, sessionId, (record) => {
+			(input as ResumableThought)._resumedFrom = record.toolCallThoughtNumber;
+			this.historyManager.addThought(input);
+		});
 	}
 }
