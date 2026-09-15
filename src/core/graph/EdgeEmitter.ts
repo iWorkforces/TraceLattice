@@ -12,8 +12,14 @@ import { getErrorMessage } from '../../errors.js';
 import type { Logger } from '../../logger/StructuredLogger.js';
 import { NullLogger } from '../../logger/NullLogger.js';
 import type { ThoughtData } from '../thought.js';
+import type { ResolvedThoughtReferences, ThoughtAdmissionContext } from '../IHistoryManager.js';
 import type { Edge, EdgeKind } from './Edge.js';
-import { generateEdgeId, type BranchId } from '../../contracts/ids.js';
+import {
+	generateEdgeId,
+	type BranchId,
+	type SessionId,
+	type ThoughtId,
+} from '../../contracts/ids.js';
 
 /** Minimal session view needed for edge emission. */
 export interface EdgeEmissionSession {
@@ -25,7 +31,7 @@ export interface EdgeEmissionSession {
 export interface EdgeEmitterConfig {
 	edgeStore?: IEdgeStore;
 	dagEdges?: boolean;
-	defaultSessionId: string;
+	defaultSessionId: SessionId;
 	logger?: Logger;
 }
 
@@ -36,7 +42,7 @@ export interface EdgeEmitterConfig {
 export class EdgeEmitter {
 	private readonly _edgeStore?: IEdgeStore;
 	private readonly _dagEdges: boolean;
-	private readonly _defaultSessionId: string;
+	private readonly _defaultSessionId: SessionId;
 	private readonly _logger: Logger;
 
 	constructor(config: EdgeEmitterConfig) {
@@ -61,22 +67,27 @@ export class EdgeEmitter {
 	 * - critiques: verification_target + thought_type=critique → current.id → target.id
 	 * - derives_from: synthesis_sources → source.id → current.id (per source)
 	 * - revises: revises_thought → current.id → target.id
-	 * - tool_invocation: tool_observation with _resumedFrom → tool_call.id → current.id
+	 * - tool_invocation: stable admission source id → current.id
 	 * - sequence: default chronological link from previous thought (if none of the above)
 	 */
-	public emitEdgesForThought(session: EdgeEmissionSession, thought: ThoughtData): void {
+	public emitEdgesForThought(
+		session: EdgeEmissionSession,
+		thought: ThoughtData,
+		context?: ThoughtAdmissionContext
+	): void {
 		if (!this._edgeStore || !this._dagEdges) return;
 		if (!thought.id) return;
 
 		const sessionId = thought.session_id ?? this._defaultSessionId;
+		const references = context?.resolvedReferences ?? {};
 		const emittedRelational = [
-			this._emitBranchEdge(session, thought, sessionId),
-			this._emitMergeEdges(session, thought, sessionId),
-			this._emitVerificationEdge(session, thought, sessionId),
-			this._emitCritiqueEdge(session, thought, sessionId),
-			this._emitSynthesisEdges(session, thought, sessionId),
-			this._emitRevisionEdge(session, thought, sessionId),
-			this._emitToolInvocationEdge(session, thought, sessionId),
+			this._emitBranchEdge(thought, references, sessionId),
+			this._emitMergeEdges(thought, references, sessionId),
+			this._emitVerificationEdge(thought, references, sessionId),
+			this._emitCritiqueEdge(thought, references, sessionId),
+			this._emitSynthesisEdges(thought, references, sessionId),
+			this._emitRevisionEdge(thought, references, sessionId),
+			this._emitToolInvocationEdge(thought, sessionId, context),
 		].some((emitted) => emitted);
 
 		if (!emittedRelational) {
@@ -85,93 +96,107 @@ export class EdgeEmitter {
 	}
 
 	private _emitBranchEdge(
-		session: EdgeEmissionSession,
 		thought: ThoughtData,
-		sessionId: string
+		references: ResolvedThoughtReferences,
+		sessionId: SessionId
 	): boolean {
 		if (thought.branch_from_thought === undefined || !thought.branch_id) return false;
 
-		const parentId = this.resolveThoughtId(session, thought.branch_from_thought);
-		return this._addEdgeIfValid(parentId, thought.id, 'branch', sessionId);
+		return this._addEdgeIfValid(references.branchFromThoughtId, thought.id, 'branch', sessionId);
 	}
 
 	private _emitMergeEdges(
-		session: EdgeEmissionSession,
 		thought: ThoughtData,
-		sessionId: string
+		references: ResolvedThoughtReferences,
+		sessionId: SessionId
 	): boolean {
 		let emitted = false;
-		for (const src of thought.merge_from_thoughts ?? []) {
-			const srcId = this.resolveThoughtId(session, src);
+		for (const srcId of references.mergeFromThoughtIds ?? []) {
 			emitted = this._addEdgeIfValid(srcId, thought.id, 'merge', sessionId) || emitted;
 		}
 		return emitted;
 	}
 
 	private _emitVerificationEdge(
-		session: EdgeEmissionSession,
 		thought: ThoughtData,
-		sessionId: string
+		references: ResolvedThoughtReferences,
+		sessionId: SessionId
 	): boolean {
-		if (thought.verification_target === undefined || thought.thought_type !== 'verification') return false;
+		if (thought.verification_target === undefined || thought.thought_type !== 'verification')
+			return false;
 
-		const targetId = this.resolveThoughtId(session, thought.verification_target);
-		return this._addEdgeIfValid(thought.id, targetId, 'verifies', sessionId);
+		return this._addEdgeIfValid(
+			thought.id,
+			references.verificationTargetThoughtId,
+			'verifies',
+			sessionId
+		);
 	}
 
 	private _emitCritiqueEdge(
-		session: EdgeEmissionSession,
 		thought: ThoughtData,
-		sessionId: string
+		references: ResolvedThoughtReferences,
+		sessionId: SessionId
 	): boolean {
-		if (thought.verification_target === undefined || thought.thought_type !== 'critique') return false;
+		if (thought.verification_target === undefined || thought.thought_type !== 'critique')
+			return false;
 
-		const targetId = this.resolveThoughtId(session, thought.verification_target);
-		return this._addEdgeIfValid(thought.id, targetId, 'critiques', sessionId);
+		return this._addEdgeIfValid(
+			thought.id,
+			references.verificationTargetThoughtId,
+			'critiques',
+			sessionId
+		);
 	}
 
 	private _emitSynthesisEdges(
-		session: EdgeEmissionSession,
 		thought: ThoughtData,
-		sessionId: string
+		references: ResolvedThoughtReferences,
+		sessionId: SessionId
 	): boolean {
 		let emitted = false;
-		for (const src of thought.synthesis_sources ?? []) {
-			const srcId = this.resolveThoughtId(session, src);
+		for (const srcId of references.synthesisSourceThoughtIds ?? []) {
 			emitted = this._addEdgeIfValid(srcId, thought.id, 'derives_from', sessionId) || emitted;
 		}
 		return emitted;
 	}
 
 	private _emitRevisionEdge(
-		session: EdgeEmissionSession,
 		thought: ThoughtData,
-		sessionId: string
+		references: ResolvedThoughtReferences,
+		sessionId: SessionId
 	): boolean {
 		if (thought.revises_thought === undefined) return false;
 
-		const targetId = this.resolveThoughtId(session, thought.revises_thought);
-		return this._addEdgeIfValid(thought.id, targetId, 'revises', sessionId);
+		return this._addEdgeIfValid(thought.id, references.revisesThoughtId, 'revises', sessionId);
 	}
 
 	private _emitToolInvocationEdge(
-		session: EdgeEmissionSession,
 		thought: ThoughtData,
-		sessionId: string
+		sessionId: SessionId,
+		context?: ThoughtAdmissionContext
 	): boolean {
-		if (thought.thought_type !== 'tool_observation' || thought._resumedFrom === undefined) {
+		if (
+			thought.thought_type !== 'tool_observation' ||
+			context?.toolInvocationSourceThoughtId === undefined
+		) {
 			return false;
 		}
 
-		const toolCallId = this.resolveThoughtId(session, thought._resumedFrom);
 		const metadata = thought.tool_name !== undefined ? { tool_name: thought.tool_name } : undefined;
-		return this._addEdgeIfValid(toolCallId, thought.id, 'tool_invocation', sessionId, metadata);
+		return this._addEdgeIfValid(
+			context.toolInvocationSourceThoughtId,
+			thought.id,
+			'tool_invocation',
+			sessionId,
+			metadata
+		);
 	}
 
 	private _emitSequenceEdge(
 		session: EdgeEmissionSession,
 		thought: ThoughtData,
-		sessionId: string
+		sessionId: SessionId
 	): boolean {
 		const history = session.thought_history;
 		if (history.length < 2) return false;
@@ -183,40 +208,15 @@ export class EdgeEmitter {
 	}
 
 	/**
-	 * Resolves a thought_number to its stable id within the given session.
-	 * Searches main history first, then branches.
-	 *
-	 * @returns The thought's id if found and non-empty, undefined otherwise
-	 */
-	public resolveThoughtId(
-		session: EdgeEmissionSession,
-		thoughtNumber: number
-	): string | undefined {
-		for (const t of session.thought_history) {
-			if (t.thought_number === thoughtNumber && typeof t.id === 'string' && t.id.length > 0) {
-				return t.id;
-			}
-		}
-		for (const branchThoughts of Object.values(session.branches)) {
-			for (const t of branchThoughts) {
-				if (t.thought_number === thoughtNumber && typeof t.id === 'string' && t.id.length > 0) {
-					return t.id;
-				}
-			}
-		}
-		return undefined;
-	}
-
-	/**
 	 * Adds an edge to the edge store if both endpoints are non-empty strings.
 	 * Returns true if added, false if skipped (missing endpoint).
 	 * Failures (e.g. self-edge) are caught and logged.
 	 */
 	private _addEdgeIfValid(
-		from: string | undefined,
-		to: string | undefined,
+		from: ThoughtId | undefined,
+		to: ThoughtId | undefined,
 		kind: EdgeKind,
-		sessionId: string,
+		sessionId: SessionId,
 		metadata?: Record<string, unknown>
 	): boolean {
 		if (!from || !to) {
@@ -240,6 +240,10 @@ export class EdgeEmitter {
 			this._logger.warn('EdgeStore not available; skipping edge', { kind });
 			return false;
 		}
+		const duplicate = this._edgeStore
+			.edgesForSession(sessionId)
+			.some((existing) => existing.kind === kind && existing.from === from && existing.to === to);
+		if (duplicate) return false;
 		try {
 			this._edgeStore.addEdge(edge);
 			return true;

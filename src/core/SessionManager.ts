@@ -32,6 +32,8 @@ export interface SessionManagerConfig {
 	getMaxSessions: () => number;
 	/** Maximum sessions per owner (per-owner LRU bucket). @default 50 */
 	maxSessionsPerOwner?: number;
+	/** Invoked synchronously after a session is removed from the live map. */
+	onSessionRemoved?: (sessionId: SessionId) => void;
 	logger?: Logger;
 }
 
@@ -46,6 +48,7 @@ export class SessionManager<S extends SessionLike> {
 	private readonly _getMaxSessions: () => number;
 	private readonly _maxSessionsPerOwner: number;
 	private readonly _logger: Logger;
+	private readonly _onSessionRemoved?: (sessionId: SessionId) => void;
 	private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 	constructor(config: SessionManagerConfig) {
@@ -55,6 +58,7 @@ export class SessionManager<S extends SessionLike> {
 		this._getMaxSessions = config.getMaxSessions;
 		this._maxSessionsPerOwner = config.maxSessionsPerOwner ?? 50;
 		this._logger = config.logger ?? new NullLogger();
+		this._onSessionRemoved = config.onSessionRemoved;
 	}
 
 	/** Returns the underlying cleanup timer (for test introspection). */
@@ -99,6 +103,7 @@ export class SessionManager<S extends SessionLike> {
 			if (session.provenance === 'restored') continue;
 			if (now - session.lastAccessedAt > this._sessionTtlMs) {
 				sessions.delete(key);
+				this._onSessionRemoved?.(key);
 				this._logger.info('Evicted stale session', { sessionId: key });
 			}
 		}
@@ -144,6 +149,7 @@ export class SessionManager<S extends SessionLike> {
 			for (let i = 0; i < toEvict && i < ownerSessions.length; i++) {
 				const [evictKey] = ownerSessions[i]!;
 				sessions.delete(evictKey);
+				this._onSessionRemoved?.(evictKey);
 				this._logger.info('Evicted oldest session (per-owner LRU)', {
 					sessionId: evictKey,
 					owner,
@@ -171,6 +177,7 @@ export class SessionManager<S extends SessionLike> {
 			}
 			if (oldestKey !== null) {
 				sessions.delete(oldestKey);
+				this._onSessionRemoved?.(oldestKey);
 				liveSessionCount--;
 				this._logger.info('Evicted oldest session (global LRU)', { sessionId: oldestKey });
 			} else {

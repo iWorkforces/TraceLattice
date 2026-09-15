@@ -13,9 +13,20 @@
  */
 
 import type { IEdgeStore, IMetrics, ISessionLock } from '../contracts/interfaces.js';
-import { asSessionId, GLOBAL_SESSION_ID, type BranchId, type SessionId } from '../contracts/ids.js';
+import {
+	asSessionId,
+	GLOBAL_SESSION_ID,
+	type BranchId,
+	type SessionId,
+	type ThoughtId,
+} from '../contracts/ids.js';
 import type { ISummaryStore } from '../contracts/summary.js';
-import { AsyncResetRequiredError, ValidationError, SessionAccessDeniedError } from '../errors.js';
+import {
+	AsyncResetRequiredError,
+	InvalidBacktrackError,
+	ValidationError,
+	SessionAccessDeniedError,
+} from '../errors.js';
 import { NullLogger } from '../logger/NullLogger.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import type { PersistenceBackend } from '../contracts/PersistenceBackend.js';
@@ -26,13 +37,19 @@ import {
 } from './compression/DehydrationPolicy.js';
 import type { Summary } from './compression/Summary.js';
 import { EdgeEmitter } from './graph/EdgeEmitter.js';
-import type { HistorySessionSnapshot, IHistoryManager } from './IHistoryManager.js';
+import type {
+	HistorySessionSnapshot,
+	IHistoryManager,
+	ThoughtAdmissionContext,
+} from './IHistoryManager.js';
 import { PersistenceBuffer, type PersistenceEventEmitter } from './PersistenceBuffer.js';
 import { SessionManager } from './SessionManager.js';
 import { SessionResetCoordinator } from './SessionResetCoordinator.js';
 import { stagePersistenceRestore, type RestoredSession } from './PersistenceRestore.js';
 import type { ThoughtData } from './thought.js';
 import { getOwner } from '../context/RequestContext.js';
+import { ThoughtReferenceIndex, type ThoughtReferenceResolution } from './ThoughtReferenceIndex.js';
+import { resolveThoughtReferencesForAdmission } from './CrossReferenceValidator.js';
 
 /** Absolute maximum history size (~20MB at 2KB/thought). Cannot be overridden. */
 export const ABSOLUTE_MAX_HISTORY_SIZE = 10_000;
@@ -106,6 +123,7 @@ export class HistoryManager implements IHistoryManager {
 	private _eventEmitter: PersistenceEventEmitter | null;
 
 	private readonly _edgeEmitter: EdgeEmitter;
+	private _referenceIndex = new ThoughtReferenceIndex();
 	private _persistenceBuffer: PersistenceBuffer<SessionState> | null;
 	private readonly _sessionManager: SessionManager<SessionState>;
 	private readonly _resetCoordinator: SessionResetCoordinator<SessionState>;
@@ -146,6 +164,7 @@ export class HistoryManager implements IHistoryManager {
 			cleanupIntervalMs: 5 * 60 * 1000,
 			getMaxSessions: () => HistoryManager.MAX_SESSIONS,
 			maxSessionsPerOwner: config.maxSessionsPerOwner ?? 50,
+			onSessionRemoved: (sessionId) => this._referenceIndex.clearSession(sessionId),
 			logger: this._logger,
 		});
 
@@ -305,10 +324,25 @@ export class HistoryManager implements IHistoryManager {
 	 * Adds a thought to the history. Routes per-session, applies retraction for backtrack,
 	 * caches tools/skills, trims, branches, emits DAG edges, and buffers for persistence.
 	 */
-	public addThought(thought: ThoughtData): void {
+	public addThought(thought: ThoughtData, context?: ThoughtAdmissionContext): void {
 		const sessionId = asSessionId(thought.session_id ?? HistoryManager.DEFAULT_SESSION);
 		this._persistenceBuffer?.assertSessionAdmissionOpen(sessionId);
-		const session = this._getSession(sessionId, this._getCurrentOwner());
+		const owner = this._getCurrentOwner();
+		this._authorizeExistingSession(sessionId, owner);
+		const resolvedReferences =
+			context?.resolvedReferences ??
+			resolveThoughtReferencesForAdmission(thought, (thoughtNumber) =>
+				this._referenceIndex.resolve(sessionId, thoughtNumber)
+			);
+		const retractionTarget = resolvedReferences.backtrackTargetThoughtId;
+		if (thought.thought_type === 'backtrack' && thought.backtrack_target !== undefined) {
+			if (retractionTarget === undefined) {
+				throw new InvalidBacktrackError(
+					`backtrack_target ${thought.backtrack_target} is missing in session history`
+				);
+			}
+		}
+		const session = this._getSession(sessionId, owner);
 		this._metrics?.counter(
 			'thought_requests_total',
 			1,
@@ -320,8 +354,8 @@ export class HistoryManager implements IHistoryManager {
 
 		// Logical retraction: when a backtrack thought is added, mark its target
 		// as retracted (append-only — target remains in history).
-		if (thought.thought_type === 'backtrack' && thought.backtrack_target !== undefined) {
-			this._applyRetraction(session, thought.backtrack_target);
+		if (retractionTarget !== undefined) {
+			this._applyRetraction(session, retractionTarget);
 		}
 
 		// Cache available_mcp_tools/available_skills for cross-call persistence
@@ -346,6 +380,7 @@ export class HistoryManager implements IHistoryManager {
 				this._persistenceBuffer?.bufferBranch(sessionId, thought.branch_id, branchSnapshot);
 			}
 		}
+		this._rebuildReferenceIndex(sessionId, session);
 
 		// Track merge operations for analytics
 		if (thought.merge_from_thoughts?.length || thought.merge_branch_ids?.length) {
@@ -359,7 +394,7 @@ export class HistoryManager implements IHistoryManager {
 
 		// Emit DAG edges (no-op unless edgeStore + dagEdges flag both enabled)
 		const edgeCountBefore = this._edgeStore?.size(sessionId) ?? 0;
-		this._edgeEmitter.emitEdgesForThought(session, thought);
+		this._edgeEmitter.emitEdgesForThought(session, thought, { ...context, resolvedReferences });
 		if (
 			this._edgeStore &&
 			this._persistenceBuffer &&
@@ -375,21 +410,28 @@ export class HistoryManager implements IHistoryManager {
 	}
 
 	/** Marks the thought as retracted within the session (append-only). */
-	private _applyRetraction(session: SessionState, targetNumber: number): void {
+	private _applyRetraction(session: SessionState, targetId: ThoughtId): void {
 		for (const t of session.thought_history) {
-			if (t.thought_number === targetNumber) {
-				t.retracted = true;
-				return;
-			}
+			if (t.id === targetId) t.retracted = true;
 		}
 		for (const branchThoughts of Object.values(session.branches)) {
 			for (const t of branchThoughts) {
-				if (t.thought_number === targetNumber) {
-					t.retracted = true;
-					return;
-				}
+				if (t.id === targetId) t.retracted = true;
 			}
 		}
+	}
+
+	private _rebuildReferenceIndex(sessionId: SessionId, session: SessionState): void {
+		const retained = [session.thought_history, ...Object.values(session.branches)].flat();
+		this._referenceIndex.replaceSession(sessionId, retained);
+	}
+
+	public resolveThoughtReference(
+		sessionId: SessionId,
+		thoughtNumber: number
+	): ThoughtReferenceResolution {
+		this._authorizeExistingSession(sessionId, this._getCurrentOwner());
+		return this._referenceIndex.resolve(sessionId, thoughtNumber);
 	}
 
 	private _addToSessionBranch(
@@ -537,6 +579,7 @@ export class HistoryManager implements IHistoryManager {
 				throw new AsyncResetRequiredError('session', canonicalSessionId, 'active');
 			}
 			this._resetCoordinator.clearSession(canonicalSessionId);
+			this._referenceIndex.clearSession(canonicalSessionId);
 			return;
 		}
 		this._assertOwnerlessResetAll();
@@ -544,6 +587,7 @@ export class HistoryManager implements IHistoryManager {
 			throw new AsyncResetRequiredError('all', undefined, 'active');
 		}
 		this._resetCoordinator.clearAll();
+		this._referenceIndex.clearAll();
 	}
 
 	/** Awaitably deletes one authorized durable namespace before replacing its live state. */
@@ -558,12 +602,14 @@ export class HistoryManager implements IHistoryManager {
 			preservedOwner,
 			clearAuxiliaryState
 		);
+		this._referenceIndex.clearSession(canonicalSessionId);
 	}
 
 	/** Awaitably deletes all durable namespaces from a trusted ownerless context. */
 	public async resetAll(clearAuxiliaryState?: () => void): Promise<void> {
 		this._assertOwnerlessResetAll();
 		await this._resetCoordinator.resetAll(clearAuxiliaryState);
+		this._referenceIndex.clearAll();
 	}
 
 	public clearSession(sessionId: string): void {
@@ -608,11 +654,17 @@ export class HistoryManager implements IHistoryManager {
 		const sessions = restored.sessions.map(
 			(session) => [session.sessionId, this._restoredState(session)] as const
 		);
+		const referenceIndex = new ThoughtReferenceIndex();
+		for (const [sessionId, session] of sessions) {
+			const retained = [session.thought_history, ...Object.values(session.branches)].flat();
+			referenceIndex.replaceSession(sessionId, retained);
+		}
 
 		this._edgeStore?.clearAll();
 		this._summaryStore?.clearAll();
 		this._sessions.clear();
 		for (const [sessionId, session] of sessions) this._sessions.set(sessionId, session);
+		this._referenceIndex = referenceIndex;
 		for (const session of restored.sessions) {
 			for (const edge of session.edges) this._edgeStore?.addEdge(edge);
 			for (const summary of session.summaries) this._summaryStore?.add(summary);
