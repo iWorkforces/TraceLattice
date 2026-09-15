@@ -37,7 +37,11 @@ import { enforceJsonShape, JsonShapeError } from '../sanitize.js';
 import { SequentialThinkingSchema } from '../schema.js';
 import { GraphView } from './graph/GraphView.js';
 import { assertNever } from '../utils.js';
-import type { HistorySessionSnapshot, IHistoryManager } from './IHistoryManager.js';
+import type {
+	HistorySessionSnapshot,
+	IHistoryManager,
+	ThoughtAdmissionContext,
+} from './IHistoryManager.js';
 import { normalizeInput } from './InputNormalizer.js';
 import type {
 	ThoughtData,
@@ -52,12 +56,6 @@ import { SequentialStrategy } from './reasoning/strategies/SequentialStrategy.js
 import type { CompressionService } from './compression/CompressionService.js';
 import { validateThoughtCrossReferences } from './CrossReferenceValidator.js';
 
-/**
- * Internal extension to ThoughtData carrying resume metadata.
- * Attached by `_handleToolObservation` so downstream consumers (e.g. edge
- * emission) can correlate the observation with the suspended `tool_call`.
- */
-type ResumableThought = ThoughtData & { _resumedFrom?: number };
 type ConfidenceSignalsResult = ReturnType<ThoughtEvaluator['computeConfidenceSignals']>;
 type ReasoningStatsResult = ReturnType<ThoughtEvaluator['computeReasoningStats']>;
 
@@ -426,15 +424,23 @@ export class ThoughtProcessor {
 				thought.available_skills = [...validationSnapshot.availableSkills];
 			}
 		}
-		const strictReferences = resetState || registerBranchId !== undefined;
-		const { result: checkedInput, warnings: refWarnings } = validateThoughtCrossReferences(
-			thought,
-			validationSnapshot,
-			strictReferences,
-			this._logger
-		);
+		const resolveThoughtReference = resetState
+			? () => ({ kind: 'missing' as const })
+			: (thoughtNumber: number) =>
+					this.historyManager.resolveThoughtReference(sessionId, thoughtNumber);
+		const {
+			result: checkedInput,
+			warnings: refWarnings,
+			resolvedReferences,
+		} = validateThoughtCrossReferences(thought, {
+			snapshot: validationSnapshot,
+			resolveThoughtReference,
+			strictBranchReferences: resetState || registerBranchId !== undefined,
+			logger: this._logger,
+		});
 		const allWarnings = [...prepared.validationWarnings, ...refWarnings];
-		const validated = this._validateNewTypes(checkedInput, validationSnapshot);
+		const validated = this._validateNewTypes(checkedInput);
+		const admissionContext: ThoughtAdmissionContext = { resolvedReferences };
 		if (resetState && validated.thought_type === 'tool_observation') {
 			throw new ValidationError(
 				'thought_type',
@@ -455,15 +461,15 @@ export class ThoughtProcessor {
 		// Tool-interleave suspend path: persist the tool_call thought, then return
 		// a `suspended` envelope without running strategy/evaluator.
 		if (validated.thought_type === 'tool_call' && this._suspensionStore) {
-			return this._handleToolCall(validated, sessionId, exposeSessionId);
+			return this._handleToolCall(validated, sessionId, exposeSessionId, admissionContext);
 		}
 
 		// Tool-interleave resume path: consume the suspension and continue the
 		// normal pipeline (addThought → format → evaluate → strategy).
 		if (validated.thought_type === 'tool_observation' && this._suspensionStore) {
-			await this._handleToolObservation(validated, sessionId);
+			await this._handleToolObservation(validated, sessionId, admissionContext);
 		} else {
-			this.historyManager.addThought(checkedInput);
+			this.historyManager.addThought(checkedInput, admissionContext);
 		}
 
 		const formattedThought = this.thoughtFormatter.formatThought(checkedInput);
@@ -724,19 +730,7 @@ export class ThoughtProcessor {
 		}
 	}
 
-	private _validateNewTypes(
-		input: ThoughtData,
-		snapshot: HistorySessionSnapshot
-	): ValidatedThought {
-		if (
-			input.thought_type === 'backtrack' &&
-			input.backtrack_target !== undefined &&
-			!this._thoughtNumberExists(input.backtrack_target, snapshot)
-		) {
-			throw new InvalidBacktrackError(
-				'backtrack_target ' + input.backtrack_target + ' does not exist in session history'
-			);
-		}
+	private _validateNewTypes(input: ThoughtData): ValidatedThought {
 		return input as ValidatedThought;
 	}
 
@@ -760,22 +754,6 @@ export class ThoughtProcessor {
 		if (!this._toolRegistry.has(toolName)) {
 			throw new UnknownToolError(toolName);
 		}
-	}
-
-	/**
-	 * Checks whether a given thought_number exists in the session history or any branch.
-	 * @private
-	 */
-	private _thoughtNumberExists(thoughtNumber: number, snapshot: HistorySessionSnapshot): boolean {
-		for (const t of snapshot.history) {
-			if (t.thought_number === thoughtNumber) return true;
-		}
-		for (const branchThoughts of Object.values(snapshot.branches)) {
-			for (const t of branchThoughts) {
-				if (t.thought_number === thoughtNumber) return true;
-			}
-		}
-		return false;
 	}
 
 	/**
@@ -803,15 +781,20 @@ export class ThoughtProcessor {
 	private _handleToolCall(
 		input: ToolCallThought,
 		sessionId: SessionId,
-		exposeSessionId: boolean
+		exposeSessionId: boolean,
+		admissionContext: ThoughtAdmissionContext
 	): CallToolResult {
-		this.historyManager.addThought(input);
+		if (input.id === undefined) {
+			throw new ValidationError('id', 'tool_call requires an admitted thought id');
+		}
+		this.historyManager.addThought(input, admissionContext);
 		if (!this._suspensionStore) {
 			throw new ValidationError('thought_type', 'tool_call requires suspensionStore');
 		}
 		const record: SuspensionRecord = this._suspensionStore.suspend({
 			sessionId,
 			toolCallThoughtNumber: input.thought_number,
+			toolCallThoughtId: input.id,
 			toolName: input.tool_name,
 			toolArguments: input.tool_arguments ?? {},
 			expiresAt: 0,
@@ -845,14 +828,17 @@ export class ThoughtProcessor {
 	 */
 	private async _handleToolObservation(
 		input: ToolObservationThought,
-		sessionId: SessionId
+		sessionId: SessionId,
+		admissionContext: ThoughtAdmissionContext
 	): Promise<void> {
 		if (!this._suspensionStore) {
 			throw new ValidationError('thought_type', 'tool_observation requires suspensionStore');
 		}
 		await this._suspensionStore.compareAndAdmit(input.continuation_token, sessionId, (record) => {
-			(input as ResumableThought)._resumedFrom = record.toolCallThoughtNumber;
-			this.historyManager.addThought(input);
+			this.historyManager.addThought(input, {
+				...admissionContext,
+				toolInvocationSourceThoughtId: record.toolCallThoughtId,
+			});
 		});
 	}
 }
