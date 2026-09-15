@@ -237,6 +237,7 @@ describe('ordered scoped session reset', () => {
 		suspensionStore.suspend({
 			sessionId: SESSION_A,
 			toolCallThoughtNumber: 1,
+			toolCallThoughtId: asThoughtId('reset-call-1'),
 			toolName: 'tool',
 			toolArguments: {},
 			expiresAt: 0,
@@ -297,6 +298,7 @@ describe('ordered scoped session reset', () => {
 		suspensionStore.suspend({
 			sessionId: SESSION_A,
 			toolCallThoughtNumber: 1,
+			toolCallThoughtId: asThoughtId('reset-call-2'),
 			toolName: 'tool',
 			toolArguments: {},
 			expiresAt: 0,
@@ -391,6 +393,7 @@ describe('ordered scoped session reset', () => {
 		suspensionStore.suspend({
 			sessionId: SESSION_A,
 			toolCallThoughtNumber: 1,
+			toolCallThoughtId: asThoughtId('reset-call-3'),
 			toolName: 'tool',
 			toolArguments: {},
 			expiresAt: 0,

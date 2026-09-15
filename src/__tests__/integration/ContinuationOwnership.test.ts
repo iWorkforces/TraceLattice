@@ -15,7 +15,6 @@ import { ThoughtFormatter } from '../../core/ThoughtFormatter.js';
 import { ThoughtProcessor, type CallToolResult } from '../../core/ThoughtProcessor.js';
 import { SequentialStrategy } from '../../core/reasoning/strategies/SequentialStrategy.js';
 import { InMemorySuspensionStore } from '../../core/tools/InMemorySuspensionStore.js';
-import type { ThoughtData } from '../../core/thought.js';
 import { ERROR_CODES } from '../../errors.js';
 import { createMockToolRegistry } from '../helpers/factories.js';
 
@@ -139,7 +138,7 @@ describe('continuation session and owner admission', () => {
 		expect(rightful.isError).toBeUndefined();
 		const historyA = history.inspectSession(SESSION_A).history;
 		expect(historyA).toHaveLength(2);
-		expect((historyA[1] as ThoughtData & { _resumedFrom?: number })._resumedFrom).toBe(1);
+		expect('_resumedFrom' in (historyA[1] ?? {})).toBe(false);
 		expect(store.size()).toBe(0);
 	});
 

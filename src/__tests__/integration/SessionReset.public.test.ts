@@ -177,6 +177,7 @@ describe('public reset surface', () => {
 		suspensionStore.suspend({
 			sessionId: orphanAuxiliarySession,
 			toolCallThoughtNumber: 1,
+			toolCallThoughtId: asThoughtId('public-reset-call'),
 			toolName: 'tool',
 			toolArguments: {},
 			expiresAt: 0,
