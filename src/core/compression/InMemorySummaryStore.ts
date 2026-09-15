@@ -59,7 +59,7 @@ function branchKey(sessionId: SessionId, branchId: BranchId): BranchId {
  * ```
  */
 export class InMemorySummaryStore implements ISummaryStore {
-	private readonly _byId: Map<SummaryId, Summary> = new Map();
+	private readonly _byId: Map<SessionId, Map<SummaryId, Summary>> = new Map();
 	private readonly _bySession: Map<SessionId, Summary[]> = new Map();
 	private readonly _byBranch: Map<BranchId, Summary[]> = new Map();
 
@@ -79,11 +79,16 @@ export class InMemorySummaryStore implements ISummaryStore {
 	 * ```
 	 */
 	add(summary: Summary): void {
-		if (this._byId.has(asSummaryId(summary.id))) {
+		let sessionIds = this._byId.get(summary.sessionId);
+		if (sessionIds === undefined) {
+			sessionIds = new Map<SummaryId, Summary>();
+			this._byId.set(summary.sessionId, sessionIds);
+		}
+		if (sessionIds.has(asSummaryId(summary.id))) {
 			throw new SequentialThinkingError(`Duplicate summary id: ${summary.id}`, 'DUPLICATE_SUMMARY');
 		}
 
-		this._byId.set(asSummaryId(summary.id), summary);
+		sessionIds.set(asSummaryId(summary.id), summary);
 		this._insertSorted(this._bySession, summary.sessionId, summary);
 		if (summary.branchId !== undefined) {
 			this._insertSorted(
@@ -106,7 +111,11 @@ export class InMemorySummaryStore implements ISummaryStore {
 	 * ```
 	 */
 	get(id: string): Summary | undefined {
-		return this._byId.get(asSummaryId(id));
+		for (const sessionIds of this._byId.values()) {
+			const summary = sessionIds.get(asSummaryId(id));
+			if (summary !== undefined) return summary;
+		}
+		return undefined;
 	}
 
 	/**
@@ -160,11 +169,11 @@ export class InMemorySummaryStore implements ISummaryStore {
 		}
 
 		for (const summary of summaries) {
-			this._byId.delete(asSummaryId(summary.id));
 			if (summary.branchId !== undefined) {
 				this._byBranch.delete(branchKey(asSessionId(sessionId), summary.branchId));
 			}
 		}
+		this._byId.delete(asSessionId(sessionId));
 		this._bySession.delete(asSessionId(sessionId));
 	}
 
@@ -191,7 +200,9 @@ export class InMemorySummaryStore implements ISummaryStore {
 		if (sessionId !== undefined) {
 			return this._bySession.get(asSessionId(sessionId))?.length ?? 0;
 		}
-		return this._byId.size;
+		let total = 0;
+		for (const sessionIds of this._byId.values()) total += sessionIds.size;
+		return total;
 	}
 
 	/**

@@ -10,7 +10,14 @@ import { asSessionId, asBranchId, type ThoughtId } from '../../contracts/ids.js'
 
 let counter = 0;
 
-function makeSummary(overrides: Partial<Omit<Summary, 'sessionId' | 'rootThoughtId' | 'coveredIds' | 'branchId'>> & { sessionId?: string; rootThoughtId?: string; coveredIds?: readonly string[]; branchId?: string } = {}): Summary {
+function makeSummary(
+	overrides: Partial<Omit<Summary, 'sessionId' | 'rootThoughtId' | 'coveredIds' | 'branchId'>> & {
+		sessionId?: string;
+		rootThoughtId?: string;
+		coveredIds?: readonly string[];
+		branchId?: string;
+	} = {}
+): Summary {
 	counter += 1;
 	return {
 		id: overrides.id ?? `sum-${counter}`,
@@ -53,6 +60,37 @@ describe('InMemorySummaryStore', () => {
 		} catch (err) {
 			expect((err as SequentialThinkingError).code).toBe('DUPLICATE_SUMMARY');
 		}
+	});
+
+	it('T10-S01 permits the same summary id in different sessions', () => {
+		// Given
+		const first = makeSummary({ id: 'shared-id', sessionId: 's1' });
+		const second = makeSummary({ id: 'shared-id', sessionId: 's2' });
+
+		// When
+		store.add(first);
+		store.add(second);
+
+		// Then
+		expect(store.forSession('s1')).toEqual([first]);
+		expect(store.forSession('s2')).toEqual([second]);
+		expect(store.get('shared-id')).toBe(first);
+	});
+
+	it('T10-S02 clearing one session preserves a same-id summary in another session', () => {
+		// Given
+		const first = makeSummary({ id: 'shared-id', sessionId: 's1' });
+		const second = makeSummary({ id: 'shared-id', sessionId: 's2' });
+		store.add(first);
+		store.add(second);
+
+		// When
+		store.clearSession('s1');
+
+		// Then
+		expect(store.forSession('s1')).toEqual([]);
+		expect(store.forSession('s2')).toEqual([second]);
+		expect(store.get('shared-id')).toBe(second);
 	});
 
 	it('forSession() returns summaries sorted by createdAt ascending', () => {
