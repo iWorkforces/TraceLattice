@@ -16,6 +16,8 @@ export interface SessionLike {
 	lastAccessedAt: number;
 	/** Owner identifier for per-owner LRU quota. Undefined for stdio/global sessions. */
 	owner?: string;
+	/** Startup-restored namespaces are protected from eviction until durable eviction exists. */
+	provenance?: 'restored';
 }
 
 /** Configuration options for SessionManager. */
@@ -94,6 +96,7 @@ export class SessionManager<S extends SessionLike> {
 		const now = Date.now();
 		for (const [key, session] of sessions) {
 			if (key === this._defaultSessionId) continue;
+			if (session.provenance === 'restored') continue;
 			if (now - session.lastAccessedAt > this._sessionTtlMs) {
 				sessions.delete(key);
 				this._logger.info('Evicted stale session', { sessionId: key });
@@ -121,6 +124,7 @@ export class SessionManager<S extends SessionLike> {
 		const ownerCounts = new Map<string, number>();
 		for (const [key, session] of sessions) {
 			if (key === this._defaultSessionId) continue;
+			if (session.provenance === 'restored') continue;
 			if (session.owner === undefined) continue;
 			ownerCounts.set(session.owner, (ownerCounts.get(session.owner) ?? 0) + 1);
 		}
@@ -131,6 +135,7 @@ export class SessionManager<S extends SessionLike> {
 			const ownerSessions: Array<[SessionId, S]> = [];
 			for (const [key, session] of sessions) {
 				if (key === this._defaultSessionId) continue;
+				if (session.provenance === 'restored') continue;
 				if (session.owner !== owner) continue;
 				ownerSessions.push([key, session]);
 			}
@@ -150,11 +155,15 @@ export class SessionManager<S extends SessionLike> {
 	/** Global LRU cap enforcement: evicts oldest until under `getMaxSessions()`. */
 	private _evictGlobalOverflow(sessions: Map<SessionId, S>): void {
 		const max = this._getMaxSessions();
-		while (sessions.size > max) {
+		let liveSessionCount = Array.from(sessions.values()).filter(
+			(session) => session.provenance !== 'restored'
+		).length;
+		while (liveSessionCount > max) {
 			let oldestKey: SessionId | null = null;
 			let oldestTime = Infinity;
 			for (const [key, session] of sessions) {
 				if (key === this._defaultSessionId) continue;
+				if (session.provenance === 'restored') continue;
 				if (session.lastAccessedAt < oldestTime) {
 					oldestTime = session.lastAccessedAt;
 					oldestKey = key;
@@ -162,6 +171,7 @@ export class SessionManager<S extends SessionLike> {
 			}
 			if (oldestKey !== null) {
 				sessions.delete(oldestKey);
+				liveSessionCount--;
 				this._logger.info('Evicted oldest session (global LRU)', { sessionId: oldestKey });
 			} else {
 				break;

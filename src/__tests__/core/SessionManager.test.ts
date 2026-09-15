@@ -11,11 +11,15 @@ import { asSessionId, type SessionId } from '../../contracts/ids.js';
 
 interface TestSession extends SessionLike {
 	id: string;
+	provenance?: 'restored';
 }
 
 const DEFAULT_ID = '__global__';
 
-function makeManager(opts?: { maxSessions?: number; maxSessionsPerOwner?: number }): SessionManager<TestSession> {
+function makeManager(opts?: {
+	maxSessions?: number;
+	maxSessionsPerOwner?: number;
+}): SessionManager<TestSession> {
 	return new SessionManager<TestSession>({
 		defaultSessionId: DEFAULT_ID,
 		sessionTtlMs: 60_000,
@@ -59,7 +63,11 @@ describe('SessionManager — per-owner LRU eviction', () => {
 		}
 		// Owner B: 30 sessions (under quota)
 		for (let i = 0; i < 30; i++) {
-			sessions.set(asSessionId(`b-${i}`), { id: `b-${i}`, lastAccessedAt: now + 1000 + i, owner: 'B' });
+			sessions.set(asSessionId(`b-${i}`), {
+				id: `b-${i}`,
+				lastAccessedAt: now + 1000 + i,
+				owner: 'B',
+			});
 		}
 
 		mgr.evictExcessSessions(sessions);
@@ -83,7 +91,11 @@ describe('SessionManager — per-owner LRU eviction', () => {
 
 		for (let i = 0; i < 5; i++) {
 			sessions.set(asSessionId(`a-${i}`), { id: `a-${i}`, lastAccessedAt: now + i, owner: 'A' });
-			sessions.set(asSessionId(`b-${i}`), { id: `b-${i}`, lastAccessedAt: now + 100 + i, owner: 'B' });
+			sessions.set(asSessionId(`b-${i}`), {
+				id: `b-${i}`,
+				lastAccessedAt: now + 100 + i,
+				owner: 'B',
+			});
 		}
 
 		mgr.evictExcessSessions(sessions);
@@ -105,7 +117,11 @@ describe('SessionManager — per-owner LRU eviction', () => {
 		}
 		// Legitimate owner Y: 3 sessions (at quota)
 		for (let i = 0; i < 3; i++) {
-			sessions.set(asSessionId(`y-${i}`), { id: `y-${i}`, lastAccessedAt: now + 50 + i, owner: 'Y' });
+			sessions.set(asSessionId(`y-${i}`), {
+				id: `y-${i}`,
+				lastAccessedAt: now + 50 + i,
+				owner: 'Y',
+			});
 		}
 
 		mgr.evictExcessSessions(sessions);
@@ -149,6 +165,69 @@ describe('SessionManager — per-owner LRU eviction', () => {
 		}
 	});
 
+	it('T10-M01 excludes restored sessions from TTL eviction', () => {
+		// Given
+		const mgr = makeManager({ maxSessions: 1 });
+		const sessions = new Map<SessionId, TestSession>([
+			[
+				asSessionId('restored'),
+				{ id: 'restored', lastAccessedAt: now - 120_000, provenance: 'restored' },
+			],
+		]);
+
+		// When
+		mgr.cleanupStaleSessions(sessions);
+
+		// Then
+		expect(sessions.has(asSessionId('restored'))).toBe(true);
+	});
+
+	it('T10-M02 excludes restored sessions from per-owner LRU quotas', () => {
+		// Given
+		const mgr = makeManager({ maxSessions: 100, maxSessionsPerOwner: 1 });
+		const sessions = new Map<SessionId, TestSession>([
+			[
+				asSessionId('restored'),
+				{ id: 'restored', lastAccessedAt: now, owner: 'A', provenance: 'restored' },
+			],
+			[asSessionId('live-old'), { id: 'live-old', lastAccessedAt: now + 1, owner: 'A' }],
+			[asSessionId('live-new'), { id: 'live-new', lastAccessedAt: now + 2, owner: 'A' }],
+		]);
+
+		// When
+		mgr.evictExcessSessions(sessions);
+
+		// Then
+		expect([...sessions.keys()]).toEqual([asSessionId('restored'), asSessionId('live-new')]);
+	});
+
+	it('T10-M03 excludes restored sessions from global LRU while capping live sessions', () => {
+		// Given
+		const mgr = makeManager({ maxSessions: 1, maxSessionsPerOwner: 100 });
+		const sessions = new Map<SessionId, TestSession>([
+			[
+				asSessionId('restored-a'),
+				{ id: 'restored-a', lastAccessedAt: now, provenance: 'restored' },
+			],
+			[
+				asSessionId('restored-b'),
+				{ id: 'restored-b', lastAccessedAt: now + 1, provenance: 'restored' },
+			],
+			[asSessionId('live-old'), { id: 'live-old', lastAccessedAt: now + 2 }],
+			[asSessionId('live-new'), { id: 'live-new', lastAccessedAt: now + 3 }],
+		]);
+
+		// When
+		mgr.evictExcessSessions(sessions);
+
+		// Then
+		expect([...sessions.keys()]).toEqual([
+			asSessionId('restored-a'),
+			asSessionId('restored-b'),
+			asSessionId('live-new'),
+		]);
+	});
+
 	it('default session is never evicted (per-owner stage)', () => {
 		const mgr = makeManager({ maxSessions: 1000, maxSessionsPerOwner: 1 });
 		const sessions = new Map<SessionId, TestSession>();
@@ -177,7 +256,11 @@ describe('SessionManager — per-owner LRU eviction', () => {
 			owner: undefined,
 		});
 		for (let i = 0; i < 10; i++) {
-			sessions.set(asSessionId(`s-${i}`), { id: `s-${i}`, lastAccessedAt: now + i, owner: undefined });
+			sessions.set(asSessionId(`s-${i}`), {
+				id: `s-${i}`,
+				lastAccessedAt: now + i,
+				owner: undefined,
+			});
 		}
 
 		mgr.evictExcessSessions(sessions);
@@ -192,10 +275,22 @@ describe('SessionManager — per-owner LRU eviction', () => {
 		const sessions = new Map<SessionId, TestSession>();
 
 		// Insert out-of-order timestamps for owner A
-		sessions.set(asSessionId('a-newest'), { id: 'a-newest', lastAccessedAt: now + 300, owner: 'A' });
-		sessions.set(asSessionId('a-oldest'), { id: 'a-oldest', lastAccessedAt: now + 100, owner: 'A' });
+		sessions.set(asSessionId('a-newest'), {
+			id: 'a-newest',
+			lastAccessedAt: now + 300,
+			owner: 'A',
+		});
+		sessions.set(asSessionId('a-oldest'), {
+			id: 'a-oldest',
+			lastAccessedAt: now + 100,
+			owner: 'A',
+		});
 		sessions.set(asSessionId('a-mid'), { id: 'a-mid', lastAccessedAt: now + 200, owner: 'A' });
-		sessions.set(asSessionId('a-ancient'), { id: 'a-ancient', lastAccessedAt: now + 50, owner: 'A' });
+		sessions.set(asSessionId('a-ancient'), {
+			id: 'a-ancient',
+			lastAccessedAt: now + 50,
+			owner: 'A',
+		});
 
 		mgr.evictExcessSessions(sessions);
 
