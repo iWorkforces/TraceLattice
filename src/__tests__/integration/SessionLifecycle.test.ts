@@ -478,6 +478,13 @@ describe('session lifecycle integration', () => {
 		let settled = false;
 
 		const first = manager.shutdown();
+		expect(() => manager.addThought(thought(sessionId, 2))).toThrow(
+			expect.objectContaining({
+				code: 'SESSION_LIFECYCLE_CLOSED',
+				phase: 'shutting_down',
+			})
+		);
+		expect(manager.getHistory(sessionId)).toHaveLength(1);
 		void first.then(() => {
 			settled = true;
 		});
@@ -492,6 +499,29 @@ describe('session lifecycle integration', () => {
 		expect(manager.getSessionIds()).toEqual([]);
 		expect(clearAllAuxiliaryState).toHaveBeenCalledOnce();
 		expect(lifecycle.globalPhase).toBe('stopped');
+	});
+
+	it('binds one shutdown owner without replacing it', async () => {
+		// Given
+		const manager = new HistoryManager();
+		const ownerSettlement = Promise.withResolvers<void>();
+		const firstOwner = vi.fn(() => ownerSettlement.promise);
+		const rejectedOwner = vi.fn(async () => undefined);
+		manager.bindShutdownOwner(firstOwner);
+
+		// When
+		expect(() => manager.bindShutdownOwner(rejectedOwner)).toThrow(TypeError);
+		const first = manager.shutdown();
+		const repeated = manager.shutdown();
+
+		// Then
+		expect(first).toBe(ownerSettlement.promise);
+		expect(repeated).toBe(first);
+		expect(rejectedOwner).not.toHaveBeenCalled();
+		ownerSettlement.resolve();
+		await first;
+		expect(manager.shutdown()).toBe(first);
+		expect(rejectedOwner).not.toHaveBeenCalled();
 	});
 
 	it('cleans DI-owned session auxiliaries after successful server shutdown', async () => {

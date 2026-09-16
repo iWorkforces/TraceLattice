@@ -138,6 +138,7 @@ export class HistoryManager implements IHistoryManager {
 	private readonly _resetCoordinator: SessionResetCoordinator<SessionState>;
 	private readonly _sessionLock?: ISessionLock;
 	private readonly _lifecycle: SessionLifecycleCoordinator;
+	private _shutdownOwner: (() => Promise<void>) | null = null;
 	private readonly _clearSessionAuxiliaryState?: (sessionId: SessionId) => void;
 	private readonly _clearAllAuxiliaryState?: () => void;
 
@@ -941,8 +942,23 @@ export class HistoryManager implements IHistoryManager {
 		this._persistenceBuffer?.setEventEmitter(emitter);
 	}
 
+	/**
+	 * Binds shutdown to the resource owner responsible for the complete cleanup sequence.
+	 *
+	 * @internal
+	 * @param owner - Callback returning the owner's memoized shutdown promise.
+	 * @throws {TypeError} When a shutdown owner has already been bound.
+	 */
+	public bindShutdownOwner(owner: () => Promise<void>): void {
+		if (this._shutdownOwner !== null) {
+			throw new TypeError('HistoryManager shutdown owner is already bound');
+		}
+		this._shutdownOwner = owner;
+	}
+
 	/** Stops timers, drains writes, and clears live state under one memoized lifecycle settlement. */
 	public shutdown(): Promise<void> {
+		if (this._shutdownOwner !== null) return this._shutdownOwner();
 		return this._lifecycle.shutdown(async () => {
 			await this.shutdownWithinLifecycle();
 			this.clearLiveStateAfterShutdown();
