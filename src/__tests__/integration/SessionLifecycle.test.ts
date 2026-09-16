@@ -185,6 +185,68 @@ describe('session lifecycle integration', () => {
 		await manager.shutdown();
 	});
 
+	it('excludes a registered-only branch from every public view when maxBranches is zero', async () => {
+		// Given
+		const sessionId = asSessionId('zero-registered');
+		const branchId = asBranchId('future');
+		const server = await createServer({
+			config: new ServerConfig({ maxBranches: 0 }),
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+
+		// When
+		const result = await server.processThought({
+			thought: 'registration must respect the exact zero bound',
+			thought_number: 1,
+			total_thoughts: 1,
+			next_thought_needed: false,
+			session_id: sessionId,
+			register_branch_id: branchId,
+		});
+
+		// Then
+		expect(JSON.parse(result.content[0]?.text ?? '{}')).toMatchObject({ branches: [] });
+		expect(server.history.getBranchIds(sessionId)).toEqual([]);
+		expect(server.history.inspectSession(sessionId).branchIds).toEqual([]);
+		expect(server.history.branchExists(sessionId, branchId)).toBe(false);
+		await server.dispose();
+	});
+
+	it('evicts identities by first admission across registration and thought-backed creation', async () => {
+		// Given
+		const sessionId = asSessionId('mixed-identity-order');
+		const oldest = asBranchId('oldest');
+		const second = asBranchId('second');
+		const newest = asBranchId('newest');
+		const manager = new HistoryManager({ maxBranches: 2 });
+		manager.registerBranch(sessionId, oldest);
+		manager.addThought({
+			...thought(sessionId, 1),
+			branch_from_thought: 1,
+			branch_id: second,
+		});
+
+		// When
+		manager.addThought({
+			...thought(sessionId, 2),
+			branch_from_thought: 1,
+			branch_id: oldest,
+		});
+		manager.registerBranch(sessionId, newest);
+
+		// Then
+		expect(manager.getBranchIds(sessionId)).toEqual([second, newest]);
+		expect(Object.keys(manager.getBranches(sessionId))).toEqual([second]);
+		expect(manager.inspectSession(sessionId).branchIds).toEqual([second, newest]);
+		expect(Object.keys(manager.inspectSession(sessionId).branches)).toEqual([second]);
+		expect(manager.branchExists(sessionId, oldest)).toBe(false);
+		expect(manager.branchExists(sessionId, second)).toBe(true);
+		expect(manager.branchExists(sessionId, newest)).toBe(true);
+		expect(manager.getBranch(oldest, sessionId)).toBeUndefined();
+		await manager.shutdown();
+	});
+
 	it('persists the survivor before deleting the evicted branch and pruned edges', async () => {
 		const sessionId = asSessionId('branch-replacement');
 		const staleBranch = asBranchId('z');
