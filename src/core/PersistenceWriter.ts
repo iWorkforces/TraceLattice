@@ -106,9 +106,17 @@ export class PersistenceWriter {
 					'saveThoughtForSession'
 				).saveThoughtForSession(work.sessionId, work.thought);
 			case 'branch':
-				if (work.sessionId === GLOBAL_SESSION_ID) {
-					return this._persistence.saveBranch(work.key, [...work.snapshot]);
+				if (work.operation === 'delete') {
+					const persistence = requireSessionScopedPersistence(
+						this._persistence,
+						work.sessionId === GLOBAL_SESSION_ID ? 'deleteBranch' : 'deleteBranchForSession'
+					);
+					return work.sessionId === GLOBAL_SESSION_ID
+						? persistence.deleteBranch(work.key)
+						: persistence.deleteBranchForSession(work.sessionId, work.key);
 				}
+				if (work.sessionId === GLOBAL_SESSION_ID)
+					return this._persistence.saveBranch(work.key, [...work.snapshot]);
 				return requireSessionScopedPersistence(
 					this._persistence,
 					'saveBranchForSession'
@@ -133,6 +141,7 @@ export class PersistenceWriter {
 			case 'branch':
 				return {
 					kind: work.kind,
+					operation: work.operation,
 					token: work.token,
 					sessionId: work.sessionId,
 					key: work.key,

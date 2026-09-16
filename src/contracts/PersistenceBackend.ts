@@ -34,6 +34,15 @@ export interface PersistenceBackend {
 	saveBranch(branchId: BranchId, thoughts: ThoughtData[]): Promise<void>;
 
 	/**
+	 * Delete one global branch without treating an empty branch as deletion.
+	 *
+	 * Optional on legacy backends; the complete scoped capability requires it.
+	 *
+	 * @param branchId - The branch identifier to delete
+	 */
+	deleteBranch?(branchId: BranchId): Promise<void>;
+
+	/**
 	 * Load all thoughts for a specific branch.
 	 *
 	 * @param branchId - The unique identifier for the branch
@@ -115,6 +124,8 @@ export type SessionScopedPersistenceOperation =
 	| 'saveThoughtForSession'
 	| 'loadHistoryForSession'
 	| 'saveBranchForSession'
+	| 'deleteBranch'
+	| 'deleteBranchForSession'
 	| 'loadBranchForSession'
 	| 'listBranchesForSession'
 	| 'listSessions'
@@ -122,6 +133,7 @@ export type SessionScopedPersistenceOperation =
 
 /** Persistence contract for durable named-session isolation. */
 export interface SessionScopedPersistenceBackend extends PersistenceBackend {
+	deleteBranch(branchId: BranchId): Promise<void>;
 	saveThoughtForSession(sessionId: SessionId, thought: ThoughtData): Promise<void>;
 	loadHistoryForSession(sessionId: SessionId): Promise<ThoughtData[]>;
 	saveBranchForSession(
@@ -129,6 +141,7 @@ export interface SessionScopedPersistenceBackend extends PersistenceBackend {
 		branchId: BranchId,
 		thoughts: readonly ThoughtData[]
 	): Promise<void>;
+	deleteBranchForSession(sessionId: SessionId, branchId: BranchId): Promise<void>;
 	loadBranchForSession(
 		sessionId: SessionId,
 		branchId: BranchId
@@ -149,6 +162,10 @@ export function supportsSessionScopedPersistence(
 		typeof backend.loadHistoryForSession === 'function' &&
 		'saveBranchForSession' in backend &&
 		typeof backend.saveBranchForSession === 'function' &&
+		'deleteBranch' in backend &&
+		typeof backend.deleteBranch === 'function' &&
+		'deleteBranchForSession' in backend &&
+		typeof backend.deleteBranchForSession === 'function' &&
 		'loadBranchForSession' in backend &&
 		typeof backend.loadBranchForSession === 'function' &&
 		'listBranchesForSession' in backend &&

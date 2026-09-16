@@ -112,11 +112,42 @@ export class PersistenceWorkQueue {
 		const acceptance = this._accept();
 		const work: WorkOf<'branch'> = Object.freeze({
 			kind: 'branch',
+			operation: 'save',
 			token: acceptance.token,
 			sessionId,
 			key: branchId,
 			version,
 			snapshot: Object.freeze([...thoughts]),
+		});
+		const branchMap = this._branches.get(sessionId) ?? new Map<BranchId, BranchEntry>();
+		this._branches.set(sessionId, branchMap);
+		branchMap.set(branchId, {
+			acceptedSequence: acceptance.sequence,
+			work,
+			terminalFailure: undefined,
+		});
+		return work;
+	}
+
+	/**
+	 * @param sessionId - Session that owns the branch.
+	 * @param branchId - Stable branch coordinate within the session.
+	 * @returns The new immutable, versioned deletion work handle.
+	 */
+	public deleteBranch(sessionId: SessionId, branchId: BranchId): WorkOf<'branch'> {
+		const versionMap = this._branchVersions.get(sessionId) ?? new Map<BranchId, number>();
+		this._branchVersions.set(sessionId, versionMap);
+		const version = (versionMap.get(branchId) ?? 0) + 1;
+		versionMap.set(branchId, version);
+
+		const acceptance = this._accept();
+		const work: WorkOf<'branch'> = Object.freeze({
+			kind: 'branch',
+			operation: 'delete',
+			token: acceptance.token,
+			sessionId,
+			key: branchId,
+			version,
 		});
 		const branchMap = this._branches.get(sessionId) ?? new Map<BranchId, BranchEntry>();
 		this._branches.set(sessionId, branchMap);
@@ -306,6 +337,30 @@ export class PersistenceWorkQueue {
 		return this._thoughts.length + branchCount + this._edges.size + this._summaries.size;
 	}
 
+	/** @returns Whether any accepted work remains for a session across all work kinds. */
+	public hasSessionWork(sessionId: SessionId): boolean {
+		return this._entries().some((entry) => entry.work.sessionId === sessionId);
+	}
+
+	/** @returns Whether current retained work for a session owns a terminal failure. */
+	public hasSessionTerminalFailure(sessionId: SessionId): boolean {
+		return this.currentFailures(undefined, sessionId).length > 0;
+	}
+
+	/**
+	 * Forgets version coordinates only after all accepted work for a session is gone.
+	 *
+	 * @returns `false` without mutation while any accepted work remains.
+	 */
+	public forgetQuiescentSession(sessionId: SessionId): boolean {
+		if (this.hasSessionWork(sessionId)) return false;
+		this._branches.delete(sessionId);
+		this._branchVersions.delete(sessionId);
+		this._edgeVersions.delete(sessionId);
+		this._summaryVersions.delete(sessionId);
+		return true;
+	}
+
 	/** Discards every retained work item and version coordinate for one deleted session. */
 	public discardSession(sessionId: SessionId): void {
 		for (let index = this._thoughts.length - 1; index >= 0; index -= 1) {
@@ -404,6 +459,7 @@ export class PersistenceWorkQueue {
 			case 'branch':
 				return (
 					current.kind === 'branch' &&
+					current.operation === selected.operation &&
 					current.key === selected.key &&
 					current.version === selected.version
 				);
@@ -436,6 +492,12 @@ export class PersistenceWorkQueue {
 			case 'thought':
 				return true;
 			case 'branch':
+				return (
+					failure.kind === 'branch' &&
+					work.operation === failure.operation &&
+					work.key === failure.key &&
+					work.version === failure.version
+				);
 			case 'edge':
 			case 'summary':
 				return 'key' in failure && work.key === failure.key && work.version === failure.version;

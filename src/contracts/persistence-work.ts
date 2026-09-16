@@ -28,11 +28,20 @@ export type PersistenceWork =
 	  }
 	| {
 			readonly kind: 'branch';
+			readonly operation: 'save';
 			readonly token: PersistenceWorkToken;
 			readonly sessionId: SessionId;
 			readonly key: BranchId;
 			readonly version: number;
 			readonly snapshot: readonly ThoughtData[];
+	  }
+	| {
+			readonly kind: 'branch';
+			readonly operation: 'delete';
+			readonly token: PersistenceWorkToken;
+			readonly sessionId: SessionId;
+			readonly key: BranchId;
+			readonly version: number;
 	  }
 	| {
 			readonly kind: 'edge';
@@ -67,6 +76,7 @@ export type PersistenceWorkFailure =
 	  }
 	| {
 			readonly kind: 'branch';
+			readonly operation: 'save' | 'delete';
 			readonly token: PersistenceWorkToken;
 			readonly sessionId: SessionId;
 			readonly key: BranchId;
