@@ -84,6 +84,16 @@ class MockPersistence implements SessionScopedPersistenceBackend {
 		this._sessionBranches.set(sessionId, branches);
 	}
 
+	async deleteBranch(branchId: BranchId): Promise<void> {
+		delete this._branches[branchId];
+	}
+
+	async deleteBranchForSession(sessionId: SessionId, branchId: BranchId): Promise<void> {
+		const branches = this._sessionBranches.get(sessionId);
+		branches?.delete(branchId);
+		if (branches?.size === 0) this._sessionBranches.delete(sessionId);
+	}
+
 	async loadBranchForSession(
 		sessionId: SessionId,
 		branchId: BranchId
@@ -253,8 +263,8 @@ describe('HistoryManager', () => {
 				);
 			}
 
-			expect(manager.getBranch(asBranchId('alt-1'))).toHaveLength(3);
-			expect(manager.getBranch(asBranchId('alt-1'))![0]!.thought_number).toBe(2);
+			expect(manager.getBranch(asBranchId('alt-1'))).toHaveLength(2);
+			expect(manager.getBranch(asBranchId('alt-1'))?.[0]?.thought_number).toBe(3);
 		});
 
 		it('should remove oldest branches when maxBranches is exceeded', () => {
@@ -906,7 +916,7 @@ describe('HistoryManager', () => {
 	});
 
 	describe('session TTL eviction', () => {
-		it('evicts sessions inactive longer than TTL', () => {
+		it('evicts sessions inactive longer than TTL', async () => {
 			useFakeTimers();
 			const manager = new HistoryManager();
 
@@ -914,10 +924,10 @@ describe('HistoryManager', () => {
 			expect(manager.getHistoryLength(asSessionId('old'))).toBe(1);
 
 			// Advance past TTL (30 minutes) + cleanup interval (5 minutes)
-			vi.advanceTimersByTime(31 * 60 * 1000);
+			await vi.advanceTimersByTimeAsync(31 * 60 * 1000);
 
 			// Trigger the 5-minute cleanup timer
-			vi.advanceTimersByTime(5 * 60 * 1000);
+			await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
 
 			// The 'old' session should have been cleaned up
 			expect(manager.getSessionIds()).not.toContain('old');
@@ -1256,8 +1266,8 @@ describe('HistoryManager — uncovered branches', () => {
 		});
 	});
 
-	describe('_evictExcessSessions break branch (line 837)', () => {
-		it('should break when only __global__ session remains during LRU eviction', () => {
+	describe('infeasible admission', () => {
+		it('rejects without exceeding capacity when only __global__ remains', () => {
 			const manager = new HistoryManager({});
 
 			// Access private _sessions map directly
@@ -1287,10 +1297,10 @@ describe('HistoryManager — uncovered branches', () => {
 				// _getSession() calls _evictExcessSessions() when creating new sessions
 				// Since MAX_SESSIONS=0 and we have __global__ (size=1 > 0), it enters the while loop.
 				// The for loop only sees __global__, skips it, so oldestKey stays null → break
-				manager.addThought(createTestThought({ thought_number: 2, session_id: 'trigger' }));
-
-				// If we got here without infinite loop, the break branch was hit
-				expect(sessions.size).toBeGreaterThan(0);
+				expect(() =>
+					manager.addThought(createTestThought({ thought_number: 2, session_id: 'trigger' }))
+				).toThrow('Max sessions');
+				expect([...sessions.keys()]).toEqual(['__global__']);
 			} finally {
 				Object.defineProperty(HistoryManager, 'MAX_SESSIONS', {
 					value: originalMaxSessions,
@@ -1302,7 +1312,7 @@ describe('HistoryManager — uncovered branches', () => {
 	});
 
 	describe('session eviction interactions with EdgeStore', () => {
-		it('TTL-evicted session leaves EdgeStore entries intact (current behavior)', () => {
+		it('TTL eviction clears matching EdgeStore entries', async () => {
 			useFakeTimers();
 			const edgeStore = new EdgeStore();
 			const manager = new HistoryManager({ edgeStore, dagEdges: true });
@@ -1313,16 +1323,15 @@ describe('HistoryManager — uncovered branches', () => {
 			expect(sizeBefore).toBeGreaterThan(0);
 
 			// Trigger TTL eviction
-			vi.advanceTimersByTime(31 * 60 * 1000);
-			vi.advanceTimersByTime(5 * 60 * 1000);
+			await vi.advanceTimersByTimeAsync(31 * 60 * 1000);
+			await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
 
 			// Session is gone from manager...
 			expect(manager.getSessionIds()).not.toContain('old');
-			// ...but EdgeStore entries persist (no auto-cleanup wired)
-			expect(edgeStore.size(asSessionId('old'))).toBe(sizeBefore);
+			expect(edgeStore.size(asSessionId('old'))).toBe(0);
 		});
 
-		it('LRU-evicted session leaves EdgeStore entries intact (current behavior)', () => {
+		it('LRU eviction clears matching EdgeStore entries', () => {
 			useFakeTimers();
 			// MAX_SESSIONS is private — override via defineProperty (default is 100)
 			Object.defineProperty(HistoryManager, 'MAX_SESSIONS', {
@@ -1348,8 +1357,7 @@ describe('HistoryManager — uncovered branches', () => {
 				manager.addThought(createTestThought({ thought_number: 1, session_id: 's3', id: 's3-1' }));
 
 				expect(manager.getSessionIds()).not.toContain('s1');
-				// EdgeStore entries persist after LRU eviction
-				expect(edgeStore.size(asSessionId('s1'))).toBe(s1EdgesBefore);
+				expect(edgeStore.size(asSessionId('s1'))).toBe(0);
 			} finally {
 				Object.defineProperty(HistoryManager, 'MAX_SESSIONS', {
 					value: 100,

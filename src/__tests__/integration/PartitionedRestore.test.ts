@@ -156,6 +156,11 @@ class RecordingPersistence extends MemoryPersistence {
 		await super.saveBranchForSession(sessionId, branchId, values);
 	}
 
+	override async deleteBranchForSession(sessionId: SessionId, branchId: BranchId): Promise<void> {
+		this.calls.push(`delete-branch:${sessionId}:${branchId}`);
+		await super.deleteBranchForSession(sessionId, branchId);
+	}
+
 	override async saveEdges(sessionId: SessionId, values: readonly Edge[]): Promise<void> {
 		this.calls.push(`save-edges:${sessionId}`);
 		await super.saveEdges(sessionId, values);
@@ -279,7 +284,7 @@ describe('Task 10 partitioned startup restore', () => {
 		expect(history.getBranch(shared, sessionA)?.[0]?.session_id).toBe(sessionA);
 		expect(history.getBranch(shared, sessionB)?.[0]?.session_id).toBe(sessionB);
 		expect(history.getBranch(empty, sessionA)).toEqual([]);
-		expect(edgeStore.edgesForSession(edgeOnly)).toHaveLength(1);
+		expect(edgeStore.edgesForSession(edgeOnly)).toEqual([]);
 		expect(summaryStore.forSession(summaryOnly)).toHaveLength(1);
 	});
 
@@ -340,6 +345,133 @@ describe('Task 10 partitioned startup restore', () => {
 		).toEqual([7]);
 		expect(await persistence.loadHistoryForSession(sessionA)).toEqual([first, second, third]);
 		expect(await persistence.loadBranchForSession(sessionA, asBranchId('a'))).toHaveLength(2);
+	});
+
+	it('restores exact zero branches and prunes their edges without mutating persistence', async () => {
+		const persistence = new RecordingPersistence();
+		const sessionA = asSessionId('zero-restore');
+		const branchId = asBranchId('stale');
+		const branchThought = thought(sessionA, 2, { branch_id: branchId });
+		await persistence.saveBranchForSession(sessionA, branchId, [branchThought]);
+		await persistence.saveEdges(sessionA, [
+			{
+				id: asEdgeId('stale-edge'),
+				from: asThoughtId('missing-root'),
+				to: branchThought.id ?? asThoughtId('missing-branch'),
+				kind: 'branch',
+				sessionId: sessionA,
+				createdAt: 1,
+			},
+		]);
+		persistence.calls.length = 0;
+		const edgeStore = new EdgeStore();
+		const history = manager(persistence, { maxBranches: 0, edgeStore });
+
+		await history.loadFromPersistence();
+
+		expect(history.getBranchIds(sessionA)).toEqual([]);
+		expect(edgeStore.edgesForSession(sessionA)).toEqual([]);
+		expect(await persistence.loadBranchForSession(sessionA, branchId)).toEqual([branchThought]);
+		expect(persistence.calls.filter((call) => call.startsWith('save-'))).toEqual([]);
+		expect(persistence.calls.filter((call) => call.startsWith('delete-'))).toEqual([]);
+	});
+
+	it('drops a restored edge with a missing source without mutating persistence', async () => {
+		// Given
+		const persistence = new RecordingPersistence();
+		const sessionA = asSessionId('missing-source');
+		const targetId = asThoughtId('retained-target');
+		const danglingEdge: Edge = {
+			id: asEdgeId('missing-source-edge'),
+			from: asThoughtId('missing-source-id'),
+			to: targetId,
+			kind: 'sequence',
+			sessionId: sessionA,
+			createdAt: 1,
+		};
+		await persistence.saveThoughtForSession(sessionA, thought(sessionA, 1, { id: targetId }));
+		await persistence.saveEdges(sessionA, [danglingEdge]);
+		persistence.calls.length = 0;
+		const edgeStore = new EdgeStore();
+		const history = manager(persistence, { edgeStore });
+
+		// When
+		await history.loadFromPersistence();
+
+		// Then
+		expect(edgeStore.edgesForSession(sessionA)).toEqual([]);
+		expect(await persistence.loadEdges(sessionA)).toEqual([danglingEdge]);
+		expect(
+			persistence.calls.filter(
+				(call) => call.startsWith('save-') || call.startsWith('delete-') || call.startsWith('clear')
+			)
+		).toEqual([]);
+	});
+
+	it('drops a restored edge with a missing target', async () => {
+		// Given
+		const persistence = new MemoryPersistence();
+		const sessionA = asSessionId('missing-target');
+		const sourceId = asThoughtId('retained-source');
+		await persistence.saveThoughtForSession(sessionA, thought(sessionA, 1, { id: sourceId }));
+		await persistence.saveEdges(sessionA, [
+			{
+				id: asEdgeId('missing-target-edge'),
+				from: sourceId,
+				to: asThoughtId('missing-target-id'),
+				kind: 'sequence',
+				sessionId: sessionA,
+				createdAt: 1,
+			},
+		]);
+		const edgeStore = new EdgeStore();
+		const history = manager(persistence, { edgeStore });
+
+		// When
+		await history.loadFromPersistence();
+
+		// Then
+		expect(edgeStore.edgesForSession(sessionA)).toEqual([]);
+	});
+
+	it('restores a branch edge only when its target is a retained branch thought', async () => {
+		// Given
+		const persistence = new MemoryPersistence();
+		const sessionA = asSessionId('branch-target');
+		const branchId = asBranchId('retained-branch');
+		const sourceId = asThoughtId('branch-source');
+		const mainTargetId = asThoughtId('main-only-target');
+		const branchTargetId = asThoughtId('branch-target-id');
+		await persistence.saveThoughtForSession(sessionA, thought(sessionA, 1, { id: sourceId }));
+		await persistence.saveThoughtForSession(sessionA, thought(sessionA, 2, { id: mainTargetId }));
+		await persistence.saveBranchForSession(sessionA, branchId, [
+			thought(sessionA, 3, { id: branchTargetId, branch_id: branchId }),
+		]);
+		const mainTargetEdge: Edge = {
+			id: asEdgeId('main-target-branch-edge'),
+			from: sourceId,
+			to: mainTargetId,
+			kind: 'branch',
+			sessionId: sessionA,
+			createdAt: 1,
+		};
+		const branchTargetEdge: Edge = {
+			id: asEdgeId('branch-target-branch-edge'),
+			from: sourceId,
+			to: branchTargetId,
+			kind: 'branch',
+			sessionId: sessionA,
+			createdAt: 2,
+		};
+		await persistence.saveEdges(sessionA, [mainTargetEdge, branchTargetEdge]);
+		const edgeStore = new EdgeStore();
+		const history = manager(persistence, { edgeStore });
+
+		// When
+		await history.loadFromPersistence();
+
+		// Then
+		expect(edgeStore.edgesForSession(sessionA)).toEqual([branchTargetEdge]);
 	});
 
 	it('T10-R06 rejects cross-partition thought scope without mutating the input or live state', async () => {
@@ -524,7 +656,16 @@ describe('Task 10 partitioned startup restore', () => {
 			for (const number of [1, 2, 3]) {
 				await seed.saveThoughtForSession(sessionA, thought(sessionA, number));
 			}
-			await seed.saveThoughtForSession(sessionB, thought(sessionB, 1));
+			await seed.saveThoughtForSession(
+				sessionB,
+				thought(sessionB, 1, { id: asThoughtId('file-edge-from') })
+			);
+			await seed.saveBranchForSession(sessionB, branchId, [
+				thought(sessionB, 2, {
+					id: asThoughtId('file-edge-to'),
+					branch_id: branchId,
+				}),
+			]);
 			await seed.saveBranchForSession(sessionA, branchId, [
 				thought(sessionA, 4, { branch_id: branchId }),
 				thought(sessionA, 5, { branch_id: branchId }),
@@ -586,10 +727,16 @@ describe('Task 10 partitioned startup restore', () => {
 		const sessionA = asSessionId('A');
 		const sessionB = asSessionId('B');
 		const branchId = asBranchId('shared');
-		await persistence.saveThoughtForSession(sessionA, thought(sessionA, 1));
+		await persistence.saveThoughtForSession(
+			sessionA,
+			thought(sessionA, 1, { id: asThoughtId('sqlite-edge-from') })
+		);
 		await persistence.saveThoughtForSession(sessionB, thought(sessionB, 1));
 		await persistence.saveBranchForSession(sessionA, branchId, [
-			thought(sessionA, 2, { branch_id: branchId }),
+			thought(sessionA, 2, {
+				id: asThoughtId('sqlite-edge-to'),
+				branch_id: branchId,
+			}),
 		]);
 		await persistence.saveBranchForSession(sessionB, branchId, [
 			thought(sessionB, 2, { branch_id: branchId }),
@@ -697,7 +844,7 @@ describe('Task 10 partitioned startup restore', () => {
 			);
 		});
 		expect(history.getHistory()).toHaveLength(1);
-		expect(edgeStore.edgesForSession(edgeOnly)).toHaveLength(1);
+		expect(edgeStore.edgesForSession(edgeOnly)).toEqual([]);
 		expect(summaryStore.forSession(summaryOnly)).toHaveLength(1);
 	});
 

@@ -95,7 +95,7 @@ describe('HistoryManager reference-index lifecycle', () => {
 		});
 	});
 
-	it('cleans the index when current TTL eviction removes a live session', () => {
+	it('cleans the index when current TTL eviction removes a live session', async () => {
 		const history = manager();
 		const sessionId = asSessionId('expired');
 		history.addThought(
@@ -103,15 +103,13 @@ describe('HistoryManager reference-index lifecycle', () => {
 		);
 		const internals = history as unknown as {
 			_sessions: Map<SessionId, { lastAccessedAt: number }>;
-			_sessionManager: {
-				cleanupStaleSessions(sessions: Map<SessionId, { lastAccessedAt: number }>): void;
-			};
+			_evictSessions(sessionIds: readonly SessionId[]): Promise<void>;
 		};
 		const state = internals._sessions.get(sessionId);
 		if (state === undefined) throw new Error('expected live session state');
 		state.lastAccessedAt = Date.now() - 31 * 60 * 1000;
 
-		internals._sessionManager.cleanupStaleSessions(internals._sessions);
+		await internals._evictSessions([sessionId]);
 
 		expect(history.resolveThoughtReference(sessionId, 2)).toEqual({ kind: 'missing' });
 	});

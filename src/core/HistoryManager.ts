@@ -24,6 +24,7 @@ import type { ISummaryStore } from '../contracts/summary.js';
 import {
 	AsyncResetRequiredError,
 	InvalidBacktrackError,
+	MaxSessionsReachedError,
 	ValidationError,
 	SessionAccessDeniedError,
 } from '../errors.js';
@@ -50,6 +51,7 @@ import type { ThoughtData } from './thought.js';
 import { getOwner } from '../context/RequestContext.js';
 import { ThoughtReferenceIndex, type ThoughtReferenceResolution } from './ThoughtReferenceIndex.js';
 import { resolveThoughtReferencesForAdmission } from './CrossReferenceValidator.js';
+import { SessionLifecycleCoordinator } from './SessionLifecycleCoordinator.js';
 
 /** Absolute maximum history size (~20MB at 2KB/thought). Cannot be overridden. */
 export const ABSOLUTE_MAX_HISTORY_SIZE = 10_000;
@@ -93,6 +95,12 @@ export interface HistoryManagerConfig {
 	maxSessionsPerOwner?: number;
 	/** Shared processor lock used to reject unsafe legacy synchronous clears. */
 	sessionLock?: ISessionLock;
+	/** Shared admission and exclusive lifecycle coordinator. */
+	lifecycleCoordinator?: SessionLifecycleCoordinator;
+	/** Clears processor-owned state after a session is actually removed. */
+	clearSessionAuxiliaryState?: (sessionId: SessionId) => void;
+	/** Clears all processor-owned state after a successful global lifecycle operation. */
+	clearAllAuxiliaryState?: () => void;
 }
 
 /**
@@ -128,6 +136,9 @@ export class HistoryManager implements IHistoryManager {
 	private readonly _sessionManager: SessionManager<SessionState>;
 	private readonly _resetCoordinator: SessionResetCoordinator<SessionState>;
 	private readonly _sessionLock?: ISessionLock;
+	private readonly _lifecycle: SessionLifecycleCoordinator;
+	private readonly _clearSessionAuxiliaryState?: (sessionId: SessionId) => void;
+	private readonly _clearAllAuxiliaryState?: () => void;
 
 	constructor(config: HistoryManagerConfig = {}) {
 		this._logger = config.logger ?? new NullLogger();
@@ -139,7 +150,7 @@ export class HistoryManager implements IHistoryManager {
 				applied: ABSOLUTE_MAX_HISTORY_SIZE,
 			});
 		}
-		this._maxBranches = config.maxBranches || 50;
+		this._maxBranches = config.maxBranches ?? 50;
 		this._maxBranchSize = config.maxBranchSize || 100;
 		this._persistence = config.persistence ?? null;
 		this._persistenceEnabled = this._persistence !== null;
@@ -149,6 +160,9 @@ export class HistoryManager implements IHistoryManager {
 		this._summaryStore = config.summaryStore;
 		this._dagEdges = config.dagEdges ?? true;
 		this._sessionLock = config.sessionLock;
+		this._lifecycle = config.lifecycleCoordinator ?? new SessionLifecycleCoordinator();
+		this._clearSessionAuxiliaryState = config.clearSessionAuxiliaryState;
+		this._clearAllAuxiliaryState = config.clearAllAuxiliaryState;
 
 		// Wire delegates
 		this._edgeEmitter = new EdgeEmitter({
@@ -164,7 +178,6 @@ export class HistoryManager implements IHistoryManager {
 			cleanupIntervalMs: 5 * 60 * 1000,
 			getMaxSessions: () => HistoryManager.MAX_SESSIONS,
 			maxSessionsPerOwner: config.maxSessionsPerOwner ?? 50,
-			onSessionRemoved: (sessionId) => this._referenceIndex.clearSession(sessionId),
 			logger: this._logger,
 		});
 
@@ -194,7 +207,11 @@ export class HistoryManager implements IHistoryManager {
 			logger: this._logger,
 		});
 
-		this._sessionManager.startCleanupTimer(this._sessions);
+		this._sessionManager.startCleanupTimer(
+			this._sessions,
+			(sessionId) => this._isTtlEvictionEligible(sessionId),
+			(sessionIds) => this._evictSessions(sessionIds)
+		);
 	}
 
 	// Test-coupled accessors: these private member names must remain reachable
@@ -234,7 +251,9 @@ export class HistoryManager implements IHistoryManager {
 	 * @param summaries - Complete current summary snapshot for the session.
 	 */
 	public bufferSummaries(sessionId: SessionId, summaries: readonly Summary[]): void {
-		this._persistenceBuffer?.bufferSummaries(sessionId, summaries);
+		this._lifecycle.runMutation(sessionId, () =>
+			this._persistenceBuffer?.bufferSummaries(sessionId, summaries)
+		);
 	}
 
 	/** EdgeStore instance, if configured. Used by ThoughtProcessor for StrategyContext. */
@@ -262,27 +281,109 @@ export class HistoryManager implements IHistoryManager {
 	 */
 	private _getSession(sessionId?: string, owner?: string): SessionState {
 		const key = sessionId === undefined ? HistoryManager.DEFAULT_SESSION : asSessionId(sessionId);
+		const existing = this._sessions.get(key);
+		if (existing !== undefined) {
+			this._assertSessionOwner(key, existing, owner);
+			existing.lastAccessedAt = Date.now();
+			return existing;
+		}
+		return this._lifecycle.runMutation(key, () => this._getSessionWithinOperation(key, owner));
+	}
+
+	private _getSessionWithinOperation(key: SessionId, owner?: string): SessionState {
 		let session = this._sessions.get(key);
 		if (!session) {
+			this._makeCapacityForSession(owner);
 			session = this._createSessionState(owner);
 			this._sessions.set(key, session);
-			this._sessionManager.evictExcessSessions(this._sessions);
-		} else if (owner !== undefined) {
-			if (session.provenance === 'restored') {
-				throw new SessionAccessDeniedError(key, 'unavailable', owner);
-			}
-			if (session.owner !== undefined && session.owner !== owner) {
-				throw new SessionAccessDeniedError(key, session.owner, owner);
-			}
-			if (session.owner === undefined) {
-				// First owner-aware access: bind owner. Acceptable promotion path
-				// for sessions created by stdio that later receive an owner-bearing
-				// access (single-user transition).
-				session.owner = owner;
-			}
+		} else {
+			this._assertSessionOwner(key, session, owner);
 		}
 		session.lastAccessedAt = Date.now();
 		return session;
+	}
+
+	private _assertSessionOwner(
+		sessionId: SessionId,
+		session: SessionState,
+		owner: string | undefined
+	): void {
+		if (owner === undefined) return;
+		if (session.provenance === 'restored') {
+			throw new SessionAccessDeniedError(sessionId, 'unavailable', owner);
+		}
+		if (session.owner !== undefined && session.owner !== owner) {
+			throw new SessionAccessDeniedError(sessionId, session.owner, owner);
+		}
+		if (session.owner === undefined) session.owner = owner;
+	}
+
+	private _makeCapacityForSession(owner: string | undefined): void {
+		const victims = this._sessionManager.planProspectiveAdmission(
+			this._sessions,
+			owner,
+			(sessionId) => this._isCapacityEvictionEligible(sessionId)
+		);
+		if (victims === undefined) throw new MaxSessionsReachedError(HistoryManager.MAX_SESSIONS);
+		if (victims.length === 0) return;
+		const evicted = this._lifecycle.tryEvictIdleSessions(victims, (sessionIds) => {
+			if (sessionIds.some((sessionId) => !this._isPersistenceQuiescent(sessionId))) {
+				throw new MaxSessionsReachedError(HistoryManager.MAX_SESSIONS);
+			}
+			for (const sessionId of sessionIds) this._removeLiveSession(sessionId);
+		});
+		if (!evicted) throw new MaxSessionsReachedError(HistoryManager.MAX_SESSIONS);
+	}
+
+	private _isCapacityEvictionEligible(sessionId: SessionId): boolean {
+		return this._lifecycle.isIdle(sessionId) && this._isPersistenceQuiescent(sessionId);
+	}
+
+	private _isTtlEvictionEligible(sessionId: SessionId): boolean {
+		const persistenceState =
+			this._persistenceBuffer?.sessionEvictionState(sessionId) ?? 'quiescent';
+		return (
+			this._lifecycle.isIdle(sessionId) &&
+			persistenceState !== 'failed' &&
+			persistenceState !== 'barrier'
+		);
+	}
+
+	private _isPersistenceQuiescent(sessionId: SessionId): boolean {
+		return (
+			(this._persistenceBuffer?.sessionEvictionState(sessionId) ?? 'quiescent') === 'quiescent'
+		);
+	}
+
+	private async _evictSessions(sessionIds: readonly SessionId[]): Promise<void> {
+		const results = await Promise.allSettled(
+			sessionIds.map((sessionId) => this._evictSession(sessionId))
+		);
+		const failures = results.flatMap((result) =>
+			result.status === 'rejected' ? [result.reason] : []
+		);
+		if (failures.length > 0) throw new AggregateError(failures, 'Session eviction failed');
+	}
+
+	private _evictSession(sessionId: SessionId): Promise<void> {
+		return this._lifecycle.withSessionEviction(sessionId, async () => {
+			if (this._persistenceBuffer === null) {
+				this._removeLiveSession(sessionId);
+				return;
+			}
+			await this._persistenceBuffer.withSessionEvictionBarrier(sessionId, async () => {
+				this._removeLiveSession(sessionId);
+			});
+		});
+	}
+
+	private _removeLiveSession(sessionId: SessionId): void {
+		this._clearSessionAuxiliaryState?.(sessionId);
+		this._edgeStore?.clearSession(sessionId);
+		this._summaryStore?.clearSession(sessionId);
+		this._referenceIndex.clearSession(sessionId);
+		this._sessions.delete(sessionId);
+		this._persistenceBuffer?.forgetQuiescentSession(sessionId);
 	}
 
 	private _createSessionState(owner?: string, provenance?: 'restored'): SessionState {
@@ -326,23 +427,21 @@ export class HistoryManager implements IHistoryManager {
 	 */
 	public addThought(thought: ThoughtData, context?: ThoughtAdmissionContext): void {
 		const sessionId = asSessionId(thought.session_id ?? HistoryManager.DEFAULT_SESSION);
+		this._lifecycle.runMutation(sessionId, () =>
+			this._addThoughtWithinOperation(sessionId, thought, context)
+		);
+	}
+
+	private _addThoughtWithinOperation(
+		sessionId: SessionId,
+		thought: ThoughtData,
+		context?: ThoughtAdmissionContext
+	): void {
 		this._persistenceBuffer?.assertSessionAdmissionOpen(sessionId);
 		const owner = this._getCurrentOwner();
 		this._authorizeExistingSession(sessionId, owner);
-		const resolvedReferences =
-			context?.resolvedReferences ??
-			resolveThoughtReferencesForAdmission(thought, (thoughtNumber) =>
-				this._referenceIndex.resolve(sessionId, thoughtNumber)
-			);
-		const retractionTarget = resolvedReferences.backtrackTargetThoughtId;
-		if (thought.thought_type === 'backtrack' && thought.backtrack_target !== undefined) {
-			if (retractionTarget === undefined) {
-				throw new InvalidBacktrackError(
-					`backtrack_target ${thought.backtrack_target} is missing in session history`
-				);
-			}
-		}
-		const session = this._getSession(sessionId, owner);
+		const resolvedReferences = this._resolveAdmissionReferences(sessionId, thought, context);
+		const session = this._getSessionWithinOperation(sessionId, owner);
 		this._metrics?.counter(
 			'thought_requests_total',
 			1,
@@ -354,8 +453,8 @@ export class HistoryManager implements IHistoryManager {
 
 		// Logical retraction: when a backtrack thought is added, mark its target
 		// as retracted (append-only — target remains in history).
-		if (retractionTarget !== undefined) {
-			this._applyRetraction(session, retractionTarget);
+		if (resolvedReferences.backtrackTargetThoughtId !== undefined) {
+			this._applyRetraction(session, resolvedReferences.backtrackTargetThoughtId);
 		}
 
 		// Cache available_mcp_tools/available_skills for cross-call persistence
@@ -366,23 +465,10 @@ export class HistoryManager implements IHistoryManager {
 			session.availableSkills = thought.available_skills;
 		}
 
-		if (session.thought_history.length > this._maxHistorySize) {
-			session.thought_history = session.thought_history.slice(-this._maxHistorySize);
-			this.log(`History trimmed to ${this._maxHistorySize} items`, {
-				maxSize: this._maxHistorySize,
-			});
-		}
-
 		if (thought.branch_from_thought && thought.branch_id) {
 			this._addToSessionBranch(session, thought.branch_id, thought);
-			const branchSnapshot = session.branches[thought.branch_id];
-			if (branchSnapshot !== undefined) {
-				this._persistenceBuffer?.bufferBranch(sessionId, thought.branch_id, branchSnapshot);
-			}
 		}
-		this._rebuildReferenceIndex(sessionId, session);
 
-		// Track merge operations for analytics
 		if (thought.merge_from_thoughts?.length || thought.merge_branch_ids?.length) {
 			this._metrics?.counter(
 				'thought_merge_operations_total',
@@ -392,20 +478,91 @@ export class HistoryManager implements IHistoryManager {
 			);
 		}
 
-		// Emit DAG edges (no-op unless edgeStore + dagEdges flag both enabled)
-		const edgeCountBefore = this._edgeStore?.size(sessionId) ?? 0;
-		this._edgeEmitter.emitEdgesForThought(session, thought, { ...context, resolvedReferences });
-		if (
-			this._edgeStore &&
-			this._persistenceBuffer &&
-			this._edgeStore.size(sessionId) > edgeCountBefore
-		) {
-			this._persistenceBuffer.bufferEdges(sessionId, this._edgeStore.edgesForSession(sessionId));
-		}
+		const edgeAdded = this._edgeEmitter.emitEdgesForThought(session, thought, {
+			...context,
+			resolvedReferences,
+		});
+		const evictedBranchIds = this._enforceRetention(session, thought.branch_id);
+		this._rebuildReferenceIndex(sessionId, session);
+		const prunedEdges = this._pruneUnretainedEdges(sessionId, session);
+		this._bufferRetainedState(
+			sessionId,
+			session,
+			thought,
+			evictedBranchIds,
+			edgeAdded,
+			prunedEdges
+		);
+	}
 
-		// Buffer thought for persistence (no-op when persistence disabled)
-		if (this._persistenceBuffer) {
-			this._persistenceBuffer.bufferThought(sessionId, thought);
+	private _resolveAdmissionReferences(
+		sessionId: SessionId,
+		thought: ThoughtData,
+		context?: ThoughtAdmissionContext
+	): NonNullable<ThoughtAdmissionContext['resolvedReferences']> {
+		const resolved =
+			context?.resolvedReferences ??
+			resolveThoughtReferencesForAdmission(thought, (thoughtNumber) =>
+				this._referenceIndex.resolve(sessionId, thoughtNumber)
+			);
+		if (
+			thought.thought_type === 'backtrack' &&
+			thought.backtrack_target !== undefined &&
+			resolved.backtrackTargetThoughtId === undefined
+		) {
+			throw new InvalidBacktrackError(
+				`backtrack_target ${thought.backtrack_target} is missing in session history`
+			);
+		}
+		return resolved;
+	}
+
+	private _enforceRetention(
+		session: SessionState,
+		branchId: BranchId | undefined
+	): readonly BranchId[] {
+		if (session.thought_history.length > this._maxHistorySize) {
+			session.thought_history = session.thought_history.slice(-this._maxHistorySize);
+			this.log(`History trimmed to ${this._maxHistorySize} items`, {
+				maxSize: this._maxHistorySize,
+			});
+		}
+		if (branchId !== undefined) this._trimSessionBranchSize(session, branchId);
+		return this._cleanupSessionBranches(session);
+	}
+
+	private _pruneUnretainedEdges(sessionId: SessionId, session: SessionState): number {
+		if (this._edgeStore === undefined) return 0;
+		const retainedIds = new Set<ThoughtId>();
+		const retainedBranchThoughtIds = new Set<ThoughtId>();
+		for (const thought of [session.thought_history, ...Object.values(session.branches)].flat()) {
+			if (thought.id !== undefined) retainedIds.add(thought.id);
+		}
+		for (const thought of Object.values(session.branches).flat()) {
+			if (thought.id !== undefined) retainedBranchThoughtIds.add(thought.id);
+		}
+		return this._edgeStore.pruneSession(sessionId, retainedIds, retainedBranchThoughtIds);
+	}
+
+	private _bufferRetainedState(
+		sessionId: SessionId,
+		session: SessionState,
+		thought: ThoughtData,
+		evictedBranchIds: readonly BranchId[],
+		edgeAdded: boolean,
+		prunedEdges: number
+	): void {
+		const buffer = this._persistenceBuffer;
+		if (buffer === null) return;
+		buffer.bufferThought(sessionId, thought);
+		if (thought.branch_id !== undefined || evictedBranchIds.length > 0) {
+			for (const [branchId, branch] of Object.entries(session.branches)) {
+				buffer.bufferBranch(sessionId, branchId as BranchId, branch);
+			}
+			for (const branchId of evictedBranchIds) buffer.deleteBranch(sessionId, branchId);
+		}
+		if (this._edgeStore !== undefined && (edgeAdded || prunedEdges > 0)) {
+			buffer.bufferEdges(sessionId, this._edgeStore.edgesForSession(sessionId));
 		}
 	}
 
@@ -442,26 +599,21 @@ export class HistoryManager implements IHistoryManager {
 		if (!session.branches[branchId]) {
 			session.branches[branchId] = [];
 		}
-		this._trimSessionBranchSize(session, branchId);
 		session.branches[branchId].push(thought);
-
-		if (Object.keys(session.branches).length > this._maxBranches) {
-			this._cleanupSessionBranches(session);
-		}
 	}
 
-	private _cleanupSessionBranches(session: SessionState): void {
+	private _cleanupSessionBranches(session: SessionState): readonly BranchId[] {
 		const branchCount = (Object.keys(session.branches) as BranchId[]).length;
-		if (branchCount > this._maxBranches) {
-			const branchesToRemove = (Object.keys(session.branches) as BranchId[]).slice(
-				0,
-				branchCount - this._maxBranches
-			);
-			for (const branchId of branchesToRemove) {
-				delete session.branches[branchId];
-				this.log(`Removed old branch: ${branchId}`, { branchId });
-			}
+		if (branchCount <= this._maxBranches) return [];
+		const branchesToRemove = (Object.keys(session.branches) as BranchId[]).slice(
+			0,
+			branchCount - this._maxBranches
+		);
+		for (const branchId of branchesToRemove) {
+			delete session.branches[branchId];
+			this.log(`Removed old branch: ${branchId}`, { branchId });
 		}
+		return branchesToRemove;
 	}
 
 	private _trimSessionBranchSize(session: SessionState, branchId: BranchId): void {
@@ -544,13 +696,15 @@ export class HistoryManager implements IHistoryManager {
 			throw new ValidationError('branch_id', 'branch_id must be a non-empty string');
 		}
 		const canonicalSessionId = asSessionId(sessionId ?? HistoryManager.DEFAULT_SESSION);
-		this._persistenceBuffer?.assertSessionAdmissionOpen(canonicalSessionId);
-		const session = this._getSession(canonicalSessionId, this._getCurrentOwner());
-		if (branchId in session.branches || session.registeredBranches.has(branchId)) {
-			throw new ValidationError('branch_id', `Branch already exists: ${branchId}`);
-		}
-		session.registeredBranches.add(branchId);
-		this.log('Registered branch', { branchId, sessionId: sessionId ?? null });
+		this._lifecycle.runMutation(canonicalSessionId, () => {
+			this._persistenceBuffer?.assertSessionAdmissionOpen(canonicalSessionId);
+			const session = this._getSessionWithinOperation(canonicalSessionId, this._getCurrentOwner());
+			if (branchId in session.branches || session.registeredBranches.has(branchId)) {
+				throw new ValidationError('branch_id', `Branch already exists: ${branchId}`);
+			}
+			session.registeredBranches.add(branchId);
+			this.log('Registered branch', { branchId, sessionId: sessionId ?? null });
+		});
 	}
 
 	public branchExists(sessionId: string | undefined, branchId: BranchId): boolean {
@@ -580,6 +734,7 @@ export class HistoryManager implements IHistoryManager {
 			}
 			this._resetCoordinator.clearSession(canonicalSessionId);
 			this._referenceIndex.clearSession(canonicalSessionId);
+			this._clearSessionAuxiliaryState?.(canonicalSessionId);
 			return;
 		}
 		this._assertOwnerlessResetAll();
@@ -588,27 +743,50 @@ export class HistoryManager implements IHistoryManager {
 		}
 		this._resetCoordinator.clearAll();
 		this._referenceIndex.clearAll();
+		this._clearAllAuxiliaryState?.();
 	}
 
 	/** Awaitably deletes one authorized durable namespace before replacing its live state. */
 	public async resetSession(sessionId: string, clearAuxiliaryState?: () => void): Promise<void> {
 		const canonicalSessionId = asSessionId(sessionId);
-		const preservedOwner = this._authorizeExistingSession(
-			canonicalSessionId,
-			this._getCurrentOwner()
-		);
+		this._authorizeExistingSession(canonicalSessionId, this._getCurrentOwner());
+		await this._lifecycle.withSessionReset(canonicalSessionId, async () => {
+			const reset = async (): Promise<void> =>
+				await this.resetSessionWithinExclusive(canonicalSessionId, clearAuxiliaryState);
+			if (this._sessionLock === undefined) return await reset();
+			await this._sessionLock.withLock(canonicalSessionId, reset);
+		});
+	}
+
+	/** Performs scoped reset work while its lifecycle exclusive is already owned. */
+	public async resetSessionWithinExclusive(
+		sessionId: SessionId,
+		clearAuxiliaryState?: () => void
+	): Promise<void> {
+		const preservedOwner = this._authorizeExistingSession(sessionId, this._getCurrentOwner());
 		await this._resetCoordinator.resetSession(
-			canonicalSessionId,
+			sessionId,
 			preservedOwner,
-			clearAuxiliaryState
+			clearAuxiliaryState ??
+				(this._clearSessionAuxiliaryState === undefined
+					? undefined
+					: () => this._clearSessionAuxiliaryState?.(sessionId))
 		);
-		this._referenceIndex.clearSession(canonicalSessionId);
+		this._referenceIndex.clearSession(sessionId);
 	}
 
 	/** Awaitably deletes all durable namespaces from a trusted ownerless context. */
 	public async resetAll(clearAuxiliaryState?: () => void): Promise<void> {
 		this._assertOwnerlessResetAll();
-		await this._resetCoordinator.resetAll(clearAuxiliaryState);
+		await this._lifecycle.withGlobalReset(
+			async () => await this.resetAllWithinExclusive(clearAuxiliaryState)
+		);
+	}
+
+	/** Performs global reset work while its lifecycle exclusive is already owned. */
+	public async resetAllWithinExclusive(clearAuxiliaryState?: () => void): Promise<void> {
+		this._assertOwnerlessResetAll();
+		await this._resetCoordinator.resetAll(clearAuxiliaryState ?? this._clearAllAuxiliaryState);
 		this._referenceIndex.clearAll();
 	}
 
@@ -638,7 +816,9 @@ export class HistoryManager implements IHistoryManager {
 			if (session.availableMcpTools !== undefined && session.availableSkills !== undefined) break;
 		}
 		session.thought_history = restored.history.slice(-this._maxHistorySize);
-		for (const branch of restored.branches.slice(-this._maxBranches)) {
+		const retainedBranches =
+			this._maxBranches === 0 ? [] : restored.branches.slice(-this._maxBranches);
+		for (const branch of retainedBranches) {
 			session.branches[branch.branchId] = branch.thoughts.slice(-this._maxBranchSize);
 		}
 		return session;
@@ -655,9 +835,23 @@ export class HistoryManager implements IHistoryManager {
 			(session) => [session.sessionId, this._restoredState(session)] as const
 		);
 		const referenceIndex = new ThoughtReferenceIndex();
+		const retainedThoughtIds = new Map<SessionId, ReadonlySet<ThoughtId>>();
+		const retainedBranchThoughtIds = new Map<SessionId, ReadonlySet<ThoughtId>>();
 		for (const [sessionId, session] of sessions) {
 			const retained = [session.thought_history, ...Object.values(session.branches)].flat();
 			referenceIndex.replaceSession(sessionId, retained);
+			retainedThoughtIds.set(
+				sessionId,
+				new Set(retained.flatMap((thought) => (thought.id === undefined ? [] : [thought.id])))
+			);
+			retainedBranchThoughtIds.set(
+				sessionId,
+				new Set(
+					Object.values(session.branches).flatMap((branch) =>
+						branch.flatMap((thought) => (thought.id === undefined ? [] : [thought.id]))
+					)
+				)
+			);
 		}
 
 		this._edgeStore?.clearAll();
@@ -666,7 +860,14 @@ export class HistoryManager implements IHistoryManager {
 		for (const [sessionId, session] of sessions) this._sessions.set(sessionId, session);
 		this._referenceIndex = referenceIndex;
 		for (const session of restored.sessions) {
-			for (const edge of session.edges) this._edgeStore?.addEdge(edge);
+			const retainedIds = retainedThoughtIds.get(session.sessionId) ?? new Set<ThoughtId>();
+			const retainedBranchIds =
+				retainedBranchThoughtIds.get(session.sessionId) ?? new Set<ThoughtId>();
+			for (const edge of session.edges) {
+				if (!retainedIds.has(edge.from) || !retainedIds.has(edge.to)) continue;
+				if (edge.kind === 'branch' && !retainedBranchIds.has(edge.to)) continue;
+				this._edgeStore?.addEdge(edge);
+			}
 			for (const summary of session.summaries) this._summaryStore?.add(summary);
 		}
 		this.log(`Restored ${restored.sessions.length} persistence namespaces`);
@@ -686,11 +887,31 @@ export class HistoryManager implements IHistoryManager {
 		this._persistenceBuffer?.setEventEmitter(emitter);
 	}
 
-	/** Stops timers and flushes any remaining buffered writes. */
-	public async shutdown(): Promise<void> {
+	/** Stops timers, drains writes, and clears live state under one memoized lifecycle settlement. */
+	public shutdown(): Promise<void> {
+		return this._lifecycle.shutdown(async () => {
+			await this.shutdownWithinLifecycle();
+			this.clearLiveStateAfterShutdown();
+		});
+	}
+
+	/** Stops timers and drains writes while the caller owns global shutdown. */
+	public async shutdownWithinLifecycle(): Promise<void> {
 		this._stopFlushTimer();
 		this._sessionManager.stopCleanupTimer();
 		await this._flushBuffer();
+	}
+
+	/** Clears non-durable state after every shutdown resource has closed successfully. */
+	public clearLiveStateAfterShutdown(): void {
+		for (const sessionId of this._sessions.keys()) {
+			this._persistenceBuffer?.forgetQuiescentSession(sessionId);
+		}
+		this._sessions.clear();
+		this._referenceIndex.clearAll();
+		this._edgeStore?.clearAll();
+		this._summaryStore?.clearAll();
+		this._clearAllAuxiliaryState?.();
 	}
 
 	/** Number of coordinator-owned thought writes not yet acknowledged successful. */

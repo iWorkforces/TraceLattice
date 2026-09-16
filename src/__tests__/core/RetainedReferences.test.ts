@@ -393,7 +393,7 @@ describe('stable edge endpoints', () => {
 		).toEqual([expect.objectContaining({ from: asThoughtId('source'), to: asThoughtId('merge') })]);
 	});
 
-	it('links a resumed observation to the original tool-call id after number reuse', async () => {
+	it('prunes a resumed observation edge when the original tool call is no longer retained', async () => {
 		const edgeStore = new EdgeStore();
 		const store = new InMemorySuspensionStore();
 		const manager = new HistoryManager({ edgeStore, maxHistorySize: 1 });
@@ -426,7 +426,7 @@ describe('stable edge endpoints', () => {
 		expect(
 			edgeStore
 				.edgesForSession(asSessionId('__global__'))
-				.find((edge) => edge.kind === 'tool_invocation')?.from
-		).toBe(originalId);
+				.filter((edge) => edge.kind === 'tool_invocation')
+		).toEqual([]);
 	});
 });
