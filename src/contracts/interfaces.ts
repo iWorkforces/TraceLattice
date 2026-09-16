@@ -190,6 +190,18 @@ export interface IEdgeStore {
 	edgesForSession(sessionId: SessionId): readonly Edge[];
 
 	/**
+	 * Remove unless both endpoints are retained; leave other sessions untouched and delete empty containers.
+	 * @param sessionId - Session whose edges should be pruned
+	 * @param retainedThoughtIds - Union of all retained thought ids in the session
+	 * @returns The exact number of removed edges
+	 */
+	pruneSession(
+		sessionId: SessionId,
+		retainedThoughtIds: ReadonlySet<ThoughtId>,
+		retainedBranchThoughtIds?: ReadonlySet<ThoughtId>
+	): number;
+
+	/**
 	 * Clear all edges for a specific session.
 	 * Other sessions are unaffected.
 	 *

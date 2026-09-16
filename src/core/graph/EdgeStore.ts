@@ -152,6 +152,53 @@ export class EdgeStore implements IEdgeStore {
 	}
 
 	/**
+	 * Remove edges whose source or target is absent from the retained thought set.
+	 * Rebuilds all indexes before replacing the session container atomically.
+	 *
+	 * @param sessionId - Session whose edges should be pruned
+	 * @param retainedThoughtIds - Union of retained thought ids for the session
+	 * @param retainedBranchThoughtIds - Retained targets for branch edges
+	 * @returns The exact number of removed edges
+	 */
+	pruneSession(
+		sessionId: SessionId,
+		retainedThoughtIds: ReadonlySet<ThoughtId>,
+		retainedBranchThoughtIds?: ReadonlySet<ThoughtId>
+	): number {
+		const session = this._sessions.get(sessionId);
+		if (!session) {
+			return 0;
+		}
+
+		const retainedEdges = Array.from(session.byId.values()).filter((edge) => {
+			if (!retainedThoughtIds.has(edge.from) || !retainedThoughtIds.has(edge.to)) return false;
+			return (
+				edge.kind !== 'branch' ||
+				retainedBranchThoughtIds === undefined ||
+				retainedBranchThoughtIds.has(edge.to)
+			);
+		});
+		const removed = session.byId.size - retainedEdges.length;
+		if (retainedEdges.length === 0) {
+			this._sessions.delete(sessionId);
+			return removed;
+		}
+
+		const rebuilt: SessionEdges = {
+			byId: new Map<EdgeId, Edge>(),
+			outgoing: new Map<ThoughtId, Edge[]>(),
+			incoming: new Map<ThoughtId, Edge[]>(),
+		};
+		for (const edge of retainedEdges) {
+			rebuilt.byId.set(edge.id, edge);
+			this._insertSorted(rebuilt.outgoing, edge.from, edge);
+			this._insertSorted(rebuilt.incoming, edge.to, edge);
+		}
+		this._sessions.set(sessionId, rebuilt);
+		return removed;
+	}
+
+	/**
 	 * Clear all edges for a specific session. Other sessions are unaffected.
 	 *
 	 * @param sessionId - Session to clear
