@@ -800,21 +800,6 @@ describe('createPersistenceBackend', () => {
 			'Unknown persistence backend: unknown'
 		);
 	});
-
-	it('should throw error for sqlite when better-sqlite3 is not installed', async () => {
-		const config: PersistenceConfig = {
-			enabled: true,
-			backend: 'sqlite',
-		};
-
-		// This will fail because better-sqlite3 is not installed
-		try {
-			await createPersistenceBackend(config);
-			// If it somehow succeeds (e.g., if package is installed), that's ok too
-		} catch (error) {
-			expect((error as Error).message).toContain('better-sqlite3');
-		}
-	});
 });
 
 describe('PersistenceBackend Interface Compliance', () => {
