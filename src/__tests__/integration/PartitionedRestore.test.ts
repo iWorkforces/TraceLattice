@@ -376,6 +376,99 @@ describe('Task 10 partitioned startup restore', () => {
 		expect(persistence.calls.filter((call) => call.startsWith('delete-'))).toEqual([]);
 	});
 
+	it('reconciles every excluded durable branch at the next accepted mutation', async () => {
+		// Given
+		const persistence = new MemoryPersistence();
+		const sessionId = asSessionId('stale-resurrection');
+		const branchA = asBranchId('a');
+		const branchB = asBranchId('b');
+		const replacement = asBranchId('A');
+		await persistence.saveBranchForSession(sessionId, branchA, [
+			thought(sessionId, 1, { branch_id: branchA }),
+		]);
+		await persistence.saveBranchForSession(sessionId, branchB, [
+			thought(sessionId, 2, { branch_id: branchB }),
+		]);
+		const history = manager(persistence, { maxBranches: 1 });
+		await history.loadFromPersistence();
+		expect(history.getBranchIds(sessionId)).toEqual([branchB]);
+
+		// When
+		history.addThought(
+			thought(sessionId, 3, {
+				branch_from_thought: 2,
+				branch_id: replacement,
+			})
+		);
+		await history._flushBuffer();
+
+		// Then
+		expect(await persistence.listBranchesForSession(sessionId)).toEqual([replacement]);
+		const restarted = manager(persistence, { maxBranches: 1 });
+		await restarted.loadFromPersistence();
+		expect(restarted.getBranchIds(sessionId)).toEqual([replacement]);
+	});
+
+	it('reconciles excluded durable branches at an explicit drain after read-only restore', async () => {
+		// Given
+		const persistence = new RecordingPersistence();
+		const sessionId = asSessionId('read-only-drain');
+		const branchA = asBranchId('a');
+		const branchB = asBranchId('b');
+		await persistence.saveBranchForSession(sessionId, branchA, [
+			thought(sessionId, 1, { branch_id: branchA }),
+		]);
+		await persistence.saveBranchForSession(sessionId, branchB, [
+			thought(sessionId, 2, { branch_id: branchB }),
+		]);
+		persistence.calls.length = 0;
+		const history = manager(persistence, { maxBranches: 1 });
+		await history.loadFromPersistence();
+		expect(
+			persistence.calls.filter(
+				(call) => call.startsWith('save-branch:') || call.startsWith('delete-branch:')
+			)
+		).toEqual([]);
+
+		// When
+		await history.drainSession(sessionId);
+
+		// Then
+		expect(
+			persistence.calls.filter(
+				(call) => call.startsWith('save-branch:') || call.startsWith('delete-branch:')
+			)
+		).toEqual([`save-branch:${sessionId}:${branchB}`, `delete-branch:${sessionId}:${branchA}`]);
+		expect(await persistence.listBranchesForSession(sessionId)).toEqual([branchB]);
+	});
+
+	it('preserves a retained empty snapshot while deleting an excluded nonempty branch', async () => {
+		// Given
+		const persistence = new RecordingPersistence();
+		const sessionId = asSessionId('retained-empty');
+		const excluded = asBranchId('a');
+		const retained = asBranchId('b');
+		await persistence.saveBranchForSession(sessionId, excluded, [
+			thought(sessionId, 1, { branch_id: excluded }),
+		]);
+		await persistence.saveBranchForSession(sessionId, retained, []);
+		persistence.calls.length = 0;
+		const history = manager(persistence, { maxBranches: 1 });
+		await history.loadFromPersistence();
+
+		// When
+		await history.drainSession(sessionId);
+
+		// Then
+		expect(
+			persistence.calls.filter(
+				(call) => call.startsWith('save-branch:') || call.startsWith('delete-branch:')
+			)
+		).toEqual([`save-branch:${sessionId}:${retained}`, `delete-branch:${sessionId}:${excluded}`]);
+		expect(await persistence.loadBranchForSession(sessionId, retained)).toEqual([]);
+		expect(await persistence.loadBranchForSession(sessionId, excluded)).toBeUndefined();
+	});
+
 	it('drops a restored edge with a missing source without mutating persistence', async () => {
 		// Given
 		const persistence = new RecordingPersistence();

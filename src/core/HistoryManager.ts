@@ -64,6 +64,7 @@ interface SessionState {
 	writeBuffer: ThoughtData[];
 	lastAccessedAt: number;
 	branchIdentities: Set<BranchId>;
+	pendingRestoreBranchDeletes: Set<BranchId>;
 	/** Owner identifier set on first owner-aware access. Immutable thereafter. */
 	owner?: string;
 	/** Non-persisted startup provenance used to block unverified network ownership. */
@@ -231,6 +232,7 @@ export class HistoryManager implements IHistoryManager {
 
 	/** @internal Public for backward-compatible test coupling. */
 	public _flushBuffer(): Promise<void> {
+		this._stageAllRestoreBranchReconciliation();
 		return this._persistenceBuffer?.flush() ?? Promise.resolve();
 	}
 
@@ -241,6 +243,8 @@ export class HistoryManager implements IHistoryManager {
 	 * @returns A promise that settles when the session's accepted work settles.
 	 */
 	public drainSession(sessionId: SessionId): Promise<void> {
+		const session = this._sessions.get(sessionId);
+		if (session !== undefined) this._stageRestoreBranchReconciliation(sessionId, session);
 		return this._persistenceBuffer?.drainSession(sessionId) ?? Promise.resolve();
 	}
 
@@ -251,9 +255,11 @@ export class HistoryManager implements IHistoryManager {
 	 * @param summaries - Complete current summary snapshot for the session.
 	 */
 	public bufferSummaries(sessionId: SessionId, summaries: readonly Summary[]): void {
-		this._lifecycle.runMutation(sessionId, () =>
-			this._persistenceBuffer?.bufferSummaries(sessionId, summaries)
-		);
+		this._lifecycle.runMutation(sessionId, () => {
+			this._persistenceBuffer?.bufferSummaries(sessionId, summaries);
+			const session = this._sessions.get(sessionId);
+			if (session !== undefined) this._stageRestoreBranchReconciliation(sessionId, session);
+		});
 	}
 
 	/** EdgeStore instance, if configured. Used by ThoughtProcessor for StrategyContext. */
@@ -371,6 +377,8 @@ export class HistoryManager implements IHistoryManager {
 				this._removeLiveSession(sessionId);
 				return;
 			}
+			const session = this._sessions.get(sessionId);
+			if (session !== undefined) this._stageRestoreBranchReconciliation(sessionId, session);
 			await this._persistenceBuffer.withSessionEvictionBarrier(sessionId, async () => {
 				this._removeLiveSession(sessionId);
 			});
@@ -395,6 +403,7 @@ export class HistoryManager implements IHistoryManager {
 			writeBuffer: [],
 			lastAccessedAt: Date.now(),
 			branchIdentities: new Set<BranchId>(),
+			pendingRestoreBranchDeletes: new Set<BranchId>(),
 			owner,
 			provenance,
 		};
@@ -555,15 +564,45 @@ export class HistoryManager implements IHistoryManager {
 		const buffer = this._persistenceBuffer;
 		if (buffer === null) return;
 		buffer.bufferThought(sessionId, thought);
-		if (thought.branch_id !== undefined || evictedBranchIds.length > 0) {
-			for (const [branchId, branch] of Object.entries(session.branches)) {
-				buffer.bufferBranch(sessionId, branchId as BranchId, branch);
-			}
-			for (const branchId of evictedBranchIds) buffer.deleteBranch(sessionId, branchId);
+		if (
+			thought.branch_id !== undefined ||
+			evictedBranchIds.length > 0 ||
+			session.pendingRestoreBranchDeletes.size > 0
+		) {
+			this._stageBranchPersistence(sessionId, session, evictedBranchIds);
 		}
 		if (this._edgeStore !== undefined && (edgeAdded || prunedEdges > 0)) {
 			buffer.bufferEdges(sessionId, this._edgeStore.edgesForSession(sessionId));
 		}
+	}
+
+	private _stageAllRestoreBranchReconciliation(): void {
+		for (const [sessionId, session] of this._sessions) {
+			this._stageRestoreBranchReconciliation(sessionId, session);
+		}
+	}
+
+	private _stageRestoreBranchReconciliation(sessionId: SessionId, session: SessionState): void {
+		if (session.pendingRestoreBranchDeletes.size === 0) return;
+		this._stageBranchPersistence(sessionId, session, []);
+	}
+
+	private _stageBranchPersistence(
+		sessionId: SessionId,
+		session: SessionState,
+		ordinaryDeletes: readonly BranchId[]
+	): void {
+		const buffer = this._persistenceBuffer;
+		if (buffer === null) return;
+		for (const branchId of session.branchIdentities) {
+			const branch = session.branches[branchId];
+			if (branch !== undefined) buffer.bufferBranch(sessionId, branchId, branch);
+		}
+		const branchIdsToDelete = new Set([...session.pendingRestoreBranchDeletes, ...ordinaryDeletes]);
+		for (const branchId of branchIdsToDelete) {
+			if (session.branches[branchId] === undefined) buffer.deleteBranch(sessionId, branchId);
+		}
+		session.pendingRestoreBranchDeletes.clear();
 	}
 
 	/** Marks the thought as retracted within the session (append-only). */
@@ -702,9 +741,18 @@ export class HistoryManager implements IHistoryManager {
 				throw new ValidationError('branch_id', `Branch already exists: ${branchId}`);
 			}
 			session.branchIdentities.add(branchId);
-			this._cleanupSessionBranches(session);
+			const evictedBranchIds = this._cleanupSessionBranches(session);
 			this._rebuildReferenceIndex(canonicalSessionId, session);
-			this._pruneUnretainedEdges(canonicalSessionId, session);
+			const prunedEdges = this._pruneUnretainedEdges(canonicalSessionId, session);
+			if (evictedBranchIds.length > 0 || session.pendingRestoreBranchDeletes.size > 0) {
+				this._stageBranchPersistence(canonicalSessionId, session, evictedBranchIds);
+			}
+			if (this._edgeStore !== undefined && prunedEdges > 0) {
+				this._persistenceBuffer?.bufferEdges(
+					canonicalSessionId,
+					this._edgeStore.edgesForSession(canonicalSessionId)
+				);
+			}
 			this.log('Registered branch', { branchId, sessionId: sessionId ?? null });
 		});
 	}
@@ -818,8 +866,11 @@ export class HistoryManager implements IHistoryManager {
 			if (session.availableMcpTools !== undefined && session.availableSkills !== undefined) break;
 		}
 		session.thought_history = restored.history.slice(-this._maxHistorySize);
-		const retainedBranches =
-			this._maxBranches === 0 ? [] : restored.branches.slice(-this._maxBranches);
+		const retainedStart = Math.max(0, restored.branches.length - this._maxBranches);
+		const retainedBranches = restored.branches.slice(retainedStart);
+		for (const branch of restored.branches.slice(0, retainedStart)) {
+			session.pendingRestoreBranchDeletes.add(branch.branchId);
+		}
 		for (const branch of retainedBranches) {
 			session.branchIdentities.add(branch.branchId);
 			session.branches[branch.branchId] = branch.thoughts.slice(-this._maxBranchSize);
