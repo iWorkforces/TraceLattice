@@ -1,9 +1,14 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { access, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
+import {
+	PackedCliError,
+	appendCleanupDiagnostics,
+	removeTemporaryRoots,
+} from './packed-cli-cleanup.mjs';
 
 const [COMMAND_TIMEOUT_MS, FORCE_CLOSE_MS] = [120_000, 5_000];
 const REQUIRED_FILES = [
@@ -12,16 +17,6 @@ const REQUIRED_FILES = [
 	['dist/lib.d.ts', 'PACKED_EXPORT_MISSING', '. types'],
 	['package.json', 'PACKED_EXPORT_MISSING', './package.json'],
 ];
-
-export class PackedCliError extends Error {
-	constructor(code, message, stage = {}) {
-		super(message);
-		this.name = 'PackedCliError';
-		this.code = code;
-		this.packSucceeded = stage.packSucceeded === true;
-		this.installSucceeded = stage.installSucceeded === true;
-	}
-}
 
 function fail(code, message, stage) {
 	throw new PackedCliError(code, message, stage);
@@ -247,15 +242,19 @@ export async function inspectPackedPackage(packageDirectory) {
 			checks: { shebang: '#!/usr/bin/env bun', executable: true },
 		};
 	} catch (error) {
-		await cleanupPackedPackage({ packRoot, consumerRoot });
-		if (error instanceof PackedCliError) throw error;
-		throw new PackedCliError('PACKED_ARTIFACT_INVALID', String(error), stage);
+		const primary =
+			error instanceof PackedCliError
+				? error
+				: new PackedCliError('PACKED_ARTIFACT_INVALID', String(error), stage);
+		const cleanupErrors = await removeTemporaryRoots([packRoot, consumerRoot]);
+		throw appendCleanupDiagnostics(primary, cleanupErrors);
 	}
 }
 
 export async function cleanupPackedPackage(artifact) {
-	await Promise.all([
-		rm(artifact.packRoot, { recursive: true, force: true }),
-		rm(artifact.consumerRoot, { recursive: true, force: true }),
-	]);
+	const cleanupErrors = await removeTemporaryRoots([artifact.packRoot, artifact.consumerRoot]);
+	if (cleanupErrors.length === 0) return;
+	const stage = { packSucceeded: true, installSucceeded: true };
+	const primary = new PackedCliError('PACKED_CLEANUP_FAILED', 'package cleanup failed', stage);
+	throw appendCleanupDiagnostics(primary, cleanupErrors);
 }

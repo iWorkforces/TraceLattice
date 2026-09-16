@@ -2,23 +2,11 @@
 import { copyFile, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import {
-	PackedCliError,
-	cleanupPackedPackage,
-	inspectPackedPackage,
-} from './packed-cli-package.mjs';
+import { PackedCliError, appendCleanupDiagnostics } from './packed-cli-cleanup.mjs';
+import { cleanupPackedPackage, inspectPackedPackage } from './packed-cli-package.mjs';
 import { verifyPackedRuntime } from './packed-cli-runtime.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-
-export function appendCleanupDiagnostics(primary, cleanupErrors) {
-	if (cleanupErrors.length === 0) return primary;
-	const diagnostics = cleanupErrors.map((error) => String(error)).join(' | ');
-	return new PackedCliError(primary.code, `${primary.message}; cleanup failures: ${diagnostics}`, {
-		packSucceeded: primary.packSucceeded,
-		installSucceeded: primary.installSucceeded,
-	});
-}
 
 function parseArguments(args) {
 	if (args.length === 0) return repositoryRoot;

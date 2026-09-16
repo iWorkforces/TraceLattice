@@ -1,5 +1,5 @@
-import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,8 +14,7 @@ type FixtureCase = {
 type ProcessResult = { readonly code: number | null; readonly stderr: string };
 
 const verifier = fileURLToPath(new URL('../../../scripts/verify-packed-cli.mjs', import.meta.url));
-const verifierUrl = new URL('../../../scripts/verify-packed-cli.mjs', import.meta.url).href;
-const packageModuleUrl = new URL('../../../scripts/packed-cli-package.mjs', import.meta.url).href;
+const cleanupModuleUrl = new URL('../../../scripts/packed-cli-cleanup.mjs', import.meta.url).href;
 const temporaryRoots: string[] = [];
 const cliBody = `#!/usr/bin/env bun
 import { createInterface } from 'node:readline';
@@ -164,8 +163,11 @@ async function createFixture(fixtureCase: FixtureCase): Promise<string> {
 	return root;
 }
 
-async function runVerifier(packageDirectory: string): Promise<ProcessResult> {
-	const child = spawn(process.execPath, [verifier, '--package-dir', packageDirectory], {
+async function runVerifier(packageDirectory: string, loader?: string): Promise<ProcessResult> {
+	const nodeArguments = loader
+		? ['--experimental-loader', loader, verifier, '--package-dir', packageDirectory]
+		: [verifier, '--package-dir', packageDirectory];
+	const child = spawn(process.execPath, nodeArguments, {
 		stdio: ['ignore', 'ignore', 'pipe'],
 	});
 	let stderr = '';
@@ -205,26 +207,58 @@ describe('packed CLI artifact contract', () => {
 		120_000
 	);
 
-	it('preserves the semantic failure when cleanup also fails', () => {
+	it('preserves the semantic failure when package inspection cleanup also fails', async () => {
 		// Given
-		const probe = `
-			import { appendCleanupDiagnostics } from ${JSON.stringify(verifierUrl)};
-			import { PackedCliError } from ${JSON.stringify(packageModuleUrl)};
-			const primary = new PackedCliError('PACKED_EXPORT_MISSING', '. import', { packSucceeded: true, installSucceeded: true });
-			const result = appendCleanupDiagnostics(primary, [new Error('rm denied')]);
-			console.log(JSON.stringify({ code: result.code, message: result.message, pack: result.packSucceeded, install: result.installSucceeded }));
-		`;
+		const missingImport = cases.find((fixtureCase) => fixtureCase.label === 'missing root import');
+		if (!missingImport) throw new Error('missing root import fixture case is required');
+		const packageDirectory = await createFixture(missingImport);
+		const loaderRoot = await mkdtemp(join(tmpdir(), 'tracelattice-cleanup-loader-'));
+		temporaryRoots.push(loaderRoot);
+		const loader = join(loaderRoot, 'cleanup-failure-loader.mjs');
+		await writeFile(
+			loader,
+			`const cleanupModuleUrl = ${JSON.stringify(cleanupModuleUrl)};
+export async function resolve(specifier, context, nextResolve) {
+  if (specifier === 'node:fs/promises' && context.parentURL === cleanupModuleUrl) {
+    return { url: 'cleanup-failure:fs-promises', shortCircuit: true };
+  }
+  return nextResolve(specifier, context);
+}
+export async function load(url, context, nextLoad) {
+  if (url !== 'cleanup-failure:fs-promises') return nextLoad(url, context);
+  return {
+    format: 'module',
+    shortCircuit: true,
+    source: \`import * as fs from 'node:fs/promises';
+import { basename } from 'node:path';
+export const { access, mkdtemp, readFile, readdir, writeFile } = fs;
+let rejected = false;
+export async function rm(path, options) {
+  if (!rejected && typeof path === 'string' && basename(path).startsWith('tracelattice-consumer-')) {
+    rejected = true;
+    await fs.rm(path, options);
+    throw new Error('injected consumer cleanup rejection');
+  }
+  return fs.rm(path, options);
+}\`,
+  };
+}
+`
+		);
+		const before = new Set(
+			(await readdir(tmpdir())).filter((entry) => /^tracelattice-(?:pack|consumer)-/.test(entry))
+		);
 		// When
-		const result = spawnSync(process.execPath, ['--input-type=module', '--eval', probe], {
-			encoding: 'utf8',
-		});
+		const result = await runVerifier(packageDirectory, loader);
 		// Then
-		expect(result.status).toBe(0);
-		expect(JSON.parse(result.stdout)).toEqual({
-			code: 'PACKED_EXPORT_MISSING',
-			message: '. import; cleanup failures: Error: rm denied',
-			pack: true,
-			install: true,
-		});
-	});
+		expect(result.code).not.toBe(0);
+		expect(result.stderr).toContain('PACKED_EXPORT_MISSING: . import');
+		expect(result.stderr).toContain('injected consumer cleanup rejection');
+		expect(result.stderr).toContain('PACK_SUCCEEDED=true');
+		expect(result.stderr).toContain('INSTALL_SUCCEEDED=true');
+		const leaked = (await readdir(tmpdir())).filter(
+			(entry) => /^tracelattice-(?:pack|consumer)-/.test(entry) && !before.has(entry)
+		);
+		expect(leaked).toEqual([]);
+	}, 120_000);
 });
