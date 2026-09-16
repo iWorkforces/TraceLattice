@@ -58,6 +58,7 @@ export const ERROR_CODES = {
 	DUPLICATE_SUMMARY: 'DUPLICATE_SUMMARY',
 	UNKNOWN_TOOL: 'UNKNOWN_TOOL',
 	LOCK_TIMEOUT: 'LOCK_TIMEOUT',
+	CLI_SHUTDOWN_TIMEOUT: 'CLI_SHUTDOWN_TIMEOUT',
 	SESSION_ACCESS_DENIED: 'SESSION_ACCESS_DENIED',
 	SESSION_LIFECYCLE_CLOSED: 'SESSION_LIFECYCLE_CLOSED',
 	PERSISTENCE_OWNERSHIP: 'PERSISTENCE_OWNERSHIP',
@@ -829,6 +830,17 @@ export class LockTimeoutError extends SequentialThinkingError {
 		super(`Lock timeout for session '${sessionId}' after ${timeoutMs}ms`, ERROR_CODES.LOCK_TIMEOUT);
 		this.name = 'LockTimeoutError';
 		this.sessionId = sessionId;
+		this.timeoutMs = timeoutMs;
+	}
+}
+
+/** Error thrown when the CLI's complete shutdown exceeds its outer deadline. */
+export class CliShutdownTimeoutError extends SequentialThinkingError {
+	public readonly timeoutMs: number;
+
+	constructor(timeoutMs: number) {
+		super(`CLI shutdown timed out after ${timeoutMs}ms`, ERROR_CODES.CLI_SHUTDOWN_TIMEOUT);
+		this.name = 'CliShutdownTimeoutError';
 		this.timeoutMs = timeoutMs;
 	}
 }
