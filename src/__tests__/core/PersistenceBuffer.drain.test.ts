@@ -47,6 +47,11 @@ interface BranchWrite {
 	readonly thoughts: readonly ThoughtData[];
 }
 
+interface BranchDelete {
+	readonly sessionId: SessionId | undefined;
+	readonly branchId: BranchId;
+}
+
 interface SnapshotWrite<T> {
 	readonly sessionId: SessionId;
 	readonly snapshot: readonly T[];
@@ -55,6 +60,7 @@ interface SnapshotWrite<T> {
 interface PersistenceHandlers {
 	readonly thought?: (write: ThoughtWrite) => Promise<void>;
 	readonly branch?: (write: BranchWrite) => Promise<void>;
+	readonly branchDelete?: (write: BranchDelete) => Promise<void>;
 	readonly edges?: (write: SnapshotWrite<Edge>) => Promise<void>;
 	readonly summaries?: (write: SnapshotWrite<Summary>) => Promise<void>;
 	readonly clearSession?: (sessionId: SessionId) => Promise<void>;
@@ -77,6 +83,7 @@ class CoordinatorFault extends Error {
 class RecordingPersistence implements SessionScopedPersistenceBackend {
 	public readonly thoughtWrites: ThoughtWrite[] = [];
 	public readonly branchWrites: BranchWrite[] = [];
+	public readonly branchDeletes: BranchDelete[] = [];
 	public readonly edgeWrites: SnapshotWrite<Edge>[] = [];
 	public readonly summaryWrites: SnapshotWrite<Summary>[] = [];
 	public readonly legacyThoughts: ThoughtData[] = [];
@@ -124,6 +131,18 @@ class RecordingPersistence implements SessionScopedPersistenceBackend {
 		this.scopedBranches.push(write);
 		this.branchWrites.push(write);
 		await this._handlers.branch?.(write);
+	}
+
+	public async deleteBranch(branchId: BranchId): Promise<void> {
+		const write = { sessionId: undefined, branchId };
+		this.branchDeletes.push(write);
+		await this._handlers.branchDelete?.(write);
+	}
+
+	public async deleteBranchForSession(sessionId: SessionId, branchId: BranchId): Promise<void> {
+		const write = { sessionId, branchId };
+		this.branchDeletes.push(write);
+		await this._handlers.branchDelete?.(write);
 	}
 
 	public async loadBranch(_branchId: BranchId): Promise<ThoughtData[] | undefined> {
@@ -277,6 +296,14 @@ function acceptBranch(
 	thoughts: readonly ThoughtData[]
 ): void {
 	buffer.bufferBranch(sessionId, branchId, thoughts);
+}
+
+function acceptBranchDelete(
+	buffer: PersistenceBuffer<BufferedSession>,
+	sessionId: SessionId,
+	branchId: BranchId
+): void {
+	buffer.deleteBranch(sessionId, branchId);
 }
 
 function acceptEdges(harness: Harness, sessionId: SessionId, edges: readonly Edge[]): void {
@@ -712,6 +739,67 @@ describe('PersistenceBuffer auxiliary-only work', () => {
 });
 
 describe('PersistenceBuffer versioned auxiliary acknowledgements', () => {
+	it('coalesces save then delete at one branch coordinate with the delete as last write', () => {
+		const sessionId = asSessionId('branch-delete-coalesce');
+		const branchId = asBranchId('branch');
+		const queue = new PersistenceWorkQueue();
+		const save = queue.replaceBranch(sessionId, branchId, [createTestThought()]);
+		const deletion = queue.deleteBranch(sessionId, branchId);
+		const selected = new Set<string>();
+
+		expect(queue.nextEligibleWork(selected, 'explicit')).toEqual(deletion);
+		expect(deletion).toMatchObject({ operation: 'delete', version: 2 });
+		queue.acknowledgeSuccess(save);
+		expect(queue.pendingWorkCount).toBe(1);
+	});
+
+	it('writes an in-flight branch save before the accepted delete in the same generation', async () => {
+		const sessionId = asSessionId('branch-delete-in-flight');
+		const branchId = asBranchId('branch');
+		const saveGate = createDeferred();
+		const events: string[] = [];
+		const persistence = new RecordingPersistence({
+			branch: async () => {
+				events.push('save');
+				await saveGate.promise;
+			},
+			branchDelete: async () => {
+				events.push('delete');
+			},
+		});
+		const harness = createHarness({ persistence });
+		acceptBranch(harness.buffer, sessionId, branchId, [createTestThought()]);
+		const draining = drain(harness.buffer);
+		await flushMicrotasks();
+
+		acceptBranchDelete(harness.buffer, sessionId, branchId);
+		saveGate.resolve();
+		await draining;
+
+		expect(events).toEqual(['save', 'delete']);
+	});
+
+	it('retains an attributable branch deletion failure for an explicit retry', async () => {
+		const sessionId = asSessionId('branch-delete-failure');
+		const branchId = asBranchId('branch');
+		let fail = true;
+		const persistence = new RecordingPersistence({
+			branchDelete: async () => {
+				if (fail) throw new ExpectedWriteError('delete failed');
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		acceptBranchDelete(harness.buffer, sessionId, branchId);
+
+		await expect(drain(harness.buffer)).rejects.toMatchObject({
+			failures: [expect.objectContaining({ kind: 'branch', key: branchId, version: 1 })],
+		});
+		fail = false;
+		await drain(harness.buffer);
+
+		expect(persistence.branchDeletes).toHaveLength(2);
+	});
+
 	it('does not let stale v1 success clear v2 and writes v2 in the same generation', async () => {
 		// Given
 		const sessionId = asSessionId('edge-version-success');
@@ -1350,5 +1438,198 @@ describe('PersistenceBuffer background joiner regression', () => {
 		expect(outcome.status).toBe('rejected');
 		expect(persistence.thoughtWrites.map((write) => write.thought.thought_number)).toEqual([1, 2]);
 		expect(events).toHaveLength(1);
+	});
+});
+
+describe('PersistenceBuffer eviction state and barrier', () => {
+	it('reports pending, barrier, and quiescent states around accepted work and cleanup', async () => {
+		// Given
+		const sessionId = asSessionId('eviction-state');
+		const writeGate = createDeferred();
+		const callbackGate = createDeferred();
+		const persistence = new RecordingPersistence({ thought: async () => writeGate.promise });
+		const harness = createHarness({ persistence });
+		acceptThought(harness, sessionId, 1);
+		expect(harness.buffer.sessionEvictionState(sessionId)).toBe('pending');
+
+		// When
+		const barrier = harness.buffer.withSessionEvictionBarrier(sessionId, async () => {
+			await callbackGate.promise;
+		});
+
+		// Then
+		expect(harness.buffer.sessionEvictionState(sessionId)).toBe('barrier');
+		writeGate.resolve();
+		await flushMicrotasks();
+		expect(harness.buffer.sessionEvictionState(sessionId)).toBe('barrier');
+		callbackGate.resolve();
+		await barrier;
+		expect(harness.buffer.sessionEvictionState(sessionId)).toBe('quiescent');
+	});
+
+	it('retains failed work and quarantine until one later explicit eviction retry succeeds', async () => {
+		// Given
+		const sessionId = asSessionId('eviction-failure');
+		let writeFails = true;
+		const persistence = new RecordingPersistence({
+			thought: async () => {
+				if (writeFails) throw new ExpectedWriteError('retained failure');
+			},
+		});
+		const harness = createHarness({ persistence, maxRetries: 0 });
+		acceptThought(harness, sessionId, 1);
+		const cleanup = vi.fn(async () => undefined);
+
+		// When
+		const first = await settle(harness.buffer.withSessionEvictionBarrier(sessionId, cleanup));
+
+		// Then
+		expect(first.status).toBe('rejected');
+		expect(cleanup).not.toHaveBeenCalled();
+		expect(harness.buffer.sessionEvictionState(sessionId)).toBe('failed');
+		expect(() => acceptThought(harness, sessionId, 2)).toThrow(
+			expect.objectContaining({ name: 'PersistenceSessionAdmissionClosedError' })
+		);
+
+		writeFails = false;
+		await harness.buffer.withSessionEvictionBarrier(sessionId, cleanup);
+		expect(cleanup).toHaveBeenCalledOnce();
+		expect(persistence.thoughtWrites).toHaveLength(2);
+		expect(harness.buffer.sessionEvictionState(sessionId)).toBe('quiescent');
+	});
+
+	it('quarantines callback failure and clears it after a successful explicit retry', async () => {
+		// Given
+		const sessionId = asSessionId('callback-failure');
+		const harness = createHarness({ persistence: new RecordingPersistence() });
+		const failure = new ExpectedWriteError('cleanup failed');
+
+		// When
+		const first = await settle(
+			harness.buffer.withSessionEvictionBarrier(sessionId, async () => Promise.reject(failure))
+		);
+
+		// Then
+		expect(first).toEqual({ status: 'rejected', reason: failure });
+		expect(harness.buffer.sessionEvictionState(sessionId)).toBe('failed');
+		await harness.buffer.withSessionEvictionBarrier(sessionId, async () => undefined);
+		expect(harness.buffer.sessionEvictionState(sessionId)).toBe('quiescent');
+	});
+
+	it('rejects same-chain eviction barrier reentrancy before joining its own tail', async () => {
+		// Given
+		const sessionId = asSessionId('eviction-reentrant');
+		const harness = createHarness({ persistence: new RecordingPersistence() });
+		let nestedEntered = false;
+
+		// When
+		const result = harness.buffer.withSessionEvictionBarrier(sessionId, async () =>
+			harness.buffer.withSessionEvictionBarrier(sessionId, async () => {
+				nestedEntered = true;
+			})
+		);
+
+		// Then
+		await expect(result).rejects.toBeInstanceOf(PersistenceSessionBarrierReentrancyError);
+		expect(nestedEntered).toBe(false);
+	});
+
+	it('forgets only quiescent queue coordinates and never discards accepted work', () => {
+		// Given
+		const sessionId = asSessionId('coordinate-cleanup');
+		const queue = new PersistenceWorkQueue();
+		const first = queue.replaceEdges(sessionId, [edge(sessionId, 'first', 1)]);
+
+		// When
+		const pendingForgotten = queue.forgetQuiescentSession(sessionId);
+		queue.acknowledgeSuccess(first);
+		const quiescentForgotten = queue.forgetQuiescentSession(sessionId);
+		const next = queue.replaceEdges(sessionId, [edge(sessionId, 'next', 2)]);
+
+		// Then
+		expect(pendingForgotten).toBe(false);
+		expect(quiescentForgotten).toBe(true);
+		expect(next.version).toBe(1);
+		expect(queue.hasSessionWork(sessionId)).toBe(true);
+		expect(queue.hasSessionTerminalFailure(sessionId)).toBe(false);
+	});
+
+	it('successful scoped reset clears a prior eviction quarantine', async () => {
+		// Given
+		const sessionId = asSessionId('eviction-then-reset');
+		const harness = createHarness({ persistence: new RecordingPersistence() });
+		await settle(
+			harness.buffer.withSessionEvictionBarrier(sessionId, async () =>
+				Promise.reject(new ExpectedWriteError('eviction cleanup failed'))
+			)
+		);
+		expect(harness.buffer.sessionEvictionState(sessionId)).toBe('failed');
+
+		// When
+		await harness.buffer.withSessionResetBarrier(sessionId, async () => undefined);
+
+		// Then
+		expect(harness.buffer.sessionEvictionState(sessionId)).toBe('quiescent');
+		expect(() => acceptThought(harness, sessionId, 1)).not.toThrow();
+	});
+
+	it('rejects a new eviction barrier after global reset closes admission', async () => {
+		// Given
+		const sessionId = asSessionId('global-reset-eviction');
+		const harness = createHarness({ persistence: new RecordingPersistence() });
+		const resetGate = createDeferred();
+		const globalReset = harness.buffer.withGlobalResetBarrier(async () => resetGate.promise);
+
+		// When
+		const stateDuringReset = harness.buffer.sessionEvictionState(sessionId);
+		const eviction = harness.buffer.withSessionEvictionBarrier(sessionId, async () => undefined);
+
+		// Then
+		await expect(eviction).rejects.toMatchObject({
+			name: 'PersistenceSessionAdmissionClosedError',
+			sessionId,
+		});
+		expect(stateDuringReset).toBe('barrier');
+		resetGate.resolve();
+		await globalReset;
+	});
+
+	it('attributes work and terminal failure introspection across every queue work kind', () => {
+		// Given
+		const thoughtSession = asSessionId('introspection-thought');
+		const branchSession = asSessionId('introspection-branch');
+		const edgeSession = asSessionId('introspection-edge');
+		const summarySession = asSessionId('introspection-summary');
+		const queue = new PersistenceWorkQueue();
+		const thoughtWork = queue.enqueueThought(
+			thoughtSession,
+			createTestThought({ session_id: thoughtSession })
+		);
+		queue.replaceBranch(branchSession, asBranchId('introspection'), []);
+		queue.replaceEdges(edgeSession, []);
+		queue.replaceSummaries(summarySession, []);
+		queue.acknowledgeFailure(thoughtWork, {
+			kind: 'thought',
+			token: thoughtWork.token,
+			sessionId: thoughtSession,
+			attempts: 1,
+			cause: new ExpectedWriteError('terminal'),
+		});
+
+		// When
+		const states = [thoughtSession, branchSession, edgeSession, summarySession].map(
+			(sessionId) => ({
+				hasWork: queue.hasSessionWork(sessionId),
+				hasFailure: queue.hasSessionTerminalFailure(sessionId),
+			})
+		);
+
+		// Then
+		expect(states).toEqual([
+			{ hasWork: true, hasFailure: true },
+			{ hasWork: true, hasFailure: false },
+			{ hasWork: true, hasFailure: false },
+			{ hasWork: true, hasFailure: false },
+		]);
 	});
 });

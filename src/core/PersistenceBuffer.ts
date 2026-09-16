@@ -34,6 +34,9 @@ export interface PersistenceEventEmitter {
 	emit(event: 'persistenceError', payload: { operation: string; error: Error }): boolean;
 }
 
+/** Observable persistence state relevant to safe in-memory session eviction. */
+export type SessionEvictionState = 'quiescent' | 'pending' | 'failed' | 'barrier';
+
 /** Configuration options for {@link PersistenceBuffer}. */
 export interface PersistenceBufferConfig<S extends BufferedSession> {
 	readonly persistence: PersistenceBackend;
@@ -102,6 +105,7 @@ export class PersistenceBuffer<S extends BufferedSession> {
 	private readonly _sessionBarrierOwnership = new AsyncLocalStorage<ReadonlySet<SessionId>>();
 	private readonly _sessionProgressWaiters = new Map<SessionId, Set<() => void>>();
 	private readonly _quarantinedSessions = new Set<SessionId>();
+	private readonly _evictionQuarantinedSessions = new Set<SessionId>();
 	private _globalResetTail: Promise<void> = Promise.resolve();
 	private _globalResetOwners = 0;
 	private _globalQuarantined = false;
@@ -191,6 +195,15 @@ export class PersistenceBuffer<S extends BufferedSession> {
 	}
 
 	/**
+	 * @param sessionId - Session that owns the branch.
+	 * @param branchId - Stable branch coordinate to delete.
+	 */
+	public deleteBranch(sessionId: SessionId, branchId: BranchId): void {
+		this._assertSessionAdmissionOpen(sessionId);
+		this._queue.deleteBranch(sessionId, branchId);
+	}
+
+	/**
 	 * Accepts the latest edge snapshot for one session.
 	 *
 	 * @param sessionId - Session that owns the edges.
@@ -262,6 +275,80 @@ export class PersistenceBuffer<S extends BufferedSession> {
 			const failures = reason.failures.filter((failure) => failure.sessionId === sessionId);
 			if (failures.length > 0) throw new PersistenceDrainError(failures);
 		});
+	}
+
+	/** Returns queue-derived persistence state for safe session eviction planning. */
+	public sessionEvictionState(sessionId: SessionId): SessionEvictionState {
+		if (this._globalResetOwners > 0 || this._sessionBarriers.has(sessionId)) return 'barrier';
+		if (
+			this._globalQuarantined ||
+			this._queue.hasSessionTerminalFailure(sessionId) ||
+			this._quarantinedSessions.has(sessionId) ||
+			this._evictionQuarantinedSessions.has(sessionId)
+		) {
+			return 'failed';
+		}
+		return this._queue.hasSessionWork(sessionId) ? 'pending' : 'quiescent';
+	}
+
+	/**
+	 * Drains accepted session work before ordinary in-memory eviction cleanup.
+	 *
+	 * Unlike reset barriers, this operation never clears durable state or discards
+	 * accepted work. Failure retains admission quarantine until a later explicit
+	 * invocation successfully drains and completes cleanup.
+	 */
+	public withSessionEvictionBarrier<T>(
+		sessionId: SessionId,
+		operation: () => Promise<T>
+	): Promise<T> {
+		if (
+			this._globalResetOwners > 0 ||
+			this._globalQuarantined ||
+			this._quarantinedSessions.has(sessionId)
+		) {
+			return Promise.reject(new PersistenceSessionAdmissionClosedError(sessionId));
+		}
+		const currentOwnership = this._sessionBarrierOwnership.getStore();
+		if (currentOwnership?.has(sessionId) === true) {
+			return Promise.reject(new PersistenceSessionBarrierReentrancyError(sessionId));
+		}
+		const operationOwnership = new Set(currentOwnership);
+		operationOwnership.add(sessionId);
+		const state = this._sessionBarriers.get(sessionId) ?? {
+			tail: Promise.resolve(),
+			pendingOwners: 0,
+		};
+		this._sessionBarriers.set(sessionId, state);
+		state.pendingOwners += 1;
+
+		const result = state.tail.then(async () => {
+			try {
+				await this._awaitSessionQuiescence(sessionId);
+				const value = await this._sessionBarrierOwnership.run(operationOwnership, operation);
+				this._queue.forgetQuiescentSession(sessionId);
+				this._evictionQuarantinedSessions.delete(sessionId);
+				return value;
+			} catch (error) {
+				this._evictionQuarantinedSessions.add(sessionId);
+				throw error;
+			} finally {
+				state.pendingOwners -= 1;
+				if (state.pendingOwners === 0) this._sessionBarriers.delete(sessionId);
+			}
+		});
+		state.tail = result.then(
+			() => undefined,
+			() => undefined
+		);
+		return result;
+	}
+
+	/** Forgets queue coordinates only when the session is fully quiescent. */
+	public forgetQuiescentSession(sessionId: SessionId): boolean {
+		return this.sessionEvictionState(sessionId) === 'quiescent'
+			? this._queue.forgetQuiescentSession(sessionId)
+			: false;
 	}
 
 	/**
@@ -350,6 +437,7 @@ export class PersistenceBuffer<S extends BufferedSession> {
 				const value = await this._sessionBarrierOwnership.run(operationOwnership, operation);
 				this._queue.discardSession(sessionId);
 				this._quarantinedSessions.delete(sessionId);
+				this._evictionQuarantinedSessions.delete(sessionId);
 				return value;
 			} catch (error) {
 				this._quarantinedSessions.add(sessionId);
@@ -381,6 +469,7 @@ export class PersistenceBuffer<S extends BufferedSession> {
 				const value = await operation();
 				this._queue.discardAll();
 				this._quarantinedSessions.clear();
+				this._evictionQuarantinedSessions.clear();
 				this._globalQuarantined = false;
 				return value;
 			} catch (error) {
@@ -546,7 +635,8 @@ export class PersistenceBuffer<S extends BufferedSession> {
 			this._globalResetOwners > 0 ||
 			this._globalQuarantined ||
 			this._sessionBarriers.has(sessionId) ||
-			this._quarantinedSessions.has(sessionId)
+			this._quarantinedSessions.has(sessionId) ||
+			this._evictionQuarantinedSessions.has(sessionId)
 		) {
 			throw new PersistenceSessionAdmissionClosedError(sessionId);
 		}
