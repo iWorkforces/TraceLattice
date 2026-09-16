@@ -123,11 +123,28 @@ export class SseTransport extends BaseTransport implements ITransport {
 	async connect(mcpServer: McpServer): Promise<void> {
 		this._mcpServer = mcpServer;
 
-		return new Promise((resolve) => {
-			this._server.listen(this._port, this._host, () => {
+		return new Promise((resolve, reject) => {
+			const cleanup = (): void => {
+				this._server.off('error', onError);
+				this._server.off('listening', onListening);
+			};
+			const onError = (error: Error): void => {
+				cleanup();
+				reject(error);
+			};
+			const onListening = (): void => {
+				cleanup();
 				this.log('info', `SSE transport listening on http://${this._host}:${this._port}`);
 				resolve();
-			});
+			};
+			this._server.once('error', onError);
+			this._server.once('listening', onListening);
+			try {
+				this._server.listen(this._port, this._host);
+			} catch (error) {
+				cleanup();
+				reject(error);
+			}
 		});
 	}
 

@@ -11,6 +11,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from 'tmcp';
 import type { GenericSchema } from 'valibot';
+import { CliLifecycle, createCliShutdownHandler } from './CliLifecycle.js';
 import type { ToolAwareSequentialThinkingServer } from './lib.js';
 import { initializeServer } from './lib.js';
 import { ServerConfig } from './ServerConfig.js';
@@ -60,23 +61,28 @@ async function main() {
 	);
 
 	const thinkingServer = await initializeServer();
-
-	if (transportType === 'sse') {
-		await startSseTransport(server, thinkingServer);
-	} else {
-		server.tool(
-			{
-				name: 'sequentialthinking_tools',
-				description: SEQUENTIAL_THINKING_TOOL.description,
-				schema: SequentialThinkingSchema,
-			},
-			async (input) => thinkingServer.processThought(input)
-		);
-		if (transportType === 'streamable-http') {
-			await startStreamableHttpTransport(server, thinkingServer);
+	const lifecycle = new CliLifecycle(thinkingServer);
+	try {
+		if (transportType === 'sse') {
+			await startSseTransport(server, thinkingServer, lifecycle);
 		} else {
-			await startStdioTransport(server, thinkingServer);
+			server.tool(
+				{
+					name: 'sequentialthinking_tools',
+					description: SEQUENTIAL_THINKING_TOOL.description,
+					schema: SequentialThinkingSchema,
+				},
+				async (input) => thinkingServer.processThought(input)
+			);
+			if (transportType === 'streamable-http') {
+				await startStreamableHttpTransport(server, thinkingServer, lifecycle);
+			} else {
+				await startStdioTransport(server, thinkingServer, lifecycle);
+			}
 		}
+		registerShutdownHandlers(lifecycle, thinkingServer, transportType === 'stdio');
+	} catch (error) {
+		await lifecycle.rollbackStartup(error);
 	}
 }
 /**
@@ -84,7 +90,8 @@ async function main() {
  */
 async function startSseTransport(
 	server: McpServer<GenericSchema>,
-	thinkingServer: ToolAwareSequentialThinkingServer
+	thinkingServer: ToolAwareSequentialThinkingServer,
+	lifecycle: CliLifecycle
 ): Promise<void> {
 	const { SseTransport } = await import('./transport/SseTransport.js');
 	const { createConnectionPool } = await import('./pool/ConnectionPool.js');
@@ -106,6 +113,17 @@ async function startSseTransport(
 				},
 			})
 		: undefined;
+	const sseTransport = new SseTransport({
+		port,
+		host,
+		corsOrigin: process.env.CORS_ORIGIN || '*',
+		enableCors: process.env.ENABLE_CORS !== 'false',
+		allowedHosts: process.env.ALLOWED_HOSTS?.split(',').map((hostValue) => hostValue.trim()),
+		metrics: transportMetrics,
+		connectionPool,
+		persistence: thinkingServer.config.persistence,
+	});
+	lifecycle.attachTransport(sseTransport);
 	server.tool(
 		{
 			name: 'sequentialthinking_tools',
@@ -123,23 +141,8 @@ async function startSseTransport(
 			};
 		}
 	);
-	const sseTransport = new SseTransport({
-		port,
-		host,
-		corsOrigin: process.env.CORS_ORIGIN || '*',
-		enableCors: process.env.ENABLE_CORS !== 'false',
-		allowedHosts: process.env.ALLOWED_HOSTS?.split(',').map((hostValue) => hostValue.trim()),
-		metrics: transportMetrics,
-		connectionPool,
-		persistence: thinkingServer.config.persistence,
-	});
 	// Connect the SSE transport
 	await sseTransport.connect(server);
-	const shutdown = async (): Promise<void> => {
-		await sseTransport.stop();
-		await thinkingServer.stop();
-	};
-	registerShutdownHandlers(shutdown);
 	thinkingServer['_logger'].info(
 		`Sequential Thinking MCP Server running on SSE transport at http://${host}:${port}`
 	);
@@ -149,7 +152,8 @@ async function startSseTransport(
  */
 async function startStreamableHttpTransport(
 	server: McpServer,
-	thinkingServer: ToolAwareSequentialThinkingServer
+	thinkingServer: ToolAwareSequentialThinkingServer,
+	lifecycle: CliLifecycle
 ): Promise<void> {
 	const { StreamableHttpTransport } = await import('./transport/StreamableHttpTransport.js');
 	const port = parseInt(process.env.STREAMABLE_HTTP_PORT || process.env.SSE_PORT || '3000', 10);
@@ -165,13 +169,9 @@ async function startStreamableHttpTransport(
 		metrics: transportMetrics,
 		stateful,
 	});
+	lifecycle.attachTransport(streamableTransport);
 	// Connect the Streamable HTTP transport
 	await streamableTransport.connect(server);
-	const shutdown = async (): Promise<void> => {
-		await streamableTransport.stop();
-		await thinkingServer.stop();
-	};
-	registerShutdownHandlers(shutdown);
 	thinkingServer['_logger'].info(
 		`Sequential Thinking MCP Server running on Streamable HTTP transport at http://${host}:${port}`
 	);
@@ -181,45 +181,56 @@ async function startStreamableHttpTransport(
  */
 async function startStdioTransport(
 	server: McpServer,
-	thinkingServer: ToolAwareSequentialThinkingServer
+	thinkingServer: ToolAwareSequentialThinkingServer,
+	lifecycle: CliLifecycle
 ): Promise<void> {
 	const transport = new StdioTransport(server);
-	transport.listen();
-	const shutdown = async (): Promise<void> => {
-		const forceExit = setTimeout(() => {
-			thinkingServer['_logger'].error('Graceful shutdown timed out after 30s - forcing exit');
-			process.exit(1);
-		}, 30_000).unref(); // 30s timeout, don't keep process alive
-		try {
-			await thinkingServer.stop();
-			clearTimeout(forceExit);
-			process.exit(0);
-		} catch (error) {
-			thinkingServer['_logger'].error('Error during shutdown', {
-				error: getErrorMessage(error),
-			});
-			process.exit(1);
-		}
+	const processListeners = {
+		sigint: new Set(process.listeners('SIGINT')),
+		sigterm: new Set(process.listeners('SIGTERM')),
+		stdinEnd: new Set(process.stdin.listeners('end')),
 	};
-	// Register signal handlers ONCE (fixes double-registration bug)
-	process.once('SIGINT', () => void shutdown());
-	process.once('SIGTERM', () => void shutdown());
+	lifecycle.attachTransport({ stop: () => transport.close() });
+	transport.listen();
+	for (const listener of process.listeners('SIGINT')) {
+		if (!processListeners.sigint.has(listener)) process.off('SIGINT', listener);
+	}
+	for (const listener of process.listeners('SIGTERM')) {
+		if (!processListeners.sigterm.has(listener)) process.off('SIGTERM', listener);
+	}
+	for (const listener of process.stdin.listeners('end')) {
+		if (!processListeners.stdinEnd.has(listener)) process.stdin.off('end', listener);
+	}
 	thinkingServer['_logger'].info('Sequential Thinking MCP Server running on stdio');
 }
 /**
  * Register shutdown signal handlers for a common pattern
  */
-function registerShutdownHandlers(shutdown: () => Promise<void>): void {
-	process.once('SIGINT', () => {
-		shutdown()
-			.then(() => process.exit(0))
-			.catch(() => process.exit(1));
+function registerShutdownHandlers(
+	lifecycle: CliLifecycle,
+	thinkingServer: ToolAwareSequentialThinkingServer,
+	shutdownOnStdinEnd: boolean
+): void {
+	const shutdown = createCliShutdownHandler(lifecycle, {
+		reportFailure: (error) => {
+			thinkingServer['_logger'].error('CLI shutdown failed', failureMetadata(error));
+		},
+		exit: (code) => process.exit(code),
 	});
-	process.once('SIGTERM', () => {
-		shutdown()
-			.then(() => process.exit(0))
-			.catch(() => process.exit(1));
-	});
+	const requestShutdown = (): void => {
+		void shutdown();
+	};
+	process.on('SIGINT', requestShutdown);
+	process.on('SIGTERM', requestShutdown);
+	if (shutdownOnStdinEnd) process.stdin.on('end', requestShutdown);
+}
+
+function failureMetadata(error: unknown): Record<string, unknown> {
+	if (!(error instanceof AggregateError)) return { error: getErrorMessage(error) };
+	return {
+		error: error.message,
+		causes: error.errors.map((cause) => getErrorMessage(cause)),
+	};
 }
 main().catch((error) => {
 	const logger = new StructuredLogger({
@@ -227,8 +238,6 @@ main().catch((error) => {
 		context: 'SequentialThinking',
 		pretty: true,
 	});
-	logger.error('Fatal error running server', {
-		error: getErrorMessage(error),
-	});
+	logger.error('Fatal error running server', failureMetadata(error));
 	process.exit(1);
 });
