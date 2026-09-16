@@ -69,17 +69,27 @@ export class EdgeEmitter {
 	 * - revises: revises_thought → current.id → target.id
 	 * - tool_invocation: stable admission source id → current.id
 	 * - sequence: default chronological link from previous thought (if none of the above)
+	 * @returns True only when at least one edge was added to the store
 	 */
 	public emitEdgesForThought(
 		session: EdgeEmissionSession,
 		thought: ThoughtData,
 		context?: ThoughtAdmissionContext
-	): void {
-		if (!this._edgeStore || !this._dagEdges) return;
-		if (!thought.id) return;
+	): boolean {
+		if (!this._edgeStore || !this._dagEdges) return false;
+		if (!thought.id) return false;
 
 		const sessionId = thought.session_id ?? this._defaultSessionId;
 		const references = context?.resolvedReferences ?? {};
+		const hasRelationalIntent =
+			(thought.branch_from_thought !== undefined && thought.branch_id !== undefined) ||
+			(thought.merge_from_thoughts?.length ?? 0) > 0 ||
+			(thought.verification_target !== undefined &&
+				(thought.thought_type === 'verification' || thought.thought_type === 'critique')) ||
+			(thought.synthesis_sources?.length ?? 0) > 0 ||
+			thought.revises_thought !== undefined ||
+			(thought.thought_type === 'tool_observation' &&
+				context?.toolInvocationSourceThoughtId !== undefined);
 		const emittedRelational = [
 			this._emitBranchEdge(thought, references, sessionId),
 			this._emitMergeEdges(thought, references, sessionId),
@@ -90,9 +100,8 @@ export class EdgeEmitter {
 			this._emitToolInvocationEdge(thought, sessionId, context),
 		].some((emitted) => emitted);
 
-		if (!emittedRelational) {
-			this._emitSequenceEdge(session, thought, sessionId);
-		}
+		if (emittedRelational || hasRelationalIntent) return emittedRelational;
+		return this._emitSequenceEdge(session, thought, sessionId);
 	}
 
 	private _emitBranchEdge(
