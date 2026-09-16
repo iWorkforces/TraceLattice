@@ -240,13 +240,24 @@ export class MockHistoryManager implements IHistoryManager {
 	}
 
 	async resetSession(sessionId: string, clearAuxiliaryState?: () => void): Promise<void> {
+		await this.resetSessionWithinExclusive(asSessionId(sessionId), clearAuxiliaryState);
+	}
+
+	async resetSessionWithinExclusive(
+		sessionId: SessionId,
+		clearAuxiliaryState?: () => void
+	): Promise<void> {
 		this._sessions.delete(sessionId);
-		this._referenceIndex.clearSession(asSessionId(sessionId));
+		this._referenceIndex.clearSession(sessionId);
 		clearAuxiliaryState?.();
 		this._resetCallCount++;
 	}
 
 	async resetAll(clearAuxiliaryState?: () => void): Promise<void> {
+		await this.resetAllWithinExclusive(clearAuxiliaryState);
+	}
+
+	async resetAllWithinExclusive(clearAuxiliaryState?: () => void): Promise<void> {
 		this._sessions.clear();
 		this._referenceIndex.clearAll();
 		clearAuxiliaryState?.();

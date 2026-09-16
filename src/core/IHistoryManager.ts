@@ -122,8 +122,17 @@ export interface IHistoryManager {
 	/** Awaitably clears one authorized live and durable session. */
 	resetSession(sessionId: string, clearAuxiliaryState?: () => void): Promise<void>;
 
+	/** Clears one session while the caller already owns its lifecycle exclusive. */
+	resetSessionWithinExclusive(
+		sessionId: SessionId,
+		clearAuxiliaryState?: () => void
+	): Promise<void>;
+
 	/** Awaitably clears every live and durable session from an ownerless context. */
 	resetAll(clearAuxiliaryState?: () => void): Promise<void>;
+
+	/** Clears every session while the caller already owns the global lifecycle exclusive. */
+	resetAllWithinExclusive(clearAuxiliaryState?: () => void): Promise<void>;
 
 	/** Returns a non-mutating session snapshot without creating or binding state. */
 	inspectSession(sessionId: string): HistorySessionSnapshot;

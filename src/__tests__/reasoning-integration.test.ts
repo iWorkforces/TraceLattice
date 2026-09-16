@@ -84,8 +84,14 @@ class BranchAwareMockHistoryManager implements IHistoryManager {
 	async resetSession(): Promise<void> {
 		this.clear();
 	}
+	async resetSessionWithinExclusive(): Promise<void> {
+		this.clear();
+	}
 
 	async resetAll(): Promise<void> {
+		this.clear();
+	}
+	async resetAllWithinExclusive(): Promise<void> {
 		this.clear();
 	}
 
