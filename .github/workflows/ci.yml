@@ -4,40 +4,102 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 jobs:
-  ci:
+  library:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [26.x, 24.x]
-
+        node-version: [24.x, 26.x]
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
-
       - name: Install dependencies
         run: npm install
+      - name: Verify library
+        run: npm run verify:library
 
-      - name: Type check
-        run: npm run type-check
+  native-sqlite:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Setup Node.js 26.x
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 26.x
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Verify native SQLite
+        run: npm run verify:native
 
-      - name: Lint
-        run: npm run lint
-        continue-on-error: true
-
-      - name: Run tests
-        run: npm test -- --coverage
-
-      - name: Build
+  packed-cli:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Setup Node.js 26.x
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 26.x
+          cache: npm
+      - name: Setup Bun 1.4.2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - name: Assert Bun version
+        run: test "$(bun --version)" = "1.4.2"
+      - name: Install dependencies
+        run: npm install
+      - name: Build package
         run: npm run build
+      - name: Verify packed CLI
+        run: npm run verify:packed
+        env:
+          TRACELATTICE_PACK_OUTPUT_DIR: ${{ runner.temp }}/tracelattice-release
+          TRACELATTICE_SOURCE_SHA: ${{ github.sha }}
+      - name: Upload verified release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tracelattice-release-${{ github.sha }}
+          path: ${{ runner.temp }}/tracelattice-release
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: false
 
-      - name: Security audit
+  required-gates:
+    runs-on: ubuntu-latest
+    needs: [library, native-sqlite, packed-cli]
+    if: always()
+    steps:
+      - name: Require every release gate
+        run: |
+          if [ "${{ needs.library.result }}" != "success" ] ||
+             [ "${{ needs.native-sqlite.result }}" != "success" ] ||
+             [ "${{ needs.packed-cli.result }}" != "success" ]; then
+            exit 1
+          fi
+
+  advisory-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Setup Node.js 26.x
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 26.x
+          cache: npm
+      - name: Install dependencies
+        run: npm install
+      - name: Security audit (advisory)
         run: npm audit --audit-level=high
         continue-on-error: true
