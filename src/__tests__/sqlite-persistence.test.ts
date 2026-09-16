@@ -1094,7 +1094,3 @@ describe('SqlitePersistence stateful structural behavior', () => {
 		expect(database.snapshot()).toEqual(before);
 	});
 });
-
-describe('native SQLite conformance', () => {
-	it.skip('better-sqlite3 unavailable; Task18 approval pending', () => {});
-});

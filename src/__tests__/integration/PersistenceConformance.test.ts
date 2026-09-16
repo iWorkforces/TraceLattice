@@ -481,7 +481,3 @@ describe.each(disabledBranchFixtures)(
 		});
 	}
 );
-
-describe('native SQLite conformance boundary', () => {
-	it.skip('better-sqlite3 unavailable; Task18 approval pending', () => {});
-});
