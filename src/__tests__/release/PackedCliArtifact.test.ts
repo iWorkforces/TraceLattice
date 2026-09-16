@@ -120,6 +120,20 @@ const cases: readonly FixtureCase[] = [
 			manifest.name = 'not-tracelattice';
 		},
 	},
+	{
+		label: 'missing publish files contract',
+		code: 'PACKED_FILES_INVALID',
+		mutate: async (_root, manifest) => {
+			delete manifest.files;
+		},
+	},
+	{
+		label: 'traversing publish file entry',
+		code: 'PACKED_FILES_INVALID',
+		mutate: async (_root, manifest) => {
+			manifest.files = ['dist', 'README.md', 'LICENSE', '../outside'];
+		},
+	},
 ];
 
 async function createFixture(fixtureCase: FixtureCase): Promise<string> {

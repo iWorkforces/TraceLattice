@@ -90,12 +90,13 @@ function parsePackResult(stdout, packRoot, stage) {
 }
 
 function inPackageTarget(packageRoot, target, contract) {
-	if (typeof target !== 'string' || isAbsolute(target))
+	if (typeof target !== 'string' || !target.trim() || isAbsolute(target))
 		fail(contract.code, 'target must be relative', contract.stage);
-	const normalized = normalize(target.replace(/^\.\//, ''));
-	if (normalized === '..' || normalized.startsWith(`..${sep}`)) {
+	if (/^(?:[\\/]|[A-Za-z]:)/.test(target))
+		fail(contract.code, 'target must be relative', contract.stage);
+	if (target.split(/[\\/]+/).includes('..'))
 		fail(contract.code, 'target must remain inside the package', contract.stage);
-	}
+	const normalized = normalize(target.replace(/^\.\//, ''));
 	const absolute = resolve(packageRoot, normalized);
 	if (!absolute.startsWith(`${resolve(packageRoot)}${sep}`)) {
 		fail(contract.code, 'target must remain inside the package', contract.stage);
@@ -109,6 +110,10 @@ function readManifestContract(manifest, context) {
 	if (typeof manifest.version !== 'string' || manifest.version !== packResult.version) {
 		fail('PACKED_VERSION_INVALID', 'pack and installed manifest versions differ', stage);
 	}
+	const files = manifest.files;
+	const filesContract = { code: 'PACKED_FILES_INVALID', stage };
+	if (!Array.isArray(files) || !files.includes('dist')) fail(filesContract.code, 'files', stage);
+	for (const file of files) inPackageTarget(packageRoot, file, filesContract);
 	if (!isRecord(manifest.exports) || !isRecord(manifest.exports['.'])) {
 		fail('PACKED_EXPORT_MISSING', '.', stage);
 	}
@@ -135,16 +140,13 @@ function readManifestContract(manifest, context) {
 		message,
 	}));
 	const binaryPath = inPackageTarget(packageRoot, binTarget, { code: 'PACKED_BIN_INVALID', stage });
-	return { binaryPath, targetContracts };
+	return { binaryPath, targetContracts, files };
 }
 
 async function validateFiles(artifact, stage) {
-	const packedFiles = artifact.result.files;
-	if (!Array.isArray(packedFiles))
-		fail('PACK_RESULT_INVALID', 'packed file list is missing', stage);
-	const fileNames = packedFiles.flatMap((entry) =>
-		isRecord(entry) && typeof entry.path === 'string' ? [entry.path] : []
-	);
+	const files = artifact.result.files;
+	if (!Array.isArray(files)) fail('PACK_RESULT_INVALID', 'packed file list is missing', stage);
+	const fileNames = files.flatMap((entry) => (typeof entry?.path === 'string' ? [entry.path] : []));
 	for (const [path, code, message] of REQUIRED_FILES) {
 		if (!fileNames.includes(path)) fail(code, message, stage);
 	}
@@ -231,6 +233,7 @@ export async function inspectPackedPackage(packageDirectory) {
 			version: manifest.version,
 			packedFiles: files.fileNames,
 			manifest: {
+				files: contract.files,
 				main: manifest.main,
 				types: manifest.types,
 				exports: manifest.exports,
@@ -244,10 +247,7 @@ export async function inspectPackedPackage(packageDirectory) {
 			checks: { shebang: '#!/usr/bin/env bun', executable: true },
 		};
 	} catch (error) {
-		await Promise.all([
-			rm(packRoot, { recursive: true, force: true }),
-			rm(consumerRoot, { recursive: true, force: true }),
-		]);
+		await cleanupPackedPackage({ packRoot, consumerRoot });
 		if (error instanceof PackedCliError) throw error;
 		throw new PackedCliError('PACKED_ARTIFACT_INVALID', String(error), stage);
 	}
