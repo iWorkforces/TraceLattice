@@ -1,354 +1,316 @@
-/**
- * Tests for SessionManager — per-owner LRU + global LRU eviction policy.
- *
- * Covers WU-3.3: per-owner session quota prevents one attacker from churning
- * sessions and evicting legitimate users' sessions.
- */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { describe, it, expect, beforeEach } from 'vitest';
-import { SessionManager, type SessionLike } from '../../core/SessionManager.js';
 import { asSessionId, type SessionId } from '../../contracts/ids.js';
+import { SessionManager, type SessionLike } from '../../core/SessionManager.js';
+import type { Logger } from '../../logger/StructuredLogger.js';
 
 interface TestSession extends SessionLike {
-	id: string;
-	provenance?: 'restored';
+	readonly id: string;
 }
 
-const DEFAULT_ID = '__global__';
+const DEFAULT_ID = asSessionId('__global__');
 
-function makeManager(opts?: {
-	maxSessions?: number;
-	maxSessionsPerOwner?: number;
+function makeLogger(): Logger {
+	return {
+		debug: vi.fn(),
+		info: vi.fn(),
+		warn: vi.fn(),
+		error: vi.fn(),
+		setLevel: vi.fn(),
+		getLevel: () => 'info',
+	};
+}
+
+function makeManager(options?: {
+	readonly maxSessions?: number;
+	readonly maxSessionsPerOwner?: number;
+	readonly logger?: Logger;
 }): SessionManager<TestSession> {
 	return new SessionManager<TestSession>({
 		defaultSessionId: DEFAULT_ID,
 		sessionTtlMs: 60_000,
-		cleanupIntervalMs: 60_000,
-		getMaxSessions: () => opts?.maxSessions ?? 1000,
-		maxSessionsPerOwner: opts?.maxSessionsPerOwner ?? 50,
+		cleanupIntervalMs: 100,
+		getMaxSessions: () => options?.maxSessions ?? 1_000,
+		maxSessionsPerOwner: options?.maxSessionsPerOwner ?? 50,
+		logger: options?.logger,
 	});
 }
 
-function fillSessions(
-	owner: string | undefined,
-	count: number,
-	startTime: number,
-	prefix: string
-): Map<SessionId, TestSession> {
-	const map = new Map<SessionId, TestSession>();
-	for (let i = 0; i < count; i++) {
-		map.set(asSessionId(`${prefix}-${i}`), {
-			id: `${prefix}-${i}`,
-			lastAccessedAt: startTime + i,
-			owner,
-		});
-	}
-	return map;
+function session(id: string, lastAccessedAt: number, owner?: string): TestSession {
+	return { id, lastAccessedAt, owner };
 }
 
-describe('SessionManager — per-owner LRU eviction', () => {
-	let now: number;
+function eligible(): boolean {
+	return true;
+}
 
-	beforeEach(() => {
-		now = Date.now();
-	});
+beforeEach(() => {
+	vi.useFakeTimers();
+});
 
-	it('evicts oldest sessions of an over-quota owner only (own bucket)', () => {
-		const mgr = makeManager({ maxSessions: 1000, maxSessionsPerOwner: 50 });
-		const sessions = new Map<SessionId, TestSession>();
+afterEach(() => {
+	vi.clearAllTimers();
+	vi.useRealTimers();
+});
 
-		// Owner A: 60 sessions (10 over quota)
-		for (let i = 0; i < 60; i++) {
-			sessions.set(asSessionId(`a-${i}`), { id: `a-${i}`, lastAccessedAt: now + i, owner: 'A' });
-		}
-		// Owner B: 30 sessions (under quota)
-		for (let i = 0; i < 30; i++) {
-			sessions.set(asSessionId(`b-${i}`), {
-				id: `b-${i}`,
-				lastAccessedAt: now + 1000 + i,
-				owner: 'B',
-			});
-		}
-
-		mgr.evictExcessSessions(sessions);
-
-		// Owner A: oldest 10 evicted -> a-0..a-9 gone, a-10..a-59 remain (50)
-		for (let i = 0; i < 10; i++) {
-			expect(sessions.has(asSessionId(`a-${i}`))).toBe(false);
-		}
-		for (let i = 10; i < 60; i++) {
-			expect(sessions.has(asSessionId(`a-${i}`))).toBe(true);
-		}
-		// Owner B: untouched
-		for (let i = 0; i < 30; i++) {
-			expect(sessions.has(asSessionId(`b-${i}`))).toBe(true);
-		}
-	});
-
-	it('two owners each filling exactly to quota — neither evicts the other', () => {
-		const mgr = makeManager({ maxSessions: 1000, maxSessionsPerOwner: 5 });
-		const sessions = new Map<SessionId, TestSession>();
-
-		for (let i = 0; i < 5; i++) {
-			sessions.set(asSessionId(`a-${i}`), { id: `a-${i}`, lastAccessedAt: now + i, owner: 'A' });
-			sessions.set(asSessionId(`b-${i}`), {
-				id: `b-${i}`,
-				lastAccessedAt: now + 100 + i,
-				owner: 'B',
-			});
-		}
-
-		mgr.evictExcessSessions(sessions);
-
-		expect(sessions.size).toBe(10);
-		for (let i = 0; i < 5; i++) {
-			expect(sessions.has(asSessionId(`a-${i}`))).toBe(true);
-			expect(sessions.has(asSessionId(`b-${i}`))).toBe(true);
-		}
-	});
-
-	it('owner exceeding quota evicts only own oldest sessions, not other owners', () => {
-		const mgr = makeManager({ maxSessions: 1000, maxSessionsPerOwner: 3 });
-		const sessions = new Map<SessionId, TestSession>();
-
-		// Attacker owner X: 10 sessions (7 over quota)
-		for (let i = 0; i < 10; i++) {
-			sessions.set(asSessionId(`x-${i}`), { id: `x-${i}`, lastAccessedAt: now + i, owner: 'X' });
-		}
-		// Legitimate owner Y: 3 sessions (at quota)
-		for (let i = 0; i < 3; i++) {
-			sessions.set(asSessionId(`y-${i}`), {
-				id: `y-${i}`,
-				lastAccessedAt: now + 50 + i,
-				owner: 'Y',
-			});
-		}
-
-		mgr.evictExcessSessions(sessions);
-
-		// X: oldest 7 gone (x-0..x-6), x-7..x-9 remain
-		for (let i = 0; i < 7; i++) {
-			expect(sessions.has(asSessionId(`x-${i}`))).toBe(false);
-		}
-		for (let i = 7; i < 10; i++) {
-			expect(sessions.has(asSessionId(`x-${i}`))).toBe(true);
-		}
-		// Y: all retained
-		for (let i = 0; i < 3; i++) {
-			expect(sessions.has(asSessionId(`y-${i}`))).toBe(true);
-		}
-	});
-
-	it('sessions without an owner (stdio) are exempt from per-owner quota', () => {
-		const mgr = makeManager({ maxSessions: 1000, maxSessionsPerOwner: 5 });
-		const sessions = fillSessions(undefined, 100, now, 'stdio');
-
-		mgr.evictExcessSessions(sessions);
-
-		// All 100 retained — under global cap (1000), no per-owner cap applied
-		expect(sessions.size).toBe(100);
-	});
-
-	it('global cap still applies and falls back to global LRU', () => {
-		const mgr = makeManager({ maxSessions: 50, maxSessionsPerOwner: 1000 });
-		const sessions = fillSessions(undefined, 60, now, 's');
-
-		mgr.evictExcessSessions(sessions);
-
-		expect(sessions.size).toBe(50);
-		// Oldest 10 evicted
-		for (let i = 0; i < 10; i++) {
-			expect(sessions.has(asSessionId(`s-${i}`))).toBe(false);
-		}
-		for (let i = 10; i < 60; i++) {
-			expect(sessions.has(asSessionId(`s-${i}`))).toBe(true);
-		}
-	});
-
-	it('T10-M01 excludes restored sessions from TTL eviction', () => {
+describe('SessionManager prospective admission planning', () => {
+	it('uses owner victims for both owner and global capacity before global alternatives', () => {
 		// Given
-		const mgr = makeManager({ maxSessions: 1 });
+		const manager = makeManager({ maxSessions: 3, maxSessionsPerOwner: 2 });
 		const sessions = new Map<SessionId, TestSession>([
-			[
-				asSessionId('restored'),
-				{ id: 'restored', lastAccessedAt: now - 120_000, provenance: 'restored' },
-			],
+			[DEFAULT_ID, session('default', 0)],
+			[asSessionId('owner-old'), session('owner-old', 1, 'A')],
+			[asSessionId('owner-new'), session('owner-new', 4, 'A')],
+			[asSessionId('other-old'), session('other-old', 2, 'B')],
 		]);
 
 		// When
-		mgr.cleanupStaleSessions(sessions);
+		const plan = manager.planProspectiveAdmission(sessions, 'A', eligible);
 
 		// Then
-		expect(sessions.has(asSessionId('restored'))).toBe(true);
+		expect(plan).toEqual([asSessionId('owner-old'), asSessionId('other-old')]);
+		expect(sessions).toHaveLength(4);
 	});
 
-	it('T10-M02 excludes restored sessions from per-owner LRU quotas', () => {
+	it('skips a pinned oldest session for the oldest eligible alternative', () => {
 		// Given
-		const mgr = makeManager({ maxSessions: 100, maxSessionsPerOwner: 1 });
+		const manager = makeManager({ maxSessions: 2 });
+		const pinned = asSessionId('pinned-oldest');
+		const alternative = asSessionId('eligible-next');
 		const sessions = new Map<SessionId, TestSession>([
-			[
-				asSessionId('restored'),
-				{ id: 'restored', lastAccessedAt: now, owner: 'A', provenance: 'restored' },
-			],
-			[asSessionId('live-old'), { id: 'live-old', lastAccessedAt: now + 1, owner: 'A' }],
-			[asSessionId('live-new'), { id: 'live-new', lastAccessedAt: now + 2, owner: 'A' }],
+			[pinned, session('pinned-oldest', 1)],
+			[alternative, session('eligible-next', 2)],
 		]);
 
 		// When
-		mgr.evictExcessSessions(sessions);
+		const plan = manager.planProspectiveAdmission(
+			sessions,
+			undefined,
+			(sessionId) => sessionId !== pinned
+		);
 
 		// Then
-		expect([...sessions.keys()]).toEqual([asSessionId('restored'), asSessionId('live-new')]);
+		expect(plan).toEqual([alternative]);
 	});
 
-	it('T10-M03 excludes restored sessions from global LRU while capping live sessions', () => {
+	it('returns no plan and no partial victims when the complete set is infeasible', () => {
 		// Given
-		const mgr = makeManager({ maxSessions: 1, maxSessionsPerOwner: 100 });
+		const manager = makeManager({ maxSessions: 1 });
 		const sessions = new Map<SessionId, TestSession>([
-			[
-				asSessionId('restored-a'),
-				{ id: 'restored-a', lastAccessedAt: now, provenance: 'restored' },
-			],
-			[
-				asSessionId('restored-b'),
-				{ id: 'restored-b', lastAccessedAt: now + 1, provenance: 'restored' },
-			],
-			[asSessionId('live-old'), { id: 'live-old', lastAccessedAt: now + 2 }],
-			[asSessionId('live-new'), { id: 'live-new', lastAccessedAt: now + 3 }],
+			[asSessionId('pinned-a'), session('pinned-a', 1)],
+			[asSessionId('eligible-b'), session('eligible-b', 2)],
 		]);
 
 		// When
-		mgr.evictExcessSessions(sessions);
+		const plan = manager.planProspectiveAdmission(
+			sessions,
+			undefined,
+			(sessionId) => sessionId === asSessionId('eligible-b')
+		);
 
 		// Then
-		expect([...sessions.keys()]).toEqual([
-			asSessionId('restored-a'),
-			asSessionId('restored-b'),
-			asSessionId('live-new'),
+		expect(plan).toBeUndefined();
+		expect([...sessions.keys()]).toEqual([asSessionId('pinned-a'), asSessionId('eligible-b')]);
+	});
+
+	it('preserves stable insertion order when eligible timestamps tie', () => {
+		// Given
+		const manager = makeManager({ maxSessions: 1 });
+		const sessions = new Map<SessionId, TestSession>([
+			[asSessionId('first'), session('first', 10)],
+			[asSessionId('second'), session('second', 10)],
 		]);
+
+		// When
+		const plan = manager.planProspectiveAdmission(sessions, undefined, eligible);
+
+		// Then
+		expect(plan).toEqual([asSessionId('first'), asSessionId('second')]);
 	});
 
-	it('default session is never evicted (per-owner stage)', () => {
-		const mgr = makeManager({ maxSessions: 1000, maxSessionsPerOwner: 1 });
-		const sessions = new Map<SessionId, TestSession>();
-		// Default session is owner-less — exempt anyway, but make sure it's present
-		sessions.set(asSessionId(DEFAULT_ID), {
-			id: DEFAULT_ID,
-			lastAccessedAt: 0, // very old
-			owner: undefined,
-		});
-		// Owner A overflows
-		for (let i = 0; i < 5; i++) {
-			sessions.set(asSessionId(`a-${i}`), { id: `a-${i}`, lastAccessedAt: now + i, owner: 'A' });
-		}
+	it('counts the default globally but never selects it for eviction', () => {
+		// Given
+		const manager = makeManager({ maxSessions: 1 });
+		const sessions = new Map<SessionId, TestSession>([[DEFAULT_ID, session('default', 0)]]);
 
-		mgr.evictExcessSessions(sessions);
+		// When
+		const plan = manager.planProspectiveAdmission(sessions, undefined, eligible);
 
-		expect(sessions.has(asSessionId(DEFAULT_ID))).toBe(true);
+		// Then
+		expect(plan).toBeUndefined();
 	});
 
-	it('default session is never evicted (global stage)', () => {
-		const mgr = makeManager({ maxSessions: 3, maxSessionsPerOwner: 1000 });
-		const sessions = new Map<SessionId, TestSession>();
-		sessions.set(asSessionId(DEFAULT_ID), {
-			id: DEFAULT_ID,
-			lastAccessedAt: 0, // oldest
-			owner: undefined,
-		});
-		for (let i = 0; i < 10; i++) {
-			sessions.set(asSessionId(`s-${i}`), {
-				id: `s-${i}`,
-				lastAccessedAt: now + i,
-				owner: undefined,
-			});
-		}
+	it('excludes restored sessions from counts and candidate selection', () => {
+		// Given
+		const manager = makeManager({ maxSessions: 1, maxSessionsPerOwner: 1 });
+		const sessions = new Map<SessionId, TestSession>([
+			[asSessionId('restored'), { ...session('restored', 0, 'A'), provenance: 'restored' }],
+		]);
 
-		mgr.evictExcessSessions(sessions);
+		// When
+		const plan = manager.planProspectiveAdmission(sessions, 'A', eligible);
 
-		// Default kept; global cap of 3 enforced over total -> 3 retained including default
-		expect(sessions.has(asSessionId(DEFAULT_ID))).toBe(true);
-		expect(sessions.size).toBe(3); // default + 2 newest
+		// Then
+		expect(plan).toEqual([]);
 	});
 
-	it('per-owner eviction respects lastAccessedAt order', () => {
-		const mgr = makeManager({ maxSessions: 1000, maxSessionsPerOwner: 2 });
-		const sessions = new Map<SessionId, TestSession>();
+	it('applies only global capacity to ownerless admission', () => {
+		// Given
+		const manager = makeManager({ maxSessions: 10, maxSessionsPerOwner: 1 });
+		const sessions = new Map<SessionId, TestSession>([
+			[asSessionId('stdio-a'), session('stdio-a', 1)],
+			[asSessionId('stdio-b'), session('stdio-b', 2)],
+		]);
 
-		// Insert out-of-order timestamps for owner A
-		sessions.set(asSessionId('a-newest'), {
-			id: 'a-newest',
-			lastAccessedAt: now + 300,
-			owner: 'A',
-		});
-		sessions.set(asSessionId('a-oldest'), {
-			id: 'a-oldest',
-			lastAccessedAt: now + 100,
-			owner: 'A',
-		});
-		sessions.set(asSessionId('a-mid'), { id: 'a-mid', lastAccessedAt: now + 200, owner: 'A' });
-		sessions.set(asSessionId('a-ancient'), {
-			id: 'a-ancient',
-			lastAccessedAt: now + 50,
-			owner: 'A',
-		});
+		// When
+		const plan = manager.planProspectiveAdmission(sessions, undefined, eligible);
 
-		mgr.evictExcessSessions(sessions);
-
-		// Quota 2 -> evict oldest 2 (ancient, oldest) -> retain (mid, newest)
-		expect(sessions.has(asSessionId('a-ancient'))).toBe(false);
-		expect(sessions.has(asSessionId('a-oldest'))).toBe(false);
-		expect(sessions.has(asSessionId('a-mid'))).toBe(true);
-		expect(sessions.has(asSessionId('a-newest'))).toBe(true);
+		// Then
+		expect(plan).toEqual([]);
 	});
 
-	it('default maxSessionsPerOwner is 50 when not configured', () => {
-		const mgr = new SessionManager<TestSession>({
+	it('uses the configured default owner quota of fifty for prospective admission', () => {
+		// Given
+		const manager = new SessionManager<TestSession>({
 			defaultSessionId: DEFAULT_ID,
 			sessionTtlMs: 60_000,
-			cleanupIntervalMs: 60_000,
-			getMaxSessions: () => 1000,
+			cleanupIntervalMs: 100,
+			getMaxSessions: () => 1_000,
 		});
 		const sessions = new Map<SessionId, TestSession>();
-		for (let i = 0; i < 60; i++) {
-			sessions.set(asSessionId(`a-${i}`), { id: `a-${i}`, lastAccessedAt: now + i, owner: 'A' });
+		for (let index = 0; index < 50; index += 1) {
+			const sessionId = asSessionId(`owner-${index}`);
+			sessions.set(sessionId, session(sessionId, index, 'A'));
 		}
-		mgr.evictExcessSessions(sessions);
-		// 50 per-owner default -> 10 evicted
-		expect(sessions.size).toBe(50);
+
+		// When
+		const plan = manager.planProspectiveAdmission(sessions, 'A', eligible);
+
+		// Then
+		expect(plan).toEqual([asSessionId('owner-0')]);
+	});
+
+	it('does not substitute another owner when required owner victims are pinned', () => {
+		// Given
+		const manager = makeManager({ maxSessions: 10, maxSessionsPerOwner: 1 });
+		const ownerSession = asSessionId('owner-pinned');
+		const sessions = new Map<SessionId, TestSession>([
+			[ownerSession, session('owner-pinned', 1, 'A')],
+			[asSessionId('other-eligible'), session('other-eligible', 2, 'B')],
+		]);
+
+		// When
+		const plan = manager.planProspectiveAdmission(
+			sessions,
+			'A',
+			(sessionId) => sessionId !== ownerSession
+		);
+
+		// Then
+		expect(plan).toBeUndefined();
 	});
 });
 
-describe('SessionManager — config integration via HistoryManager path', () => {
-	it('SESSION_MAX_PER_OWNER env var flows through ConfigLoader → ServerConfig', async () => {
+describe('SessionManager TTL candidates and timer', () => {
+	it('uses the same default, restored, eligibility, and oldest-first candidate rules for TTL', () => {
+		// Given
+		const manager = makeManager();
+		const pinned = asSessionId('pinned');
+		const sessions = new Map<SessionId, TestSession>([
+			[DEFAULT_ID, session('default', 0)],
+			[asSessionId('restored'), { ...session('restored', 1), provenance: 'restored' }],
+			[pinned, session('pinned', 2)],
+			[asSessionId('eligible-old'), session('eligible-old', 3)],
+			[asSessionId('eligible-new'), session('eligible-new', 4)],
+		]);
+
+		// When
+		const candidates = manager.staleSessionCandidates(
+			sessions,
+			(sessionId) => sessionId !== pinned,
+			60_005
+		);
+
+		// Then
+		expect(candidates).toEqual([asSessionId('eligible-old'), asSessionId('eligible-new')]);
+	});
+
+	it('observes and reports asynchronous cleanup rejection without an unhandled promise', async () => {
+		// Given
+		const logger = makeLogger();
+		const manager = makeManager({ logger });
+		const sessionId = asSessionId('stale');
+		const sessions = new Map<SessionId, TestSession>([[sessionId, session('stale', 0)]]);
+		const failure = new Error('cleanup rejected');
+		const cleanup = vi.fn(async () => Promise.reject(failure));
+		manager.startCleanupTimer(sessions, eligible, cleanup);
+
+		// When
+		await vi.advanceTimersByTimeAsync(100);
+
+		// Then
+		expect(cleanup).toHaveBeenCalledWith([sessionId]);
+		expect(logger.error).toHaveBeenCalledWith('Session cleanup failed', {
+			error: failure,
+		});
+		manager.stopCleanupTimer();
+	});
+
+	it('reports synchronous cleanup failure from the timer callback', async () => {
+		// Given
+		const logger = makeLogger();
+		const manager = makeManager({ logger });
+		const sessionId = asSessionId('stale-sync-failure');
+		const sessions = new Map<SessionId, TestSession>([[sessionId, session('stale', 0)]]);
+		const failure = new Error('cleanup threw');
+		const cleanup = vi.fn((): Promise<void> => {
+			throw failure;
+		});
+		manager.startCleanupTimer(sessions, eligible, cleanup);
+
+		// When
+		await vi.advanceTimersByTimeAsync(100);
+
+		// Then
+		expect(logger.error).toHaveBeenCalledWith('Session cleanup failed', { error: failure });
+		manager.stopCleanupTimer();
+	});
+});
+
+describe('SessionManager config integration', () => {
+	it('SESSION_MAX_PER_OWNER env var flows through ConfigLoader to ServerConfig', async () => {
+		// Given
 		const { ConfigLoader } = await import('../../config/ConfigLoader.js');
 		const { ServerConfig } = await import('../../ServerConfig.js');
-
-		const prev = process.env.SESSION_MAX_PER_OWNER;
+		const previous = process.env.SESSION_MAX_PER_OWNER;
 		process.env.SESSION_MAX_PER_OWNER = '7';
+
 		try {
+			// When
 			const loader = new ConfigLoader();
 			const fileConfig = loader.load() ?? {};
-			const config = new ServerConfig({
-				maxSessionsPerOwner: fileConfig.maxSessionsPerOwner,
-			});
+			const config = new ServerConfig({ maxSessionsPerOwner: fileConfig.maxSessionsPerOwner });
+
+			// Then
 			expect(config.maxSessionsPerOwner).toBe(7);
 		} finally {
-			if (prev === undefined) delete process.env.SESSION_MAX_PER_OWNER;
-			else process.env.SESSION_MAX_PER_OWNER = prev;
+			if (previous === undefined) delete process.env.SESSION_MAX_PER_OWNER;
+			else process.env.SESSION_MAX_PER_OWNER = previous;
 		}
 	});
 
-	it('ServerConfig.toJSON exposes maxSessionsPerOwner', async () => {
-		const { ServerConfig } = await import('../../ServerConfig.js');
-		const cfg = new ServerConfig({ maxSessionsPerOwner: 25 });
-		expect(cfg.toJSON().maxSessionsPerOwner).toBe(25);
-	});
-
-	it('ServerConfig validates maxSessionsPerOwner bounds', async () => {
+	it('ServerConfig validates and serializes maxSessionsPerOwner', async () => {
+		// Given
 		const { ServerConfig } = await import('../../ServerConfig.js');
 		const { ConfigurationError } = await import('../../errors.js');
+
+		// When
+		const config = new ServerConfig({ maxSessionsPerOwner: 25 });
+
+		// Then
+		expect(config.toJSON().maxSessionsPerOwner).toBe(25);
 		expect(() => new ServerConfig({ maxSessionsPerOwner: 0 })).toThrow(ConfigurationError);
-		expect(() => new ServerConfig({ maxSessionsPerOwner: 10001 })).toThrow(ConfigurationError);
-		expect(() => new ServerConfig({ maxSessionsPerOwner: NaN })).toThrow(ConfigurationError);
+		expect(() => new ServerConfig({ maxSessionsPerOwner: 10_001 })).toThrow(ConfigurationError);
+		expect(() => new ServerConfig({ maxSessionsPerOwner: Number.NaN })).toThrow(ConfigurationError);
 	});
 });
