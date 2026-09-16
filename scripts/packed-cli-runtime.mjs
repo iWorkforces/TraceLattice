@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { PackedCliError } from './packed-cli-package.mjs';
+import { PackedCliError } from './packed-cli-cleanup.mjs';
 
 const OPERATION_TIMEOUT_MS = 10_000;
 const FORCE_CLOSE_MS = 5_000;
@@ -79,13 +79,19 @@ class ProtocolClient {
 		this.failure = null;
 		this.lines = createInterface({ input: running.child.stdout });
 		this.lines.on('line', (line) => this.receive(line));
-		this.running.closed.then(() => {
-			if (this.pending.size > 0) {
-				this.rejectAll(
-					`stdio CLI closed with outstanding requests: ${this.running.stderr().trim()}`
-				);
-			}
+		this.running.child.stdin.on('error', (error) => {
+			this.rejectAll(`stdio CLI stdin failed: ${error}`);
 		});
+		this.running.closed.then(
+			() => {
+				if (this.pending.size > 0) {
+					this.rejectAll(
+						`stdio CLI closed with outstanding requests: ${this.running.stderr().trim()}`
+					);
+				}
+			},
+			(error) => this.rejectAll(`stdio CLI process failed: ${error}`)
+		);
 	}
 
 	receive(line) {
