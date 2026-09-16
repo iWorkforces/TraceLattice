@@ -239,7 +239,8 @@ describe('configuration startup resource safety', () => {
 });
 
 describe('watcher cleanup ownership', () => {
-	it('joins one successful cleanup across repeated stop calls', async () => {
+	it('joins one successful server cleanup when history initiates shutdown', async () => {
+		// Given
 		const skillStop = vi.spyOn(SkillWatcher.prototype, 'stop');
 		const toolStop = vi.spyOn(ToolWatcher.prototype, 'stop');
 		const server = await createServer({
@@ -256,18 +257,70 @@ describe('watcher cleanup ownership', () => {
 		const persistence = server.getContainer().resolve('Persistence');
 		if (persistence === null) throw new TypeError('Expected configured memory persistence');
 		const persistenceClose = vi.spyOn(persistence, 'close');
+		const clearLiveState = vi.spyOn(server.history, 'clearLiveStateAfterShutdown');
+		const containerDispose = vi.spyOn(server.getContainer(), 'dispose');
 
-		const firstStop = server.stop();
-		const secondStop = server.stop();
-		expect(secondStop).toBe(firstStop);
-		await Promise.all([firstStop, secondStop]);
-		await server.dispose();
+		// When
+		const historyShutdownPromise = server.history.shutdown();
+		const serverStopPromise = server.stop();
+		const repeatedStopPromise = server.stop();
+		const firstDisposePromise = server.dispose();
+		const secondDisposePromise = server.dispose();
+		await Promise.all([
+			historyShutdownPromise,
+			serverStopPromise,
+			repeatedStopPromise,
+			firstDisposePromise,
+			secondDisposePromise,
+		]);
 
+		// Then
+		expect(serverStopPromise).toBe(historyShutdownPromise);
+		expect(repeatedStopPromise).toBe(historyShutdownPromise);
+		expect(secondDisposePromise).toBe(firstDisposePromise);
 		expect(skillStop).toHaveBeenCalledOnce();
 		expect(toolStop).toHaveBeenCalledOnce();
 		expect(suspensionStop).toHaveBeenCalledOnce();
 		expect(historyShutdown).toHaveBeenCalledOnce();
 		expect(persistenceClose).toHaveBeenCalledOnce();
+		expect(clearLiveState).toHaveBeenCalledOnce();
+		expect(containerDispose).toHaveBeenCalledOnce();
+	});
+
+	it('runs server cleanup after sequential history shutdown, stop, and dispose calls', async () => {
+		// Given
+		const skillStop = vi.spyOn(SkillWatcher.prototype, 'stop');
+		const toolStop = vi.spyOn(ToolWatcher.prototype, 'stop');
+		const server = await createServer({
+			config: new ServerConfig({
+				persistence: { enabled: true, backend: 'memory' },
+				features: { toolInterleave: true },
+			}),
+			enableWatcher: true,
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		const suspensionStop = vi.spyOn(server.getContainer().resolve('suspensionStore'), 'stop');
+		const historyShutdown = vi.spyOn(server.history, 'shutdownWithinLifecycle');
+		const persistence = server.getContainer().resolve('Persistence');
+		if (persistence === null) throw new TypeError('Expected configured memory persistence');
+		const persistenceClose = vi.spyOn(persistence, 'close');
+		const clearLiveState = vi.spyOn(server.history, 'clearLiveStateAfterShutdown');
+		const containerDispose = vi.spyOn(server.getContainer(), 'dispose');
+
+		// When
+		await server.history.shutdown();
+		await server.stop();
+		await server.dispose();
+
+		// Then
+		expect(skillStop).toHaveBeenCalledOnce();
+		expect(toolStop).toHaveBeenCalledOnce();
+		expect(suspensionStop).toHaveBeenCalledOnce();
+		expect(historyShutdown).toHaveBeenCalledOnce();
+		expect(persistenceClose).toHaveBeenCalledOnce();
+		expect(clearLiveState).toHaveBeenCalledOnce();
+		expect(containerDispose).toHaveBeenCalledOnce();
 	});
 
 	it('joins one watcher cleanup across concurrent dispose calls', async () => {
@@ -302,7 +355,8 @@ describe('watcher cleanup ownership', () => {
 		expect(toolStopCalls).toBe(1);
 	});
 
-	it('surfaces watcher failures after attempting every stop cleanup once', async () => {
+	it('surfaces watcher failures after history initiates every server cleanup once', async () => {
+		// Given
 		const skillFailure = new Error('injected skill watcher stop failure');
 		const toolFailure = new Error('injected tool watcher stop failure');
 		const originalSkillStop = SkillWatcher.prototype.stop;
@@ -333,28 +387,47 @@ describe('watcher cleanup ownership', () => {
 		const persistence = server.getContainer().resolve('Persistence');
 		if (persistence === null) throw new TypeError('Expected configured memory persistence');
 		const persistenceClose = vi.spyOn(persistence, 'close');
+		const clearLiveState = vi.spyOn(server.history, 'clearLiveStateAfterShutdown');
+		const containerDispose = vi.spyOn(server.getContainer(), 'dispose');
 
-		const firstStop = server.stop();
-		const secondStop = server.stop();
-		const outcome = await firstStop.then(
+		// When
+		const historyShutdownPromise = server.history.shutdown();
+		const serverStopPromise = server.stop();
+		const stopOutcome = await historyShutdownPromise.then(
 			() => ({ kind: 'resolved' as const }),
 			(error: unknown) => ({ kind: 'rejected' as const, error })
 		);
-		await server.getContainer().dispose();
+		const firstDisposePromise = server.dispose();
+		const secondDisposePromise = server.dispose();
+		const disposeOutcome = await firstDisposePromise.then(
+			() => ({ kind: 'resolved' as const }),
+			(error: unknown) => ({ kind: 'rejected' as const, error })
+		);
 
-		expect(secondStop).toBe(firstStop);
-		expect(outcome.kind).toBe('rejected');
-		if (outcome.kind !== 'rejected') throw new TypeError('Expected stop to reject');
-		expect(outcome.error).toBeInstanceOf(AggregateError);
-		if (!(outcome.error instanceof AggregateError)) {
+		// Then
+		expect(serverStopPromise).toBe(historyShutdownPromise);
+		expect(stopOutcome.kind).toBe('rejected');
+		if (stopOutcome.kind !== 'rejected') throw new TypeError('Expected stop to reject');
+		expect(stopOutcome.error).toBeInstanceOf(AggregateError);
+		if (!(stopOutcome.error instanceof AggregateError)) {
 			throw new TypeError('Expected aggregate stop failure');
 		}
-		expect(outcome.error.errors).toEqual([skillFailure, toolFailure]);
+		expect(stopOutcome.error.errors).toEqual([skillFailure, toolFailure]);
+		expect(secondDisposePromise).toBe(firstDisposePromise);
+		expect(disposeOutcome.kind).toBe('rejected');
+		if (disposeOutcome.kind !== 'rejected') throw new TypeError('Expected dispose to reject');
+		expect(disposeOutcome.error).toBeInstanceOf(AggregateError);
+		if (!(disposeOutcome.error instanceof AggregateError)) {
+			throw new TypeError('Expected aggregate dispose failure');
+		}
+		expect(disposeOutcome.error.errors).toEqual([skillFailure, toolFailure]);
 		expect(skillStop).toHaveBeenCalledOnce();
 		expect(toolStop).toHaveBeenCalledOnce();
 		expect(suspensionStop).toHaveBeenCalledOnce();
 		expect(historyShutdown).toHaveBeenCalledOnce();
 		expect(persistenceClose).toHaveBeenCalledOnce();
+		expect(clearLiveState).not.toHaveBeenCalled();
+		expect(containerDispose).toHaveBeenCalledOnce();
 	});
 
 	it('joins watcher cleanup before startup failure rejects', async () => {
