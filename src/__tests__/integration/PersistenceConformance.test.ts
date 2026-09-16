@@ -275,6 +275,46 @@ describe.each(fixtures)('$name session-scoped persistence conformance', ({ creat
 		}
 	});
 
+	it('deletes one branch idempotently without changing sibling or matching-session branches', async () => {
+		const backend = await create();
+		const siblingBranch = asBranchId('sibling');
+		try {
+			await backend.saveBranchForSession(sessionA, sharedBranch, [
+				thought('A-shared', sessionA, 1, true),
+			]);
+			await backend.saveBranchForSession(sessionA, siblingBranch, []);
+			await backend.saveBranchForSession(sessionB, sharedBranch, [
+				thought('B-shared', sessionB, 1, true),
+			]);
+
+			await backend.deleteBranchForSession(sessionA, sharedBranch);
+			await backend.deleteBranchForSession(sessionA, sharedBranch);
+
+			expect(await backend.loadBranchForSession(sessionA, sharedBranch)).toBeUndefined();
+			expect(await backend.loadBranchForSession(sessionA, siblingBranch)).toEqual([]);
+			expect(await backend.loadBranchForSession(sessionB, sharedBranch)).toHaveLength(1);
+			expect(await backend.listBranchesForSession(sessionA)).toEqual([siblingBranch]);
+		} finally {
+			await cleanup(backend);
+		}
+	});
+
+	it('distinguishes legacy branch deletion from saving an empty branch', async () => {
+		const backend = await create();
+		try {
+			await backend.saveBranch(sharedBranch, []);
+			expect(await backend.loadBranch(sharedBranch)).toEqual([]);
+
+			await backend.deleteBranch(sharedBranch);
+			await backend.deleteBranch(sharedBranch);
+
+			expect(await backend.loadBranch(sharedBranch)).toBeUndefined();
+			expect(await backend.listBranches()).toEqual([]);
+		} finally {
+			await cleanup(backend);
+		}
+	});
+
 	it('enumerates summary-only and explicitly empty-branch sessions in code-point order', async () => {
 		const backend = await create();
 		const summaryOnly = asSessionId('C-summary');

@@ -101,6 +101,20 @@ export class MemoryPersistence implements SessionScopedPersistenceBackend {
 		this._branches.set(validatedSessionId, branches);
 	}
 
+	public async deleteBranch(branchId: BranchId): Promise<void> {
+		await this.deleteBranchForSession(GLOBAL_SESSION_ID, branchId);
+	}
+
+	public async deleteBranchForSession(sessionId: SessionId, branchId: BranchId): Promise<void> {
+		if (!this._persistBranches) return;
+		const validatedSessionId = asSessionId(sessionId);
+		const validatedBranchId = parsePersistenceBranchId(branchId, `${validatedSessionId}/branches`);
+		const branches = this._branches.get(validatedSessionId);
+		if (branches === undefined) return;
+		branches.delete(validatedBranchId);
+		if (branches.size === 0) this._branches.delete(validatedSessionId);
+	}
+
 	public async loadBranch(branchId: BranchId): Promise<ThoughtData[] | undefined> {
 		return await this.loadBranchForSession(GLOBAL_SESSION_ID, branchId);
 	}

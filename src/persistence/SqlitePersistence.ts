@@ -177,6 +177,21 @@ export class SqlitePersistence implements SessionScopedPersistenceBackend {
 		});
 	}
 
+	public async deleteBranch(branchId: BranchId): Promise<void> {
+		await this.deleteBranchForSession(GLOBAL_SESSION_ID, branchId);
+	}
+
+	public async deleteBranchForSession(sessionId: SessionId, branchId: BranchId): Promise<void> {
+		if (!this._persistBranches) return;
+		const validatedSessionId = asSessionId(sessionId);
+		const validatedBranchId = parsePersistenceBranchId(branchId, `${this._sourcePath}:branches`);
+		runSqliteTransaction(this._db, () => {
+			this._db
+				.prepare('DELETE FROM branches WHERE session_id = ? AND branch_id = ?')
+				.run(validatedSessionId, validatedBranchId);
+		});
+	}
+
 	public async loadBranch(branchId: BranchId): Promise<ThoughtData[] | undefined> {
 		return await this.loadBranchForSession(GLOBAL_SESSION_ID, branchId);
 	}

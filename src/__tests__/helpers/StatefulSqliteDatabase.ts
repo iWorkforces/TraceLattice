@@ -18,6 +18,7 @@ const SQL = {
 		'DELETE FROM thoughts WHERE id IN (SELECT id FROM thoughts WHERE session_id = ? ORDER BY id ASC LIMIT ?)',
 	selectHistory: 'SELECT data FROM thoughts WHERE session_id = ? ORDER BY id ASC',
 	replaceBranch: 'INSERT OR REPLACE INTO branches (session_id, branch_id, data) VALUES (?, ?, ?)',
+	deleteBranch: 'DELETE FROM branches WHERE session_id = ? AND branch_id = ?',
 	selectBranch: 'SELECT data FROM branches WHERE session_id = ? AND branch_id = ?',
 	listBranches: 'SELECT branch_id FROM branches WHERE session_id = ? ORDER BY branch_id ASC',
 	listSessions:
@@ -395,6 +396,8 @@ export class StatefulSqliteDatabase implements SqliteDatabase {
 				return this._trimThoughts(params);
 			case SQL.replaceBranch:
 				return this._replaceBranch(params);
+			case SQL.deleteBranch:
+				return this._deleteBranch(params);
 			case SQL.deleteThoughtsSession:
 				return this._deleteThoughts(stringParameter(params, 0, sql));
 			case SQL.deleteBranchesSession:
@@ -523,6 +526,15 @@ export class StatefulSqliteDatabase implements SqliteDatabase {
 			data: stringParameter(params, 2, SQL.replaceBranch),
 		});
 		return result(1);
+	}
+
+	private _deleteBranch(params: readonly unknown[]): SqliteRunResult {
+		const sessionId = stringParameter(params, 0, SQL.deleteBranch);
+		const branchId = stringParameter(params, 1, SQL.deleteBranch);
+		const branches = this._state.branches.get(sessionId);
+		const changes = branches?.delete(branchId) === true ? 1 : 0;
+		if (branches?.size === 0) this._state.branches.delete(sessionId);
+		return result(changes);
 	}
 
 	private _insertEdge(params: readonly unknown[]): SqliteRunResult {

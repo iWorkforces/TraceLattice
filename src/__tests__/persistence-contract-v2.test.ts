@@ -65,7 +65,7 @@ describe('session-scoped persistence capability', () => {
 		);
 	});
 
-	it('recognizes each built-in only when all seven scoped methods are present', async () => {
+	it('recognizes each built-in only when all nine scoped methods are present', async () => {
 		const dataDir = await mkdtemp(join(tmpdir(), 'tracelattice-task7-guard-'));
 		const file = await FilePersistence.create({ dataDir });
 		try {
@@ -75,6 +75,21 @@ describe('session-scoped persistence capability', () => {
 			await file.close();
 			await rm(dataDir, { recursive: true, force: true });
 		}
+	});
+
+	it('requires both legacy and scoped branch deletion for the complete scoped capability', () => {
+		const backend = new MemoryPersistence();
+		const withoutLegacyDelete = Object.create(backend) as MemoryPersistence & {
+			deleteBranch?: undefined;
+		};
+		Object.defineProperty(withoutLegacyDelete, 'deleteBranch', { value: undefined });
+		const withoutScopedDelete = Object.create(backend) as MemoryPersistence & {
+			deleteBranchForSession?: undefined;
+		};
+		Object.defineProperty(withoutScopedDelete, 'deleteBranchForSession', { value: undefined });
+
+		expect(supportsSessionScopedPersistence(withoutLegacyDelete)).toBe(false);
+		expect(supportsSessionScopedPersistence(withoutScopedDelete)).toBe(false);
 	});
 });
 

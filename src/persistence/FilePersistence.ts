@@ -176,6 +176,22 @@ export class FilePersistence implements SessionScopedPersistenceBackend {
 		}));
 	}
 
+	public async deleteBranch(branchId: BranchId): Promise<void> {
+		await this.deleteBranchForSession(GLOBAL_SESSION_ID, branchId);
+	}
+
+	public async deleteBranchForSession(sessionId: SessionId, branchId: BranchId): Promise<void> {
+		if (!this._persistBranches) return;
+		const validatedSessionId = asSessionId(sessionId);
+		const validatedBranchId = parsePersistenceBranchId(branchId, `${validatedSessionId}/branches`);
+		await this._mutate('delete_branch', (snapshot) => ({
+			...snapshot,
+			branches: snapshot.branches.filter(
+				(record) => record.sessionId !== validatedSessionId || record.branchId !== validatedBranchId
+			),
+		}));
+	}
+
 	public async loadBranch(branchId: BranchId): Promise<ThoughtData[] | undefined> {
 		return await this.loadBranchForSession(GLOBAL_SESSION_ID, branchId);
 	}

@@ -400,6 +400,22 @@ describe('SqlitePersistence stateful structural behavior', () => {
 		expect(await persistence.listBranches()).toEqual([branchId]);
 	});
 
+	it('deletes one branch idempotently without deleting its session sibling', async () => {
+		const { persistence } = createStructuralPersistence();
+		const sessionId = asSessionId('delete-branch');
+		const removed = asBranchId('removed');
+		const sibling = asBranchId('sibling');
+		await persistence.saveBranchForSession(sessionId, removed, []);
+		await persistence.saveBranchForSession(sessionId, sibling, []);
+
+		await persistence.deleteBranchForSession(sessionId, removed);
+		await persistence.deleteBranchForSession(sessionId, removed);
+
+		expect(await persistence.loadBranchForSession(sessionId, removed)).toBeUndefined();
+		expect(await persistence.loadBranchForSession(sessionId, sibling)).toEqual([]);
+		expect(await persistence.listBranchesForSession(sessionId)).toEqual([sibling]);
+	});
+
 	it('orders session, branch, and edge-session identifiers by Unicode code point', async () => {
 		// Given
 		const { persistence } = createStructuralPersistence();
@@ -621,7 +637,7 @@ describe('SqlitePersistence stateful structural behavior', () => {
 			'DELETE FROM edges',
 			'DELETE FROM summaries',
 		]);
-		expect(STATEFUL_SQLITE_SUPPORTED_SQL.prepared).toHaveLength(23);
+		expect(STATEFUL_SQLITE_SUPPORTED_SQL.prepared).toHaveLength(24);
 		expect(() => database.prepare('SELECT * FROM imaginary')).toThrowError(
 			UnsupportedStructuralSqlError
 		);
