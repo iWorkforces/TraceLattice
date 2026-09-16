@@ -36,6 +36,7 @@ function createMockContainer() {
 		getAvailableMcpTools: vi.fn().mockReturnValue([]),
 		getAvailableSkills: vi.fn().mockReturnValue([]),
 		setEventEmitter: vi.fn(),
+		bindShutdownOwner: vi.fn<(owner: () => Promise<void>) => void>(),
 		shutdown: vi.fn().mockResolvedValue(undefined),
 		shutdownWithinLifecycle: vi.fn().mockResolvedValue(undefined),
 		clearLiveStateAfterShutdown: vi.fn(),
@@ -119,9 +120,15 @@ describe('ToolAwareSequentialThinkingServer', () => {
 			expect(mocks.mockToolRegistry.addTool).toHaveBeenCalled();
 		});
 
+		it('should bind history shutdown to one server-owned callback', () => {
+			expect(mocks.mockHistoryManager.bindShutdownOwner).toHaveBeenCalledOnce();
+			expect(mocks.mockHistoryManager.bindShutdownOwner).toHaveBeenCalledWith(expect.any(Function));
+		});
+
 		it('should create watchers when enableWatcher is true', async () => {
+			const watcherMocks = createMockContainer();
 			const serverWithWatchers = new ToolAwareSequentialThinkingServer({
-				container: mocks.container,
+				container: watcherMocks.container,
 				enableWatcher: true,
 				autoDiscover: false,
 			});
@@ -133,8 +140,9 @@ describe('ToolAwareSequentialThinkingServer', () => {
 		});
 
 		it('should not create watchers when enableWatcher is false', () => {
+			const noWatcherMocks = createMockContainer();
 			const serverNoWatchers = new ToolAwareSequentialThinkingServer({
-				container: mocks.container,
+				container: noWatcherMocks.container,
 				enableWatcher: false,
 				autoDiscover: false,
 			});
@@ -222,6 +230,22 @@ describe('ToolAwareSequentialThinkingServer', () => {
 	});
 
 	describe('stop', () => {
+		it('should join the history-owned callback to the exact server stop promise', async () => {
+			// Given
+			const shutdownOwner = mocks.mockHistoryManager.bindShutdownOwner.mock.calls[0]?.[0];
+
+			// When
+			expect(shutdownOwner).toBeTypeOf('function');
+			if (shutdownOwner === undefined) return;
+			const historyShutdownPromise = shutdownOwner();
+			const serverStopPromise = server.stop();
+
+			// Then
+			expect(serverStopPromise).toBe(historyShutdownPromise);
+			await Promise.all([historyShutdownPromise, serverStopPromise]);
+			expect(mocks.mockHistoryManager.shutdownWithinLifecycle).toHaveBeenCalledOnce();
+		});
+
 		it('should stop server and flush persistence', async () => {
 			await server.stop();
 			expect(mocks.mockHistoryManager.shutdownWithinLifecycle).toHaveBeenCalled();
@@ -257,6 +281,44 @@ describe('ToolAwareSequentialThinkingServer', () => {
 
 			await expect(server.stop()).rejects.toMatchObject({ errors: [failure] });
 			expect(mocks.mockLogger.error).toHaveBeenCalled();
+		});
+
+		it('should aggregate history-drain and persistence-close failures through the owner callback', async () => {
+			// Given
+			const historyFailure = new Error('History drain failed');
+			const persistenceFailure = new Error('Persistence close failed');
+			const mockPersistence = { close: vi.fn().mockRejectedValue(persistenceFailure) };
+			mocks.mockHistoryManager.shutdownWithinLifecycle.mockRejectedValue(historyFailure);
+			mocks.container.unregister('Persistence');
+			mocks.container.registerInstance(
+				'Persistence',
+				mockPersistence as unknown as PersistenceBackend
+			);
+			const shutdownOwner = mocks.mockHistoryManager.bindShutdownOwner.mock.calls[0]?.[0];
+
+			// When
+			expect(shutdownOwner).toBeTypeOf('function');
+			if (shutdownOwner === undefined) return;
+			const historyShutdownPromise = shutdownOwner();
+			const serverStopPromise = server.stop();
+			const outcome = await historyShutdownPromise.then(
+				() => ({ kind: 'resolved' as const }),
+				(error: unknown) => ({ kind: 'rejected' as const, error })
+			);
+
+			// Then
+			expect(serverStopPromise).toBe(historyShutdownPromise);
+			expect(outcome.kind).toBe('rejected');
+			if (outcome.kind !== 'rejected') throw new TypeError('Expected stop to reject');
+			expect(outcome.error).toBeInstanceOf(AggregateError);
+			if (!(outcome.error instanceof AggregateError)) {
+				throw new TypeError('Expected aggregate stop failure');
+			}
+			expect(outcome.error.errors).toEqual([historyFailure, persistenceFailure]);
+			expect(mocks.mockHistoryManager.shutdownWithinLifecycle).toHaveBeenCalledOnce();
+			expect(mockPersistence.close).toHaveBeenCalledOnce();
+			expect(mocks.mockHistoryManager.clearLiveStateAfterShutdown).not.toHaveBeenCalled();
+			expect(mocks.mockLogger.error).toHaveBeenCalledTimes(2);
 		});
 
 		it('should handle null persistence', async () => {

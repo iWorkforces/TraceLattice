@@ -315,6 +315,7 @@ export class ToolAwareSequentialThinkingServer
 		// Resolve dependencies from container
 		this._logger = this._container.resolve('Logger');
 		this._historyManager = this._container.resolve('HistoryManager');
+		this._historyManager.bindShutdownOwner(() => this.stop());
 		this._thoughtProcessor = this._container.resolve('ThoughtProcessor');
 		this._metrics = this._container.resolve('Metrics');
 		this._config = this._container.resolve('Config');
