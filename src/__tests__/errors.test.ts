@@ -17,6 +17,7 @@ import {
 	PoolTerminatedError,
 	PersistenceCompatibilityError,
 	PersistenceUnavailableError,
+	SessionLifecycleClosedError,
 	ValidationError,
 } from '../errors.js';
 import { asSessionId } from '../contracts/ids.js';
@@ -188,6 +189,25 @@ describe('MaxSessionsReachedError', () => {
 		);
 		expect(error.code).toBe('MAX_SESSIONS_REACHED');
 		expect(error.name).toBe('MaxSessionsReachedError');
+	});
+});
+
+describe('SessionLifecycleClosedError', () => {
+	it('carries the closed session and lifecycle phase', () => {
+		// Given
+		const sessionId = asSessionId('closed-session');
+
+		// When
+		const error = new SessionLifecycleClosedError(sessionId, 'eviction_failed');
+
+		// Then
+		expect(error).toMatchObject({
+			name: 'SessionLifecycleClosedError',
+			code: 'SESSION_LIFECYCLE_CLOSED',
+			sessionId,
+			phase: 'eviction_failed',
+			message: "Session 'closed-session' lifecycle admission is closed in phase 'eviction_failed'",
+		});
 	});
 });
 

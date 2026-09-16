@@ -59,6 +59,7 @@ export const ERROR_CODES = {
 	UNKNOWN_TOOL: 'UNKNOWN_TOOL',
 	LOCK_TIMEOUT: 'LOCK_TIMEOUT',
 	SESSION_ACCESS_DENIED: 'SESSION_ACCESS_DENIED',
+	SESSION_LIFECYCLE_CLOSED: 'SESSION_LIFECYCLE_CLOSED',
 	PERSISTENCE_OWNERSHIP: 'PERSISTENCE_OWNERSHIP',
 	PERSISTENCE_CORRUPTION: 'PERSISTENCE_CORRUPTION',
 	PERSISTENCE_PUBLICATION: 'PERSISTENCE_PUBLICATION',
@@ -76,6 +77,16 @@ export const ERROR_CODES = {
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
+
+/** Lifecycle phase that can close ordinary session admission. */
+export type SessionLifecycleClosedPhase =
+	| 'resetting'
+	| 'reset_failed'
+	| 'evicting'
+	| 'eviction_failed'
+	| 'shutting_down'
+	| 'stopped'
+	| 'shutdown_failed';
 
 /**
  * All known warning codes as a const object.
@@ -536,6 +547,42 @@ export class SessionNotFoundError extends SequentialThinkingError {
 	constructor(sessionId: SessionId) {
 		super(`Session not found: ${sessionId}`, ERROR_CODES.SESSION_NOT_FOUND);
 		this.name = 'SessionNotFoundError';
+	}
+}
+
+/**
+ * Error thrown when an operation arrives after lifecycle admission has closed.
+ *
+ * The error carries both the optional session scope and the exact phase that
+ * rejected admission so callers can distinguish session maintenance from global
+ * shutdown without parsing prose.
+ *
+ * @example
+ * ```typescript
+ * throw new SessionLifecycleClosedError(sessionId, 'evicting');
+ * ```
+ */
+export class SessionLifecycleClosedError extends SequentialThinkingError {
+	/** Session whose admission is closed, or `undefined` for a global exclusive request. */
+	public readonly sessionId: SessionId | undefined;
+	/** Lifecycle phase that rejected admission. */
+	public readonly phase: SessionLifecycleClosedPhase;
+
+	/**
+	 * Creates a lifecycle admission error.
+	 *
+	 * @param sessionId - Rejected session, or `undefined` for global coordination.
+	 * @param phase - Lifecycle phase that currently owns admission.
+	 */
+	public constructor(sessionId: SessionId | undefined, phase: SessionLifecycleClosedPhase) {
+		const scope = sessionId === undefined ? 'Global' : `Session '${sessionId}'`;
+		super(
+			`${scope} lifecycle admission is closed in phase '${phase}'`,
+			ERROR_CODES.SESSION_LIFECYCLE_CLOSED
+		);
+		this.name = 'SessionLifecycleClosedError';
+		this.sessionId = sessionId;
+		this.phase = phase;
 	}
 }
 
