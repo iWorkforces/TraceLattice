@@ -10,6 +10,7 @@ import {
 import { runWithContext } from '../../context/RequestContext.js';
 import { HistoryManager } from '../../core/HistoryManager.js';
 import { SessionLock } from '../../core/SessionLock.js';
+import { SessionLifecycleCoordinator } from '../../core/SessionLifecycleCoordinator.js';
 import { ThoughtEvaluator } from '../../core/ThoughtEvaluator.js';
 import { ThoughtFormatter } from '../../core/ThoughtFormatter.js';
 import { ThoughtProcessor, type CallToolResult } from '../../core/ThoughtProcessor.js';
@@ -33,6 +34,7 @@ const FEATURES: FeatureFlags = {
 type Harness = {
 	readonly history: HistoryManager;
 	readonly lock: SessionLock;
+	readonly lifecycle: SessionLifecycleCoordinator;
 	readonly processor: ThoughtProcessor;
 	readonly store: InMemorySuspensionStore;
 };
@@ -41,7 +43,8 @@ const liveHarnesses = new Set<Harness>();
 
 function createHarness(): Harness {
 	const lock = new SessionLock();
-	const history = new HistoryManager({ sessionLock: lock });
+	const lifecycle = new SessionLifecycleCoordinator();
+	const history = new HistoryManager({ sessionLock: lock, lifecycleCoordinator: lifecycle });
 	const store = new InMemorySuspensionStore();
 	const processor = new ThoughtProcessor(
 		history,
@@ -53,9 +56,11 @@ function createHarness(): Harness {
 		store,
 		createMockToolRegistry(['search']),
 		FEATURES,
-		lock
+		lock,
+		undefined,
+		lifecycle
 	);
-	const harness = { history, lock, processor, store };
+	const harness = { history, lock, lifecycle, processor, store };
 	liveHarnesses.add(harness);
 	return harness;
 }
@@ -164,7 +169,7 @@ describe('continuation session and owner admission', () => {
 
 describe('continuation and reset ordering', () => {
 	it('lets reset clear A before a queued A observation while B remains unchanged', async () => {
-		const { history, lock, processor, store } = createHarness();
+		const { history, lifecycle, processor, store } = createHarness();
 		const token = await suspend(processor, SESSION_A);
 		await processor.process({
 			thought: 'B remains',
@@ -175,12 +180,12 @@ describe('continuation and reset ordering', () => {
 		});
 
 		const reset = processor.resetSession(SESSION_A);
-		expect(lock.isActive(SESSION_A)).toBe(true);
+		expect(lifecycle.phaseFor(SESSION_A)).toBe('resetting');
 		const observation = observe(processor, SESSION_A, token, 'queued after reset');
 		await reset;
 		const rejected = await observation;
 
-		expect(payload(rejected)).toMatchObject({ code: ERROR_CODES.SUSPENSION_NOT_FOUND });
+		expect(payload(rejected)).toMatchObject({ code: ERROR_CODES.SESSION_LIFECYCLE_CLOSED });
 		expect(history.inspectSession(SESSION_A).history).toEqual([]);
 		expect(history.inspectSession(SESSION_B).history.map((thought) => thought.thought)).toEqual([
 			'B remains',

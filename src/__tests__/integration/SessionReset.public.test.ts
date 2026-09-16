@@ -272,7 +272,7 @@ describe.each(['memory', 'file'] as const)(
 
 				expect(rejected.isError).toBe(true);
 				expect(JSON.parse(rejected.content[0]?.text ?? '{}')).toMatchObject({
-					code: ERROR_CODES.PERSISTENCE_SESSION_ADMISSION_CLOSED,
+					code: ERROR_CODES.SESSION_LIFECYCLE_CLOSED,
 				});
 				expect(server.history.inspectSession(sessionId)).toEqual(afterFailure);
 				expect(afterFailure.branchIds).toEqual([]);

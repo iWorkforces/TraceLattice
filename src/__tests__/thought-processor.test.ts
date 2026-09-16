@@ -282,7 +282,9 @@ describe('ThoughtProcessor', () => {
 				}
 				clear(): void {}
 				async resetSession(): Promise<void> {}
+				async resetSessionWithinExclusive(): Promise<void> {}
 				async resetAll(): Promise<void> {}
+				async resetAllWithinExclusive(): Promise<void> {}
 				inspectSession(): HistorySessionSnapshot {
 					return {
 						history: [],
@@ -1565,7 +1567,7 @@ describe('ThoughtProcessor', () => {
 	describe('reset_state', () => {
 		it('delegates a direct reset without a session lock', async () => {
 			const mockHM = new MockHistoryManager();
-			const resetSpy = vi.spyOn(mockHM, 'resetSession');
+			const resetSpy = vi.spyOn(mockHM, 'resetSessionWithinExclusive');
 			const proc = new ThoughtProcessor(mockHM, formatter, new ThoughtEvaluator(), logger);
 
 			await proc.resetSession('direct-reset');
@@ -1575,7 +1577,7 @@ describe('ThoughtProcessor', () => {
 
 		it('delegates a direct reset while holding the shared session lock', async () => {
 			const mockHM = new MockHistoryManager();
-			const resetSpy = vi.spyOn(mockHM, 'resetSession');
+			const resetSpy = vi.spyOn(mockHM, 'resetSessionWithinExclusive');
 			const proc = new ThoughtProcessor(
 				mockHM,
 				formatter,
@@ -1627,7 +1629,7 @@ describe('ThoughtProcessor', () => {
 		it('awaits reset then registers the branch before admitting the replacement', async () => {
 			const events: string[] = [];
 			const mockHM = new MockHistoryManager();
-			vi.spyOn(mockHM, 'resetSession').mockImplementation(async (sessionId) => {
+			vi.spyOn(mockHM, 'resetSessionWithinExclusive').mockImplementation(async (sessionId) => {
 				events.push(`reset:${sessionId}`);
 			});
 			vi.spyOn(mockHM, 'registerBranch').mockImplementation((sessionId, branchId) => {
@@ -1655,9 +1657,9 @@ describe('ThoughtProcessor', () => {
 			]);
 		});
 
-		it('awaits historyManager.resetSession(sessionId) when reset_state is true', async () => {
+		it('awaits exclusive reset work when reset_state is true', async () => {
 			const mockHM = new MockHistoryManager();
-			const spy = vi.spyOn(mockHM, 'resetSession');
+			const spy = vi.spyOn(mockHM, 'resetSessionWithinExclusive');
 			const proc = new ThoughtProcessor(mockHM, formatter, new ThoughtEvaluator(), logger);
 
 			await proc.process({
@@ -1837,7 +1839,9 @@ describe('ThoughtProcessor — uncovered branches', () => {
 				}
 				clear(): void {}
 				async resetSession(): Promise<void> {}
+				async resetSessionWithinExclusive(): Promise<void> {}
 				async resetAll(): Promise<void> {}
+				async resetAllWithinExclusive(): Promise<void> {}
 				inspectSession(): HistorySessionSnapshot {
 					return {
 						history: [],

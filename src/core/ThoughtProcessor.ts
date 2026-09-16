@@ -21,6 +21,7 @@ import {
 	type ThoughtId,
 } from '../contracts/ids.js';
 import type { IEdgeStore, IOutcomeRecorder } from '../contracts/interfaces.js';
+import type { ICalibrator } from '../contracts/calibrator.js';
 import type { ISuspensionStore, SuspensionRecord } from '../contracts/suspension.js';
 import type { IReasoningStrategy, StrategyDecision } from '../contracts/strategy.js';
 import { DEFAULT_FLAGS, type FeatureFlags } from '../contracts/features.js';
@@ -55,6 +56,7 @@ import type { PatternName, PatternSignal } from './reasoning.js';
 import { SequentialStrategy } from './reasoning/strategies/SequentialStrategy.js';
 import type { CompressionService } from './compression/CompressionService.js';
 import { validateThoughtCrossReferences } from './CrossReferenceValidator.js';
+import { SessionLifecycleCoordinator } from './SessionLifecycleCoordinator.js';
 
 type ConfidenceSignalsResult = ReturnType<ThoughtEvaluator['computeConfidenceSignals']>;
 type ReasoningStatsResult = ReturnType<ThoughtEvaluator['computeReasoningStats']>;
@@ -173,7 +175,9 @@ export class ThoughtProcessor {
 		private readonly _toolRegistry?: IToolRegistry,
 		private readonly _features: FeatureFlags = DEFAULT_FLAGS,
 		private readonly _sessionLock?: ISessionLock,
-		private readonly _outcomeRecorder?: IOutcomeRecorder
+		private readonly _outcomeRecorder?: IOutcomeRecorder,
+		private readonly _lifecycle: SessionLifecycleCoordinator = new SessionLifecycleCoordinator(),
+		private readonly _calibrator?: ICalibrator
 	) {
 		this._thoughtEvaluator = thoughtEvaluator;
 		this._logger = logger ?? new NullLogger();
@@ -293,11 +297,19 @@ export class ThoughtProcessor {
 	public async process(input: ThoughtProcessInput): Promise<CallToolResult> {
 		try {
 			const prepared = this._prepareInput(input);
-			const lock = this._sessionLock;
-			if (lock) {
-				return await lock.withLock(prepared.sessionId, () => this._processInner(prepared));
+			const operation = async (): Promise<CallToolResult> => {
+				if (this._sessionLock !== undefined) {
+					return await this._sessionLock.withLock(prepared.sessionId, () =>
+						this._processInner(prepared)
+					);
+				}
+				return await this._processInner(prepared);
+			};
+			if (prepared.resetState) {
+				this.historyManager.inspectSession(prepared.sessionId);
+				return await this._lifecycle.withSessionReset(prepared.sessionId, operation);
 			}
-			return await this._processInner(prepared);
+			return await this._lifecycle.runOperation(prepared.sessionId, operation);
 		} catch (error) {
 			return this._buildErrorResponse(error);
 		}
@@ -306,25 +318,27 @@ export class ThoughtProcessor {
 	/** Resets one canonical session and its processor-owned auxiliary state. */
 	public async resetSession(sessionId: string): Promise<void> {
 		const canonicalSessionId = asSessionId(sessionId);
+		this.historyManager.inspectSession(canonicalSessionId);
 		const operation = async (): Promise<void> => {
-			await this.historyManager.resetSession(canonicalSessionId, () =>
-				this._clearSessionAuxiliaryState(canonicalSessionId)
+			await this.historyManager.resetSessionWithinExclusive(canonicalSessionId, () =>
+				this.clearSessionAuxiliaryState(canonicalSessionId)
 			);
 		};
-		if (this._sessionLock) {
-			await this._sessionLock.withLock(canonicalSessionId, operation);
-			return;
-		}
-		await operation();
+		await this._lifecycle.withSessionReset(canonicalSessionId, async () => {
+			if (this._sessionLock !== undefined) {
+				await this._sessionLock.withLock(canonicalSessionId, operation);
+				return;
+			}
+			await operation();
+		});
 	}
 
 	/** Resets all history and processor-owned auxiliary state from a trusted context. */
 	public async resetAll(): Promise<void> {
-		await this.historyManager.resetAll(() => {
-			this._suspensionStore?.clearAll();
-			this._outcomeRecorder?.clearAllOutcomes();
-			this._hintCooldowns.clear();
-		});
+		await this._lifecycle.withGlobalReset(
+			async () =>
+				await this.historyManager.resetAllWithinExclusive(() => this.clearAllAuxiliaryState())
+		);
 	}
 
 	private _prepareInput(input: ThoughtProcessInput): PreparedThought {
@@ -393,10 +407,20 @@ export class ThoughtProcessor {
 		};
 	}
 
-	private _clearSessionAuxiliaryState(sessionId: SessionId): void {
+	/** Clears all processor-owned state for one removed session. */
+	public clearSessionAuxiliaryState(sessionId: SessionId): void {
 		this._hintCooldowns.delete(sessionId);
 		this._suspensionStore?.clearSession(sessionId);
 		this._outcomeRecorder?.clearOutcomes(sessionId);
+		this._calibrator?.clearSession(sessionId);
+	}
+
+	/** Clears all processor-owned state after global reset or successful shutdown. */
+	public clearAllAuxiliaryState(): void {
+		this._suspensionStore?.clearAll();
+		this._outcomeRecorder?.clearAllOutcomes();
+		this._calibrator?.clearAll();
+		this._hintCooldowns.clear();
 	}
 
 	private _validateToolArgumentsShape(toolArguments: unknown): void {
@@ -449,8 +473,8 @@ export class ThoughtProcessor {
 		}
 
 		if (resetState) {
-			await this.historyManager.resetSession(sessionId, () =>
-				this._clearSessionAuxiliaryState(sessionId)
+			await this.historyManager.resetSessionWithinExclusive(sessionId, () =>
+				this.clearSessionAuxiliaryState(sessionId)
 			);
 			this.log('State reset for session', { sessionId });
 		}

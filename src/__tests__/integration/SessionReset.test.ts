@@ -12,6 +12,7 @@ import {
 import { runWithContext } from '../../context/RequestContext.js';
 import { HistoryManager } from '../../core/HistoryManager.js';
 import { SessionLock } from '../../core/SessionLock.js';
+import { SessionLifecycleCoordinator } from '../../core/SessionLifecycleCoordinator.js';
 import { ThoughtEvaluator } from '../../core/ThoughtEvaluator.js';
 import { ThoughtFormatter } from '../../core/ThoughtFormatter.js';
 import { ThoughtProcessor } from '../../core/ThoughtProcessor.js';
@@ -83,6 +84,16 @@ class ControlledPersistence implements SessionScopedPersistenceBackend {
 		const sessions = this.branches.get(sessionId) ?? new Map<BranchId, ThoughtData[]>();
 		sessions.set(branchId, structuredClone([...thoughts]));
 		this.branches.set(sessionId, sessions);
+	}
+
+	async deleteBranch(branchId: BranchId): Promise<void> {
+		await this.deleteBranchForSession(asSessionId('__global__'), branchId);
+	}
+
+	async deleteBranchForSession(sessionId: SessionId, branchId: BranchId): Promise<void> {
+		const branches = this.branches.get(sessionId);
+		branches?.delete(branchId);
+		if (branches?.size === 0) this.branches.delete(sessionId);
 	}
 
 	async loadBranch(branchId: BranchId): Promise<ThoughtData[] | undefined> {
@@ -171,6 +182,7 @@ function createHarness(persistence: ControlledPersistence): {
 	const summaryStore = new InMemorySummaryStore();
 	const suspensionStore = new InMemorySuspensionStore();
 	const outcomeRecorder = new OutcomeRecorder({ enabled: true });
+	const lifecycle = new SessionLifecycleCoordinator();
 	const history = new HistoryManager({
 		persistence,
 		edgeStore,
@@ -178,6 +190,7 @@ function createHarness(persistence: ControlledPersistence): {
 		persistenceBufferSize: 100,
 		persistenceFlushInterval: 60000,
 		persistenceMaxRetries: 0,
+		lifecycleCoordinator: lifecycle,
 	});
 	const processor = new ThoughtProcessor(
 		history,
@@ -190,7 +203,8 @@ function createHarness(persistence: ControlledPersistence): {
 		undefined,
 		undefined,
 		new SessionLock(),
-		outcomeRecorder
+		outcomeRecorder,
+		lifecycle
 	);
 	return { history, processor, edgeStore, summaryStore, suspensionStore, outcomeRecorder };
 }
@@ -357,13 +371,13 @@ describe('ordered scoped session reset', () => {
 		expect(history.getBranchIds(SESSION_A)).not.toContain('old-branch');
 		expect(history.getHistory(SESSION_B).map((thought) => thought.thought)).toEqual(['B survives']);
 		expect(edgeStore.size(SESSION_A)).toBe(0);
-		expect(edgeStore.size(SESSION_B)).toBe(1);
+		expect(edgeStore.size(SESSION_B)).toBe(0);
 		expect(summaryStore.size(SESSION_A)).toBe(0);
 		expect(summaryStore.size(SESSION_B)).toBe(1);
 		expect(suspensionStore.size(SESSION_A)).toBe(0);
 		expect(outcomeRecorder.getOutcomes(SESSION_A)).toEqual([]);
 		expect(persistence.edges.has(SESSION_A)).toBe(false);
-		expect(persistence.edges.has(SESSION_B)).toBe(true);
+		expect(persistence.edges.get(SESSION_B)).toEqual([]);
 		expect(persistence.summaries.has(SESSION_A)).toBe(false);
 		expect(persistence.summaries.has(SESSION_B)).toBe(true);
 		expect(
@@ -425,7 +439,7 @@ describe('ordered scoped session reset', () => {
 		const quarantinedSnapshot = history.inspectSession(SESSION_A);
 
 		expect(() => history.registerBranch(SESSION_A, asBranchId('direct-blocked'))).toThrow(
-			expect.objectContaining({ code: ERROR_CODES.PERSISTENCE_SESSION_ADMISSION_CLOSED })
+			expect.objectContaining({ code: ERROR_CODES.SESSION_LIFECYCLE_CLOSED })
 		);
 		expect(history.inspectSession(SESSION_A)).toEqual(quarantinedSnapshot);
 
@@ -439,7 +453,7 @@ describe('ordered scoped session reset', () => {
 		});
 		expect(normal.isError).toBe(true);
 		expect(JSON.parse(normal.content[0]?.text ?? '{}')).toMatchObject({
-			code: ERROR_CODES.PERSISTENCE_SESSION_ADMISSION_CLOSED,
+			code: ERROR_CODES.SESSION_LIFECYCLE_CLOSED,
 		});
 		expect(history.getHistory(SESSION_A).map((thought) => thought.thought)).toEqual(['A stale']);
 		expect(history.inspectSession(SESSION_A)).toEqual(quarantinedSnapshot);
@@ -484,7 +498,7 @@ describe('ordered scoped session reset', () => {
 
 		const reset = history.resetSession(SESSION_A);
 		expect(() => history.registerBranch(SESSION_A, asBranchId('barrier-blocked'))).toThrow(
-			expect.objectContaining({ code: ERROR_CODES.PERSISTENCE_SESSION_ADMISSION_CLOSED })
+			expect.objectContaining({ code: ERROR_CODES.SESSION_LIFECYCLE_CLOSED })
 		);
 		expect(history.inspectSession(SESSION_A)).toEqual(before);
 		clearGate.resolve();
@@ -510,7 +524,7 @@ describe('ordered scoped session reset', () => {
 
 		const reset = history.resetAll();
 		expect(() => history.registerBranch(SESSION_B, asBranchId('global-barrier-blocked'))).toThrow(
-			expect.objectContaining({ code: ERROR_CODES.PERSISTENCE_SESSION_ADMISSION_CLOSED })
+			expect.objectContaining({ code: ERROR_CODES.SESSION_LIFECYCLE_CLOSED })
 		);
 		expect(history.inspectSession(SESSION_B)).toEqual(before);
 		clearGate.resolve();
