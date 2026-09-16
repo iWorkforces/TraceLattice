@@ -29,7 +29,6 @@ import type {
 import type { IOutcomeRecorder, VerificationOutcome } from '../../contracts/interfaces.js';
 import type { ThoughtType } from '../reasoning.js';
 import type { SessionId } from '../../contracts/ids.js';
-import { GLOBAL_SESSION_ID } from '../../contracts/ids.js';
 import {
 	EPSILON,
 	MIN_OUTCOMES_FOR_TEMPERATURE,
@@ -42,7 +41,7 @@ import { ALL_THOUGHT_TYPES } from './internals.js';
 const ECE_BINS = 10;
 
 /** Sentinel used in the per-session temperature map for global state. */
-const GLOBAL_KEY: SessionId = GLOBAL_SESSION_ID;
+const GLOBAL_KEY: unique symbol = Symbol('global calibration temperature');
 
 /**
  * Build per-type empirical means + counts from a list of outcomes.
@@ -52,7 +51,7 @@ const GLOBAL_KEY: SessionId = GLOBAL_SESSION_ID;
  *          are absent from the map.
  */
 function aggregatePerType(
-	outcomes: readonly VerificationOutcome[],
+	outcomes: readonly VerificationOutcome[]
 ): Map<string, { mean: number; count: number }> {
 	const sums = new Map<string, { sum: number; count: number }>();
 	for (const o of outcomes) {
@@ -126,7 +125,7 @@ function expectedCalibrationError(outcomes: readonly VerificationOutcome[]): num
  *          no recorded outcomes.
  */
 function perTypeBrier(
-	outcomes: readonly VerificationOutcome[],
+	outcomes: readonly VerificationOutcome[]
 ): Record<ThoughtType, number | null> {
 	const buckets = new Map<string, VerificationOutcome[]>();
 	for (const o of outcomes) {
@@ -170,7 +169,7 @@ function emptyMetrics(): CalibrationMetrics {
 export class Calibrator implements ICalibrator {
 	public readonly enabled: boolean;
 	private readonly _recorder: IOutcomeRecorder;
-	private readonly _temperatures = new Map<SessionId, number>();
+	private readonly _temperatures = new Map<SessionId | typeof GLOBAL_KEY, number>();
 
 	constructor(outcomeRecorder: IOutcomeRecorder, enabled: boolean) {
 		this._recorder = outcomeRecorder;
@@ -180,7 +179,7 @@ export class Calibrator implements ICalibrator {
 	public calibrate(
 		rawConfidence: number,
 		type: ThoughtType,
-		sessionId: SessionId,
+		sessionId: SessionId
 	): CalibrationResult {
 		const raw = Math.min(1, Math.max(0, rawConfidence));
 		if (!this.enabled) {
@@ -193,7 +192,8 @@ export class Calibrator implements ICalibrator {
 		const observedMean = typeStats?.mean ?? 0.5;
 		const priorWeight = 1 / (1 + n / 10);
 		const shrunk = priorWeight * observedMean + (1 - priorWeight) * raw;
-		const temperature = this._temperatures.get(sessionId) ?? this._temperatures.get(GLOBAL_KEY) ?? 1.0;
+		const temperature =
+			this._temperatures.get(sessionId) ?? this._temperatures.get(GLOBAL_KEY) ?? 1.0;
 		const calibrated =
 			outcomes.length >= MIN_OUTCOMES_FOR_TEMPERATURE
 				? applyTemperature(shrunk, temperature)
@@ -223,5 +223,15 @@ export class Calibrator implements ICalibrator {
 				? this._recorder.getAllOutcomes()
 				: this._recorder.getOutcomes(sessionId);
 		this._temperatures.set(key, fitTemperature(outcomes));
+	}
+
+	public clearSession(sessionId: SessionId): void {
+		if (!this.enabled) return;
+		this._temperatures.delete(sessionId);
+	}
+
+	public clearAll(): void {
+		if (!this.enabled) return;
+		this._temperatures.clear();
 	}
 }

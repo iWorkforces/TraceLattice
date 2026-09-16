@@ -8,7 +8,7 @@ import { Calibrator } from '../../core/evaluator/Calibrator.js';
 import { ALL_THOUGHT_TYPES } from '../../core/evaluator/internals.js';
 import type { IOutcomeRecorder, VerificationOutcome } from '../../contracts/interfaces.js';
 import type { ThoughtType } from '../../core/reasoning.js';
-import { asSessionId, asThoughtId } from '../../contracts/ids.js';
+import { asSessionId, asThoughtId, GLOBAL_SESSION_ID } from '../../contracts/ids.js';
 
 class MockOutcomeRecorder implements IOutcomeRecorder {
 	public readonly enabled = true;
@@ -477,6 +477,110 @@ describe('Calibrator — global temperature fallback', () => {
 		const calibrator = new Calibrator(recorder, true);
 		const r = calibrator.calibrate(0.9, 'hypothesis', asSessionId('sUnknown'));
 		expect(r.temperature).toBe(1.0);
+	});
+});
+
+describe('Calibrator — temperature lifecycle cleanup', () => {
+	it('clearSession() preserves global fallback for the global session id', () => {
+		// Given
+		const recorder = new MockOutcomeRecorder();
+		const calibrator = new Calibrator(recorder, true);
+		const freshSession = asSessionId('global-cleanup-fresh');
+		for (let i = 0; i < 15; i++) {
+			recorder.recordVerification(makeOutcome(0.99, 0, 'hypothesis', 'global-cleanup-source'));
+		}
+		calibrator.refit();
+		const globalTemperature = calibrator.calibrate(0.9, 'hypothesis', freshSession).temperature;
+
+		// When
+		calibrator.clearSession(GLOBAL_SESSION_ID);
+
+		// Then
+		expect(globalTemperature).toBeGreaterThan(1.0);
+		expect(calibrator.calibrate(0.9, 'hypothesis', freshSession).temperature).toBe(
+			globalTemperature
+		);
+	});
+
+	it('clearSession() removes only that session temperature and preserves the global fallback', () => {
+		const recorder = new MockOutcomeRecorder();
+		const calibrator = new Calibrator(recorder, true);
+		const sessionA = asSessionId('cleanup-A');
+		const sessionB = asSessionId('cleanup-B');
+
+		for (let i = 0; i < 15; i++) {
+			recorder.recordVerification(makeOutcome(0.99, 0, 'hypothesis', 'cleanup-A'));
+		}
+		for (let i = 0; i < 9; i++) {
+			recorder.recordVerification(makeOutcome(0.6, 1, 'hypothesis', 'cleanup-B'));
+		}
+		for (let i = 0; i < 6; i++) {
+			recorder.recordVerification(makeOutcome(0.6, 0, 'hypothesis', 'cleanup-B'));
+		}
+
+		calibrator.refit();
+		calibrator.refit(sessionA);
+		calibrator.refit(sessionB);
+		const globalTemperature = calibrator.calibrate(
+			0.9,
+			'hypothesis',
+			asSessionId('cleanup-new')
+		).temperature;
+		const sessionBTemperature = calibrator.calibrate(0.9, 'hypothesis', sessionB).temperature;
+
+		calibrator.clearSession(sessionA);
+
+		expect(calibrator.calibrate(0.9, 'hypothesis', sessionA).temperature).toBe(globalTemperature);
+		expect(calibrator.calibrate(0.9, 'hypothesis', sessionB).temperature).toBe(sessionBTemperature);
+		expect(calibrator.calibrate(0.9, 'hypothesis', asSessionId('cleanup-new')).temperature).toBe(
+			globalTemperature
+		);
+		expect(recorder.getOutcomes(sessionA)).toHaveLength(15);
+	});
+
+	it('clearSession() ignores unknown sessions', () => {
+		const recorder = new MockOutcomeRecorder();
+		const calibrator = new Calibrator(recorder, true);
+		for (let i = 0; i < 15; i++) {
+			recorder.recordVerification(makeOutcome(0.99, 0));
+		}
+		calibrator.refit();
+		const temperature = calibrator.calibrate(0.9, 'hypothesis', asSessionId('known')).temperature;
+
+		calibrator.clearSession(asSessionId('unknown'));
+
+		expect(calibrator.calibrate(0.9, 'hypothesis', asSessionId('known')).temperature).toBe(
+			temperature
+		);
+	});
+
+	it('clearAll() removes every session and global temperature', () => {
+		const recorder = new MockOutcomeRecorder();
+		const calibrator = new Calibrator(recorder, true);
+		const sessionA = asSessionId('clear-all-A');
+		const sessionB = asSessionId('clear-all-B');
+		for (let i = 0; i < 15; i++) {
+			recorder.recordVerification(makeOutcome(0.99, 0, 'hypothesis', 'clear-all-A'));
+			recorder.recordVerification(makeOutcome(0.99, 0, 'hypothesis', 'clear-all-B'));
+		}
+		calibrator.refit();
+		calibrator.refit(sessionA);
+		calibrator.refit(sessionB);
+
+		calibrator.clearAll();
+
+		expect(calibrator.calibrate(0.9, 'hypothesis', sessionA).temperature).toBe(1.0);
+		expect(calibrator.calibrate(0.9, 'hypothesis', sessionB).temperature).toBe(1.0);
+		expect(calibrator.calibrate(0.9, 'hypothesis', asSessionId('clear-all-new')).temperature).toBe(
+			1.0
+		);
+	});
+
+	it('cleanup is safe when calibration is disabled', () => {
+		const calibrator = new Calibrator(new MockOutcomeRecorder(), false);
+
+		expect(() => calibrator.clearSession(asSessionId('disabled'))).not.toThrow();
+		expect(() => calibrator.clearAll()).not.toThrow();
 	});
 });
 
