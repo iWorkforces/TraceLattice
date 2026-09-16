@@ -252,7 +252,7 @@ describe('watcher cleanup ownership', () => {
 			loadFromPersistence: false,
 		});
 		const suspensionStop = vi.spyOn(server.getContainer().resolve('suspensionStore'), 'stop');
-		const historyShutdown = vi.spyOn(server.history, 'shutdown');
+		const historyShutdown = vi.spyOn(server.history, 'shutdownWithinLifecycle');
 		const persistence = server.getContainer().resolve('Persistence');
 		if (persistence === null) throw new TypeError('Expected configured memory persistence');
 		const persistenceClose = vi.spyOn(persistence, 'close');
@@ -329,7 +329,7 @@ describe('watcher cleanup ownership', () => {
 			loadFromPersistence: false,
 		});
 		const suspensionStop = vi.spyOn(server.getContainer().resolve('suspensionStore'), 'stop');
-		const historyShutdown = vi.spyOn(server.history, 'shutdown');
+		const historyShutdown = vi.spyOn(server.history, 'shutdownWithinLifecycle');
 		const persistence = server.getContainer().resolve('Persistence');
 		if (persistence === null) throw new TypeError('Expected configured memory persistence');
 		const persistenceClose = vi.spyOn(persistence, 'close');

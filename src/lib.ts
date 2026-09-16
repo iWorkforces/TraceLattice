@@ -28,6 +28,7 @@ import { createReasoningStrategy } from './core/reasoning/strategies/StrategyFac
 import { ThoughtFormatter } from './core/ThoughtFormatter.js';
 import { ThoughtProcessor, type CallToolResult } from './core/ThoughtProcessor.js';
 import { SessionLock } from './core/SessionLock.js';
+import { SessionLifecycleCoordinator } from './core/SessionLifecycleCoordinator.js';
 import { Container } from './di/Container.js';
 import { StructuredLogger } from './logger/StructuredLogger.js';
 import { Metrics } from './metrics/metrics.impl.js';
@@ -420,6 +421,7 @@ export class ToolAwareSequentialThinkingServer
 		// Register SessionLock as a lazy singleton (always registered;
 		// serializes ThoughtProcessor.process() per-session).
 		container.register('sessionLock', () => new SessionLock());
+		container.register('sessionLifecycle', () => new SessionLifecycleCoordinator());
 
 		ToolAwareSequentialThinkingServer._registerHistoryManager(container);
 		ToolAwareSequentialThinkingServer._registerThoughtPipeline(container, config);
@@ -497,6 +499,11 @@ export class ToolAwareSequentialThinkingServer
 				dagEdges: cfg.features.dagEdges,
 				maxSessionsPerOwner: cfg.maxSessionsPerOwner,
 				sessionLock: container.resolve('sessionLock'),
+				lifecycleCoordinator: container.resolve('sessionLifecycle'),
+				clearSessionAuxiliaryState: (sessionId) =>
+					container.resolve('ThoughtProcessor').clearSessionAuxiliaryState(sessionId),
+				clearAllAuxiliaryState: () =>
+					container.resolve('ThoughtProcessor').clearAllAuxiliaryState(),
 			});
 		});
 	}
@@ -550,7 +557,9 @@ export class ToolAwareSequentialThinkingServer
 				toolRegistry,
 				config.features,
 				sessionLock,
-				container.resolve('outcomeRecorder')
+				container.resolve('outcomeRecorder'),
+				container.resolve('sessionLifecycle'),
+				container.resolve('calibrator')
 			);
 		});
 	}
@@ -644,7 +653,7 @@ export class ToolAwareSequentialThinkingServer
 	 */
 	public stop(): Promise<void> {
 		if (this._stopPromise) return this._stopPromise;
-		this._stopPromise = (async () => {
+		this._stopPromise = this._container.resolve('sessionLifecycle').shutdown(async () => {
 			const failures: unknown[] = [];
 			const watcherResults = await Promise.allSettled([
 				this._skillWatcher?.stop() ?? Promise.resolve(),
@@ -680,7 +689,7 @@ export class ToolAwareSequentialThinkingServer
 
 			// Flush any buffered writes before closing persistence
 			try {
-				await this._historyManager.shutdown();
+				await this._historyManager.shutdownWithinLifecycle();
 			} catch (error) {
 				appendCleanupFailure(failures, error);
 				this._logger.error('Error flushing write buffer during shutdown', {
@@ -705,8 +714,9 @@ export class ToolAwareSequentialThinkingServer
 			if (failures.length > 0) {
 				throw new AggregateError(failures, 'Failed to stop server cleanly');
 			}
+			this._historyManager.clearLiveStateAfterShutdown();
 			this._logger.info('Server stopped, watchers cleaned up');
-		})();
+		});
 		return this._stopPromise;
 	}
 

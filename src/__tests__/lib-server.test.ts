@@ -9,6 +9,7 @@ import type { Metrics } from '../metrics/metrics.impl.js';
 import type { ToolRegistry } from '../registry/ToolRegistry.js';
 import type { SkillRegistry } from '../registry/SkillRegistry.js';
 import type { PersistenceBackend } from '../contracts/PersistenceBackend.js';
+import { SessionLifecycleCoordinator } from '../core/SessionLifecycleCoordinator.js';
 
 function createMockContainer() {
 	const container = new Container();
@@ -36,6 +37,8 @@ function createMockContainer() {
 		getAvailableSkills: vi.fn().mockReturnValue([]),
 		setEventEmitter: vi.fn(),
 		shutdown: vi.fn().mockResolvedValue(undefined),
+		shutdownWithinLifecycle: vi.fn().mockResolvedValue(undefined),
+		clearLiveStateAfterShutdown: vi.fn(),
 		loadFromPersistence: vi.fn().mockResolvedValue(undefined),
 	};
 
@@ -77,6 +80,7 @@ function createMockContainer() {
 	container.registerInstance('ToolRegistry', mockToolRegistry as unknown as ToolRegistry);
 	container.registerInstance('SkillRegistry', mockSkillRegistry as unknown as SkillRegistry);
 	container.registerInstance('Persistence', null);
+	container.registerInstance('sessionLifecycle', new SessionLifecycleCoordinator());
 
 	return {
 		container,
@@ -220,12 +224,12 @@ describe('ToolAwareSequentialThinkingServer', () => {
 	describe('stop', () => {
 		it('should stop server and flush persistence', async () => {
 			await server.stop();
-			expect(mocks.mockHistoryManager.shutdown).toHaveBeenCalled();
+			expect(mocks.mockHistoryManager.shutdownWithinLifecycle).toHaveBeenCalled();
 		});
 
 		it('should surface shutdown errors after cleanup', async () => {
 			const failure = new Error('Flush failed');
-			mocks.mockHistoryManager.shutdown.mockRejectedValue(failure);
+			mocks.mockHistoryManager.shutdownWithinLifecycle.mockRejectedValue(failure);
 			await expect(server.stop()).rejects.toMatchObject({ errors: [failure] });
 			expect(mocks.mockLogger.error).toHaveBeenCalled();
 		});
@@ -265,7 +269,7 @@ describe('ToolAwareSequentialThinkingServer', () => {
 	describe('dispose', () => {
 		it('should stop server and dispose container', async () => {
 			await server.dispose();
-			expect(mocks.mockHistoryManager.shutdown).toHaveBeenCalled();
+			expect(mocks.mockHistoryManager.shutdownWithinLifecycle).toHaveBeenCalled();
 		});
 	});
 
@@ -386,7 +390,7 @@ describe('lib.ts — uncovered branches', () => {
 	describe('stop() non-Error branches (lines 389, 401)', () => {
 		it('should surface a non-Error thrown during shutdown flush', async () => {
 			const mocks = createMockContainer();
-			mocks.mockHistoryManager.shutdown.mockRejectedValue('raw string error');
+			mocks.mockHistoryManager.shutdownWithinLifecycle.mockRejectedValue('raw string error');
 			const server = new ToolAwareSequentialThinkingServer({
 				container: mocks.container,
 				autoDiscover: false,
