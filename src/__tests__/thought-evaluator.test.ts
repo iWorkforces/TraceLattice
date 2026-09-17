@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { safeParse } from 'valibot';
 import { ThoughtEvaluator } from '../core/ThoughtEvaluator.js';
 import { ThoughtProcessor } from '../core/ThoughtProcessor.js';
@@ -9,7 +9,45 @@ import { MockHistoryManager } from './helpers/factories.js';
 import { createTestThought } from './helpers/factories.js';
 import type { ThoughtData } from '../core/thought.js';
 
-import { asBranchId } from '../contracts/ids.js';
+import type { CalibrationMetrics, ICalibrator } from '../contracts/calibrator.js';
+import { asBranchId, asSessionId, GLOBAL_SESSION_ID, type SessionId } from '../contracts/ids.js';
+import type { ThoughtType } from '../contracts/reasoning-types.js';
+
+const EMPTY_CALIBRATION_METRICS: CalibrationMetrics = {
+	brierScore: null,
+	ece: null,
+	sampleCount: 0,
+	perTypeBrier: {
+		regular: null,
+		hypothesis: null,
+		verification: null,
+		critique: null,
+		synthesis: null,
+		meta: null,
+		tool_call: null,
+		tool_observation: null,
+		assumption: null,
+		decomposition: null,
+		backtrack: null,
+	},
+};
+
+function createRecordingCalibrator() {
+	return {
+		enabled: true,
+		calibrate: vi.fn((raw: number, _type: ThoughtType, _sessionId: SessionId) => ({
+			raw,
+			calibrated: raw / 2,
+			temperature: 1,
+			priorWeight: 0,
+		})),
+		metrics: vi.fn((_sessionId?: SessionId) => EMPTY_CALIBRATION_METRICS),
+		refit: vi.fn((_sessionId?: SessionId) => undefined),
+		clearSession: vi.fn((_sessionId: SessionId) => undefined),
+		clearAll: vi.fn(() => undefined),
+	} satisfies ICalibrator;
+}
+
 describe('ThoughtEvaluator', () => {
 	const evaluator = new ThoughtEvaluator();
 
@@ -19,6 +57,54 @@ describe('ThoughtEvaluator', () => {
 	}
 
 	describe('computeConfidenceSignals', () => {
+		it('calibrates the explicit current branch thought in the canonical session', () => {
+			const calibrator = createRecordingCalibrator();
+			const calibratedEvaluator = new ThoughtEvaluator(calibrator);
+			const sessionId = asSessionId('branch-session');
+			const history = [makeThought({ confidence: 0.2, session_id: sessionId })];
+			const currentThought = makeThought({
+				confidence: 0.9,
+				thought_type: 'verification',
+				branch_id: asBranchId('branch'),
+			});
+
+			const signals = calibratedEvaluator.computeConfidenceSignals(history, {}, {
+				currentThought,
+				sessionId,
+			});
+
+			expect(calibrator.calibrate).toHaveBeenCalledWith(0.9, 'verification', sessionId);
+			expect(calibrator.metrics).toHaveBeenCalledWith(sessionId);
+			expect(signals.calibrated_confidence).toBe(0.45);
+		});
+
+		it('uses the canonical global session for the two-argument fallback', () => {
+			const calibrator = createRecordingCalibrator();
+			const calibratedEvaluator = new ThoughtEvaluator(calibrator);
+			const history = [makeThought({ confidence: 0.8 })];
+
+			calibratedEvaluator.computeConfidenceSignals(history, {});
+
+			expect(calibrator.calibrate).toHaveBeenCalledWith(0.8, 'regular', GLOBAL_SESSION_ID);
+			expect(calibrator.metrics).toHaveBeenCalledWith(GLOBAL_SESSION_ID);
+		});
+
+		it('omits calibration fields when the explicit current thought has no confidence', () => {
+			const calibrator = createRecordingCalibrator();
+			const calibratedEvaluator = new ThoughtEvaluator(calibrator);
+
+			const signals = calibratedEvaluator.computeConfidenceSignals(
+				[makeThought({ confidence: 0.8 })],
+				{},
+				{ currentThought: makeThought(), sessionId: asSessionId('current') }
+			);
+
+			expect(calibrator.calibrate).not.toHaveBeenCalled();
+			expect(calibrator.metrics).not.toHaveBeenCalled();
+			expect(signals.calibrated_confidence).toBeUndefined();
+			expect(signals.calibration_metrics).toBeUndefined();
+		});
+
 		it('returns zeros/nulls for empty history', () => {
 			const signals = evaluator.computeConfidenceSignals([], {});
 
