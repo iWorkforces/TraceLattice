@@ -1,6 +1,6 @@
 import type { SessionId } from '../contracts/ids.js';
 import { PersistenceCompatibilityError } from '../errors.js';
-import type { FileSnapshotV2 } from './FileSnapshotV2.js';
+import type { FileSnapshotV2 } from './FileSnapshotTypes.js';
 import {
 	assertBranchScope,
 	assertPersistableThoughtCollections,
