@@ -78,7 +78,6 @@ export interface VerificationOutcome {
 	/** The actual outcome (0 = wrong, 1 = correct). */
 	actual: 0 | 1;
 	/** The thought type that made the prediction. */
-	/** The thought type that made the prediction. */
 	type: ThoughtType;
 	/** Timestamp of outcome recording. */
 	recordedAt: number;
@@ -92,6 +91,12 @@ export interface VerificationOutcome {
  * Brier score and ECE computation.
  */
 export interface IOutcomeRecorder {
+	/**
+	 * Assert that a target has not already received an outcome in this session.
+	 * This preflight is side-effect free and a no-op when recording is disabled.
+	 */
+	assertCanRecord(sessionId: SessionId, thoughtId: ThoughtId): void;
+
 	/**
 	 * Record a verification outcome.
 	 * No-op when outcome recording is disabled.
