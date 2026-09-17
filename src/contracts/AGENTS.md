@@ -1,39 +1,30 @@
 # CONTRACTS MODULE
 
-**Updated:** 2026-06-25
+**Updated:** 2026-09-17
 **Parent:** ../AGENTS.md
 
 ## OVERVIEW
 
-Shared interface contracts. Single coupling point for cross-module type imports (sentrux-enforced). All consumers import directly from the matching file (no barrel).
+Cross-module type hub. No barrel. Import the specific file.
 
-## INTERFACES
+## FILES
 
 | File | Exports |
-|------|---------||
-| `interfaces.ts` | `IMetrics`, `IDiscoveryCache`, `DiscoveryCacheOptions`, `IEdgeStore`, `IOutcomeRecorder`, `IToolRegistry`, `ISessionLock`, `VerificationOutcome` |
-| `strategy.ts` | `IReasoningStrategy`, `StrategyContext`, `StrategyDecision` |
-| `summary.ts` | `ISummaryStore`, `Summary` |
-| `calibrator.ts` | `ICalibrator`, `CalibrationMetrics`, `CalibrationResult` |
-| `suspension.ts` | `ISuspensionStore`, `SuspensionRecord` |
-| `ids.ts` | `SessionId`, `ThoughtId`, `EdgeId`, `SuspensionToken`, `BranchId`, `SummaryId` (branded types) + validated constructors (`asSessionId()`, `asBranchId()` etc.) + unchecked constructors (`asThoughtId()`, `asEdgeId()`, `asSuspensionToken()`, `asSummaryId()`) + generators + `GLOBAL_SESSION_ID` constant |
-| `reasoning-types.ts` | `ThoughtType`, `PatternName` reasoning vocabulary unions |
-| `features.ts` | `FeatureFlags`, `DEFAULT_FLAGS`, `hasFeature()` type guard |
-| `transport.ts` | `ITransport`, `TransportKind` |
-| `PersistenceBackend.ts` | `PersistenceBackend` (13 methods), `PersistenceConfig` |
+|------|---------|
+| `interfaces.ts` | `IMetrics`, `IDiscoveryCache`, `IEdgeStore` (+ `pruneSession`/`clearAll`), `IOutcomeRecorder`, `IToolRegistry`, `ISessionLock` (`withLock`/`isActive`/`size`) |
+| `strategy.ts` | `IReasoningStrategy.decide` (not `decideNext`), `shouldBranch`, `shouldTerminate` |
+| `summary.ts` | `ISummaryStore` (`add`/`get`/`forSession`/`forBranch`/`clearSession`); re-exports `Summary` from core |
+| `calibrator.ts` | `ICalibrator`, metrics/result types |
+| `suspension.ts` | `ISuspensionStore` (`suspend`/`resume`→null/`compareAndAdmit`/`peek`/`expireOlderThan`) |
+| `ids.ts` | branded IDs. Only `asSessionId()` validates. `asBranchId()` does **not**. |
+| `reasoning-types.ts` | `ThoughtType` (11), `PatternName` (6) |
+| `features.ts` | `FeatureFlags`, `DEFAULT_FLAGS`. **No `hasFeature()`**. |
+| `transport.ts` | `ITransport` |
+| `PersistenceBackend.ts` | 13-method + scoped extras |
+| `persistence-work.ts` | buffer job/token types |
 
-Key contracts:
-- `IEdgeStore` (7 methods): `addEdge`, `getEdge`, `outgoing`, `incoming`, `edgesForSession`, `clearSession`, `size`
-- `IReasoningStrategy`: pure policy, `decideNext(ctx) → StrategyDecision`, no mutable state, no I/O
-- `ISuspensionStore` (8 methods): `suspend`, `resume`, `peek`, `expire`, `clearSession`, `size`, `start`, `stop`
-- `ISessionLock`: per-session concurrency lock (`@internal`; registered in DI as `sessionLock`)
-- `FeatureFlags`: 7 readonly flags + `DEFAULT_FLAGS` + `hasFeature()` type guard, re-exported from `ServerConfig.ts`
-- `ITransport`: shared transport lifecycle (`kind`, `connect`, `stop`, `clientCount`, `isShuttingDown`, `serverUrl`)
-- `GLOBAL_SESSION_ID`: replaces literal `'__global__'` string everywhere
-- `ThoughtType` / `PatternName`: canonical reasoning vocabulary in `reasoning-types.ts`; `core/reasoning.ts` keeps compatibility aliases while it owns `ConfidenceSignals`, `ReasoningStats`, and `PatternSignal`.
-- `ISessionLock` (2 methods): `acquire(sessionId) → Promise<ISessionLockHandle>`, `release(handle)` — per-session concurrency control. `@internal` — do not use outside DI-wired code.
 ## RULES
 
-- ALL cross-module type imports MUST route through this directory.
-- Exception: `IHistoryManager` and `ThoughtData` deliberately live in `src/core/` (domain primitives, not here).
-- Define interface here, implement in owning module, never import implementations across modules.
+- Cross-module types go through here.
+- Stay in `core/`: `IHistoryManager`, `ThoughtData`, `ConfidenceSignals`/`ReasoningStats`, `Edge`/`EdgeKind`, `Summary` value type.
+- Define interface here, implement in the owning module. Do not import implementations across modules.
