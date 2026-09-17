@@ -5,7 +5,7 @@ import { ConnectionPool, Session, createConnectionPool } from '../pool/Connectio
 import type { ThoughtData } from '../core/thought.js';
 import { asSessionId } from '../contracts/ids.js';
 import { NullLogger } from '../logger/NullLogger.js';
-import { SessionNotActiveError, SessionNotFoundError } from '../errors.js';
+import { SessionNotActiveError, SessionNotFoundError } from '../pool/PoolErrors.js';
 import type { SessionRunResult } from '../pool/IConnectionPool.js';
 
 const createMockServer = () => ({
