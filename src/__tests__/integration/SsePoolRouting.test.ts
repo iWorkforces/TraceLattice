@@ -10,8 +10,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { asSessionId, type SessionId } from '../../contracts/ids.js';
 import { getOwner } from '../../context/RequestContext.js';
 import type { ThoughtData } from '../../core/thought.js';
-import { SessionNotActiveError } from '../../errors.js';
 import { ConnectionPool, createConnectionPool } from '../../pool/ConnectionPool.js';
+import { SessionNotActiveError } from '../../pool/PoolErrors.js';
 import type {
 	IConnectionPool,
 	ProcessResult,
