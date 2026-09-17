@@ -4,7 +4,7 @@
 
 ## OVERVIEW
 
-Vitest 4.1.x suite colocated under `src/__tests__/` (non-standard, kept inside `src/` for path alias parity). Current full run: 2101 passing tests, 16 skipped. Coverage gates: branches 90%, functions 60%, lines 65%, statements 65%.
+Vitest 4.1.x suite colocated under `src/__tests__/` (non-standard, kept inside `src/` for path alias parity). Coverage gates: branches 90%, functions 60%, lines 65%, statements 65%.
 
 ## STRUCTURE
 
@@ -38,7 +38,6 @@ eval/fixtures/   scenarios.ts (10 canonical eval scenarios)
 
 ## SKIPS / KNOWN GAPS
 
-- `sse-transport.test.ts`: custom SSE path case is skipped; custom path behavior is not implemented.
 - `integration/dag-edges.test.ts`: conditional SQLite/persistence restart cases skip when SQLite is unavailable.
 - `integration/CompressionPersistence.test.ts`: compression persistence variants use `skipIf` for unavailable backend combinations.
 - Keep skip comments local to the skipped `it`/`describe`; do not add silent `skipIf` gates.
