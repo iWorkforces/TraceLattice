@@ -40,7 +40,7 @@ export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 ## CHILD LOGGERS
 
 ```typescript
-const childLogger = logger.child({ transport: 'sse', sessionId: '...' });
+const childLogger = logger.child({ transport: 'streamable-http', sessionId: '...' });
 // All child log calls include inherited context fields
 ```
 

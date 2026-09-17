@@ -3,12 +3,12 @@
  */
 import type { McpServer } from 'tmcp';
 
-export type TransportKind = 'sse' | 'http' | 'streamable-http';
+export type TransportKind = 'http' | 'streamable-http';
 
 /**
  * Shared lifecycle interface for MCP transports.
  *
- * All transports (SSE, HTTP, Streamable HTTP) implement this interface.
+ * All transports (HTTP and Streamable HTTP) implement this interface.
  * Share lifecycle only — request/response shapes genuinely differ across transports.
  */
 export interface ITransport {

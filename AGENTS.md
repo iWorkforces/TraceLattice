@@ -6,7 +6,7 @@
 
 ## OVERVIEW
 
-MCP Sequential Thinking Server — TypeScript/Node.js server providing structured thinking with tool/skill recommendations and a6-type reasoning pipeline (hypothesis → verification → critique → synthesis → meta). Supports stdio, SSE, Streamable HTTP, and HTTP transports with DI and persistence.
+MCP Sequential Thinking Server — TypeScript/Node.js server providing structured thinking with tool/skill recommendations and a6-type reasoning pipeline (hypothesis → verification → critique → synthesis → meta). Supports stdio, Streamable HTTP, and HTTP transports with DI and persistence.
 
 ## STRUCTURE
 
@@ -19,11 +19,11 @@ MCP Sequential Thinking Server — TypeScript/Node.js server providing structure
 │   │   ├── evaluator/    # Decomposed evaluator: SignalComputer, Aggregator, PatternDetector, Calibrator
 │   │   ├── tools/         # Tool interleave: InMemorySuspensionStore (suspend/resume)
 │   │   └── reasoning/    # Strategies: Sequential, TreeOfThought (BFS/beam), StrategyFactory
-│   ├── transport/        # MCP transports (SSE/HTTP/StreamableHTTP)
+│   ├── transport/        # MCP transports (Streamable HTTP/HTTP JSON-RPC)
 │   ├── di/               # DI container + service registry (19 services)
 │   ├── registry/         # Tool/Skill registries (BaseRegistry<T> + subclasses)
 │   ├── contracts/        # Shared interfaces (IMetrics, IDiscoveryCache, etc.)
-│   ├── __tests__/        # Test suite (Vitest, 2101 tests; colocated under src)
+│   ├── __tests__/        # Vitest suite (colocated under src)
 │   ├── cache/            # LRU+TTL discovery cache
 │   ├── logger/           # Structured logging (JSON/pretty)
 │   ├── pool/             # Multi-user session pool
@@ -48,7 +48,7 @@ MCP Sequential Thinking Server — TypeScript/Node.js server providing structure
 | **Shared Interfaces**    | `src/contracts/interfaces.ts`  | IMetrics, IDiscoveryCache, etc. (`IHistoryManager` in `src/core/`) |
 | **Persistence**          | `src/persistence/`             | File/SQLite/Memory backends                                        |
 | **DI Container**         | `src/di/Container.ts`          | IoC container + ServiceRegistry type                               |
-| **Transports**           | `src/transport/`               | SSE, HTTP, StreamableHTTP implementations                          |
+| **Transports**           | `src/transport/`               | Streamable HTTP and HTTP JSON-RPC implementations                  |
 | **Tool/Skill Discovery** | `src/registry/BaseRegistry.ts` | Base class with frontmatter parsing, LRU cache                     |
 | **Quality Signals**      | `src/core/ThoughtEvaluator.ts` | Stateless confidence signals + reasoning analytics                 |
 | **Reasoning Types**      | `src/contracts/reasoning-types.ts` + `src/core/reasoning.ts` | `ThoughtType`/`PatternName` vocabulary; confidence/stat objects stay in core reasoning |
@@ -85,7 +85,6 @@ MCP Sequential Thinking Server — TypeScript/Node.js server providing structure
 | `ToolRegistry`                      | class     | src/registry/ToolRegistry.ts             | MCP tool discovery (extends BaseRegistry)                                            |
 | `SkillRegistry`                     | class     | src/registry/SkillRegistry.ts            | Claude skill discovery(extends BaseRegistry)                                         |
 | `StreamableHttpTransport`           | class     | src/transport/StreamableHttpTransport.ts | MCP Streamable HTTP transport (stateful/stateless)                                   |
-| `SseTransport`                      | class     | src/transport/SseTransport.ts            | SSE transport for multi-user streaming                                               |
 | `HttpTransport`                     | class     | src/transport/HttpTransport.ts           | HTTP JSON-RPC transport (stateless)                                                  |
 | `DIContainer`                       | class     | src/di/Container.ts                      | IoC container (singleton/transient/lazy, circular detection). `resolveDynamic(name)` escape hatch replaces deprecated `resolve<T>(string)` overload. |
 | `ServiceRegistry`                   | interface | src/di/ServiceRegistry.ts                | Typed service key map (19 services: `ToolRegistry: ToolRegistry` concrete; includes EdgeStore, reasoningStrategy, outcomeRecorder, calibrator, summaryStore, compressionService, suspensionStore, sessionLock) |
@@ -189,7 +188,7 @@ MCP Sequential Thinking Server — TypeScript/Node.js server providing structure
 - **CD**: `.github/workflows/cd.yml` — main branch only; build + test, skip publish if version already exists, then npm publish with provenance, tag `v<version>`, GitHub release.
 - **Coverage**: Vitest thresholds are branches 90%, functions 60%, lines 65%, statements 65%.
 - **Test Helpers**: `src/__tests__/helpers/factories.ts` — `createTestThought()`, `MockHistoryManager`. `src/__tests__/helpers/timers.ts` — timer helpers.
-- **Large Files**: `ThoughtProcessor.ts` (851L), `errors.ts` (832L), `StreamableHttpTransport.ts` (729L), `schema.ts` (727L), `lib.ts` (677L), `HistoryManager.ts` (573L), `ServerConfig.ts` (517L), `SqlitePersistence.ts` (507L), `SseTransport.ts` (496L), `FilePersistence.ts` (482L), `ConfigLoader.ts` (480L), `metrics.impl.ts` (470L), `InputNormalizer.ts` (460L), `ConnectionPool.ts` (450L).
+- **Large Files**: `ThoughtProcessor.ts` (851L), `errors.ts` (832L), `StreamableHttpTransport.ts` (729L), `schema.ts` (727L), `lib.ts` (677L), `HistoryManager.ts` (573L), `ServerConfig.ts` (517L), `SqlitePersistence.ts` (507L), `FilePersistence.ts` (482L), `ConfigLoader.ts` (480L), `metrics.impl.ts` (470L), `InputNormalizer.ts` (460L), `ConnectionPool.ts` (450L).
 - **Architectural Layers**: `.sentrux/rules.toml` — 9 layers (types→crosscutting→config→core→domain→infrastructure→di→app→cli), 6 forbidden boundaries.
 - **Duplicate env files**: Both `.env.example` (minimal) and `.example.env` (full) exist — non-standard.
 - **Build split**: `rslib` emits `dist/lib.js`; `rsbuild` bundles `src/cli.ts` but externalizes `./lib.js`; `scripts/postbuild-cli.mjs` injects `#!/usr/bin/env bun` and chmods `dist/cli.js`.
@@ -200,7 +199,7 @@ MCP Sequential Thinking Server — TypeScript/Node.js server providing structure
 npm run build       # rslib build && rsbuild build -c rsbuild.config.ts && node scripts/postbuild-cli.mjs
 npm run start       # bun dist/cli.js
 npm run dev         # bunx @modelcontextprotocol/inspector dist/cli.js
-npm test            # vitest run (2101 tests)
+npm test            # vitest run
 npm run test:coverage # vitest run --coverage
 npm run type-check  # tsc --noEmit
 npm run lint        # eslint src/

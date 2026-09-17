@@ -3,7 +3,6 @@ import { McpServer } from 'tmcp';
 import { ValibotJsonSchemaAdapter } from '@tmcp/adapter-valibot';
 import * as v from 'valibot';
 import type { HttpTransport } from '../../transport/HttpTransport.js';
-import type { SseTransport } from '../../transport/SseTransport.js';
 import type { StreamableHttpTransport } from '../../transport/StreamableHttpTransport.js';
 
 export type RequestId = string | number | null;
@@ -16,7 +15,7 @@ export type JsonRpcRequest = {
 	readonly extensionField?: unknown;
 };
 
-export type NetworkTransport = HttpTransport | SseTransport | StreamableHttpTransport;
+export type NetworkTransport = HttpTransport | StreamableHttpTransport;
 
 export type WireResponse = {
 	readonly status: number;

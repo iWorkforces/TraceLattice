@@ -15,8 +15,8 @@ An MCP server that gives AI agents structured sequential thinking with tool and 
 - Outcome recording for tool_call/tool_observation results with metadata
 - Tool and skill recommendations with confidence scores, rationales, and automatic discovery
 - Per-session isolation with TTL eviction and LRU caching
-- CLI transports: stdio (default), SSE (legacy), and Streamable HTTP (production). A stateless HTTP JSON-RPC transport is also available as a library transport
-- Strict TypeScript, Valibot validation, 2100 passing tests, 18-service DI container
+- CLI transports: stdio (default) and Streamable HTTP (production). A stateless HTTP JSON-RPC transport is also available as a library transport
+- Strict TypeScript, Valibot validation, and an 18-service DI container
 
 ## Install
 
@@ -177,15 +177,10 @@ All feature flags default to enabled in `ServerConfig`. Set a boolean flag to `f
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRANSPORT_TYPE` | `stdio` | Transport: `stdio`, `sse`, or `streamable-http` |
-| `STREAMABLE_HTTP_PORT` | `3000` | Port for Streamable HTTP server |
+| `TRANSPORT_TYPE` | `stdio` | Transport: `stdio` or `streamable-http` |
+| `STREAMABLE_HTTP_PORT` | `9007` | Port for Streamable HTTP server |
 | `STREAMABLE_HTTP_HOST` | `localhost` | Host for Streamable HTTP server |
 | `STREAMABLE_HTTP_STATEFUL` | `true` | Enable stateful session tracking |
-| `SSE_PORT` | `3000` | Port for SSE server |
-| `SSE_HOST` | `localhost` | Host for SSE server |
-| `SSE_ENABLE_POOL` | `true` | Enable connection pool for session isolation |
-| `SSE_MAX_SESSIONS` | `100` | Maximum concurrent SSE sessions |
-| `SSE_SESSION_TIMEOUT` | `300000` | SSE session timeout (ms) |
 | `CORS_ORIGIN` | `*` | CORS origin |
 | `ENABLE_CORS` | `true` | Enable CORS preflight |
 | `ALLOWED_HOSTS` | derived from bound host | Comma-separated allowed `Host` header values |
@@ -205,10 +200,9 @@ Set `TRANSPORT_TYPE` to pick one:
 | Transport | When to use | Command |
 |-----------|-------------|---------|
 | `stdio` (default) | Local MCP clients | `tracelattice` |
-| `sse` (legacy) | Multi-user setups, backwards compatibility | `TRANSPORT_TYPE=sse tracelattice` |
 | `streamable-http` | Production deployments | `TRANSPORT_TYPE=streamable-http tracelattice` |
 
-The Streamable HTTP endpoint defaults to `POST /mcp` for JSON-RPC requests and supports stateful sessions via the `Mcp-Session-Id` header. The SSE transport defaults to `GET /sse` and `POST /sse/message`. The library also exposes `HttpTransport` for stateless JSON-RPC over HTTP, but the CLI does not select it with `TRANSPORT_TYPE`.
+The Streamable HTTP endpoint defaults to `POST /mcp` for JSON-RPC requests and supports stateful sessions via the `Mcp-Session-Id` header. In stateful mode, `GET /mcp` may expose `text/event-stream` notifications for that session. The library also exposes `HttpTransport` for stateless JSON-RPC over HTTP, but the CLI does not select it with `TRANSPORT_TYPE`.
 
 ## Development
 
@@ -241,7 +235,7 @@ src/
 │   └── tools/          # InMemorySuspensionStore (suspend/resume)
 ├── contracts/          # Shared interfaces and branded ID types (cross-module coupling point)
 ├── persistence/        # File, SQLite, Memory backends (with saveEdges/loadEdges)
-├── transport/          # SSE, Streamable HTTP, HTTP JSON-RPC
+├── transport/          # Streamable HTTP, HTTP JSON-RPC
 ├── di/                 # IoC container (18 services) + ServiceRegistry
 ├── registry/           # Tool/Skill discovery with frontmatter parsing and LRU cache
 ├── config/             # YAML + env var loading

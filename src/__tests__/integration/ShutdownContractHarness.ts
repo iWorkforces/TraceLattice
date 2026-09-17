@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess, type ChildProcessByStdio } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { request, type ClientRequest, type IncomingMessage, type Server } from 'node:http';
+import type { Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
@@ -25,8 +25,7 @@ export type RunningProcess = {
 	waitForStderr(marker: string): Promise<void>;
 };
 
-export type FixtureMode =
-	'deadline' | 'cleanup-rejection' | 'streamable-file' | 'reload-file' | 'pooled-sse';
+export type FixtureMode = 'deadline' | 'cleanup-rejection' | 'streamable-file' | 'reload-file';
 
 export type FixtureEvent = Readonly<{ event: string } & Record<string, unknown>>;
 
@@ -36,14 +35,6 @@ export type RunningFixture = RunningProcess & {
 };
 
 export type WireResponse = { readonly status: number; readonly body: string };
-
-export type SseConnection = {
-	readonly request: ClientRequest;
-	readonly response: IncomingMessage;
-	readonly event: FixtureEvent;
-	readonly closed: Promise<void>;
-	close(): void;
-};
 
 const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const builtCli = fileURLToPath(new URL('../../../dist/cli.js', import.meta.url));
@@ -215,50 +206,8 @@ export async function postJson(url: string, body: unknown): Promise<WireResponse
 	return { status: response.status, body: await response.text() };
 }
 
-export function requireString(event: FixtureEvent, key: string): string {
-	const value = event[key];
-	if (typeof value !== 'string') throw new ShutdownContractFixtureError(`${key} is not a string`);
-	return value;
-}
-
 export function requireNumber(event: FixtureEvent, key: string): number {
 	const value = event[key];
 	if (typeof value !== 'number') throw new ShutdownContractFixtureError(`${key} is not a number`);
 	return value;
-}
-
-export function connectSse(port: number): Promise<SseConnection> {
-	return new Promise((resolve, reject) => {
-		const clientRequest = request({ hostname: '127.0.0.1', port, path: '/sse' });
-		clientRequest.once('error', reject);
-		clientRequest.once('response', (response) => {
-			let buffer = '';
-			const closed = new Promise<void>((closeResolve) => response.once('close', closeResolve));
-			response.on('data', (chunk: Buffer) => {
-				buffer += chunk.toString();
-				const separator = buffer.indexOf('\n\n');
-				if (separator < 0) return;
-				const lines = buffer.slice(0, separator).split('\n');
-				const event = lines.find((line) => line.startsWith('event: '))?.slice(7);
-				const data = lines.find((line) => line.startsWith('data: '))?.slice(6);
-				if (!event || !data) return;
-				const parsed: unknown = JSON.parse(data);
-				if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-					reject(new ShutdownContractFixtureError('SSE event data is not an object'));
-					return;
-				}
-				resolve({
-					request: clientRequest,
-					response,
-					event: Object.freeze({ ...parsed, event }),
-					closed,
-					close: () => {
-						clientRequest.destroy();
-						response.destroy();
-					},
-				});
-			});
-		});
-		clientRequest.end();
-	});
 }

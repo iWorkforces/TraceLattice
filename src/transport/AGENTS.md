@@ -5,7 +5,7 @@
 
 ## OVERVIEW
 
-MCP transport implementations: 3 transport types + shared base. Communication channels between MCP server and clients. Factory pattern, async lifecycle, security baked in. `ITransport` contract: `src/contracts/transport.ts`.
+MCP transport implementations: 2 transport types plus a shared base. Communication channels between MCP server and clients. Factory pattern, async lifecycle, security baked in. `ITransport` contract: `src/contracts/transport.ts`.
 
 ## STRUCTURE
 
@@ -13,7 +13,6 @@ MCP transport implementations: 3 transport types + shared base. Communication ch
 src/transport/
 ├── BaseTransport.ts            # 410L  Abstract base: rate limiting, CORS, validation
 ├── StreamableHttpTransport.ts  # 704L  MCP Streamable HTTP (stateful/stateless)
-├── SseTransport.ts             # 476L  Server-Sent Events (multi-user streaming)
 ├── HttpTransport.ts            # 344L  HTTP JSON-RPC (stateless)
 └── HttpHelpers.ts              # 109L  readRequestBody + shared utils
 ```
@@ -21,10 +20,7 @@ src/transport/
 ## TRANSPORTS
 
 ### StreamableHttpTransport (production, most complex)
-Production MCP transport (replaced SSE as of MCP spec March 2025). Dual mode: stateful (per-client `SessionState` keyed by `Mcp-Session-Id` header) or stateless. Request streaming, graceful shutdown, session reaper.
-
-### SseTransport (legacy)
-Server-Sent Events for multi-user streaming. `Set<ServerResponse>` connection pool, message queue for late joiners, auto client IDs. Endpoints: `GET /sse` (SSE stream), `POST /sse/message` (send), `GET /health`. Session via `?session=` or `?sessionId=` query param.
+Production MCP transport that replaced the dedicated legacy SSE transport as of the March 2025 MCP specification. Dual mode: stateful (per-client `SessionState` keyed by `Mcp-Session-Id` header) or stateless. In stateful mode, `GET /mcp` provides an optional `text/event-stream` notification stream. Request streaming, graceful shutdown, session reaper.
 
 ### HttpTransport (simplest)
 Stateless JSON-RPC 2.0 over HTTP. Pipeline: rate limit → CORS → body size → schema → delegate. Body limit 10MB, 30s timeout.
@@ -33,11 +29,9 @@ Stateless JSON-RPC 2.0 over HTTP. Pipeline: rate limit → CORS → body size �
 
 | Transport | Method | Path | Notes |
 |-----------|--------|------|-------|
-| StreamableHTTP | POST/GET | `/mcp` | Stateful: `Mcp-Session-Id` header required after init |
+| StreamableHTTP | POST | `/mcp` | JSON-RPC requests; stateful sessions use `Mcp-Session-Id` after init |
+| StreamableHTTP | GET | `/mcp` | Optional stateful `text/event-stream` notification stream |
 | StreamableHTTP | GET | `/health`, `/ready`, `/metrics` | Health/readiness/Prometheus |
-| SSE | GET | `/sse` | SSE stream (long-lived) |
-| SSE | POST | `/sse/message` | Client→server messages |
-| SSE | GET | `/health`, `/ready` | Health/readiness |
 | HTTP | POST | `/messages` | Stateless JSON-RPC 2.0 |
 | HTTP | GET | `/health`, `/ready`, `/metrics` | Health/readiness/Prometheus |
 ## SHARED BASE
@@ -52,9 +46,8 @@ Stateless JSON-RPC 2.0 over HTTP. Pipeline: rate limit → CORS → body size �
 
 ## NOTES
 
-- Factories: `createStreamableHttpTransport()`, `createSseTransport()`, `createHttpTransport()`
+- Factories: `createStreamableHttpTransport()`, `createHttpTransport()`
 - All expose `start()` / `stop()` (Promise-based graceful shutdown)
 - `HealthChecker` integration for `/health`
 - `Mcp-Session-Id` header is the stateful StreamableHTTP session key
 - `HttpHelpers.readRequestBody` shared across HTTP variants, never duplicate
-- `SseTransport` depends on `IConnectionPool` from `src/pool/IConnectionPool.ts`, not concrete `ConnectionPool`. Keep transport code on the pool interface boundary.

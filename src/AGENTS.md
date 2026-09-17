@@ -23,10 +23,10 @@ src/
 │   ├── evaluator/    # SignalComputer, Aggregator, PatternDetector, Calibrator — has AGENTS.md
 │   ├── tools/        # Tool interleave suspend/resume
 │   └── reasoning/    # Sequential, TreeOfThought, StrategyFactory
-├── transport/        # SSE/HTTP/StreamableHTTP — has AGENTS.md
+├── transport/        # Streamable HTTP/HTTP JSON-RPC — has AGENTS.md
 ├── persistence/      # File/SQLite/Memory backends — has AGENTS.md
 ├── contracts/        # Cross-module interfaces hub — has AGENTS.md
-├── __tests__/        # Vitest suite (2101 tests) — has AGENTS.md
+├── __tests__/        # Vitest suite — has AGENTS.md
 ├── di/               # DIContainer + ServiceRegistry (19 typed keys) — has AGENTS.md
 ├── registry/         # BaseRegistry<T>, ToolRegistry, SkillRegistry
 ├── cache/            # LRU+TTL DiscoveryCache (300s, 100 max)

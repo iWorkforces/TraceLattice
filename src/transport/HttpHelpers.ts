@@ -3,7 +3,7 @@
  *
  * Centralizes JSON-RPC response formatting, request body reading,
  * and common HTTP response patterns to eliminate duplication across
- * HttpTransport, StreamableHttpTransport, and SseTransport.
+ * HttpTransport and StreamableHttpTransport.
  *
  * @module transport/HttpHelpers
  */
@@ -107,4 +107,3 @@ export async function readRequestBody(
 
 	return body;
 }
-

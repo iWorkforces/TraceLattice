@@ -349,121 +349,6 @@ async function runReloadFile() {
 	await finish(0, { event: 'reload-final', thoughts });
 }
 
-function createPooledChildServerFactory(context) {
-	const { libModule, childConfig, childStopGate, state } = context;
-	return async () => {
-		state.childCount++;
-		const childNumber = state.childCount;
-		const child = await libModule.createServer({
-			config: childConfig,
-			autoDiscover: false,
-			loadFromPersistence: false,
-		});
-		let stopPromise;
-		await send({ event: 'child-created', childCount: state.childCount });
-		return {
-			processThought: async (input) => {
-				await send({ event: 'child-dispatched', child: childNumber });
-				return child.processThought(input);
-			},
-			stop: () => {
-				if (stopPromise) return stopPromise;
-				stopPromise = (async () => {
-					state.childStopCount++;
-					state.order.push('child-stop-started');
-					await send({ event: 'child-stop-started', stopCount: state.childStopCount });
-					await childStopGate.promise;
-					await child.stop();
-					state.order.push('child-stop-completed');
-					await send({ event: 'child-stop-completed', stopCount: state.childStopCount });
-				})();
-				return stopPromise;
-			},
-		};
-	};
-}
-
-async function runPooledSse() {
-	await nextControl('start');
-	const [
-		lifecycleModule,
-		libModule,
-		configModule,
-		poolModule,
-		transportModule,
-		contextModule,
-		idModule,
-	] = await Promise.all([
-		import('../../../dist/CliLifecycle.js'),
-		import('../../../dist/lib.js'),
-		import('../../../dist/ServerConfig.js'),
-		import('../../../dist/pool/ConnectionPool.js'),
-		import('../../../dist/transport/SseTransport.js'),
-		import('../../../dist/context/RequestContext.js'),
-		import('../../../dist/contracts/ids.js'),
-	]);
-	const childStopGate = deferred();
-	const state = { childCount: 0, childStopCount: 0, order: [] };
-	let shutdownSettled = false;
-	const exits = [];
-	const childConfig = cleanConfig(configModule.ServerConfig);
-	const pool = new poolModule.ConnectionPool({
-		autoCleanup: false,
-		serverFactory: createPooledChildServerFactory({ libModule, childConfig, childStopGate, state }),
-	});
-	const protocolServer = await createProtocolServer(async (input) => {
-		const owner = contextModule.getOwner();
-		if (!owner) throw new TypeError('pooled fixture has no request owner');
-		return pool.process(idModule.asSessionId(owner), input);
-	});
-	const transport = new transportModule.SseTransport({
-		port: 0,
-		host: '127.0.0.1',
-		enableRateLimit: false,
-		connectionPool: pool,
-		persistence: { enabled: false, backend: 'memory' },
-	});
-	await transport.connect(protocolServer);
-	const parentServer = await libModule.createServer({
-		config: cleanConfig(configModule.ServerConfig),
-		autoDiscover: false,
-		loadFromPersistence: false,
-	});
-	const lifecycle = new lifecycleModule.CliLifecycle(parentServer);
-	lifecycle.attachTransport(transport);
-	const handler = lifecycleModule.createCliShutdownHandler(lifecycle, {
-		reportFailure: (error) => {
-			throw error;
-		},
-		exit: (code) => {
-			exits.push(code);
-			process.exitCode = code;
-		},
-	});
-	await send({ event: 'pooled-sse-ready', port: listeningPort(transport) });
-	await nextControl('begin-shutdown');
-	await send({ event: 'shutdown-started' });
-	const shutdown = handler().then(() => {
-		shutdownSettled = true;
-	});
-	await nextControl('observe-shutdown');
-	await nextTurn();
-	if (!shutdownSettled) await send({ event: 'shutdown-pending' });
-	await nextControl('release-child-stop');
-	childStopGate.resolve();
-	await shutdown;
-	state.order.push('lifecycle-completed');
-	await finish(0, {
-		event: 'pooled-sse-final',
-		childCount: state.childCount,
-		childStopCount: state.childStopCount,
-		order: state.order,
-		exits,
-		unhandledRejections,
-		uncaughtExceptions,
-	});
-}
-
 async function main() {
 	switch (mode) {
 		case 'deadline':
@@ -477,9 +362,6 @@ async function main() {
 			return;
 		case 'reload-file':
 			await runReloadFile();
-			return;
-		case 'pooled-sse':
-			await runPooledSse();
 			return;
 		default:
 			throw new TypeError(`unknown shutdown contract fixture mode: ${String(mode)}`);

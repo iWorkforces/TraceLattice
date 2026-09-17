@@ -10,18 +10,12 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from 'tmcp';
-import type { GenericSchema } from 'valibot';
 import { CliLifecycle, createCliShutdownHandler } from './CliLifecycle.js';
 import type { ToolAwareSequentialThinkingServer } from './lib.js';
 import { initializeServer } from './lib.js';
-import { ServerConfig } from './ServerConfig.js';
-import { ConfigLoader } from './config/ConfigLoader.js';
-import { asSessionId } from './contracts/ids.js';
-import { getOwner } from './context/RequestContext.js';
 import { StructuredLogger } from './logger/StructuredLogger.js';
 import { getErrorMessage } from './errors.js';
 import { SEQUENTIAL_THINKING_TOOL, SequentialThinkingSchema } from './schema.js';
-import { assertPooledSsePersistence } from './transport/SseTransport.js';
 
 // Get version from package.json
 const CLI_NAME = 'tracelattice' as const;
@@ -39,13 +33,6 @@ if (shouldShowVersion) {
 }
 async function main() {
 	const transportType = process.env.TRANSPORT_TYPE || 'stdio';
-	if (transportType === 'sse' && process.env.SSE_ENABLE_POOL !== 'false') {
-		const configLoader = new ConfigLoader();
-		const fileConfig = configLoader.load();
-		const effectiveConfig = new ServerConfig(configLoader.toServerConfigOptions(fileConfig ?? {}));
-		assertPooledSsePersistence(true, effectiveConfig.persistence);
-	}
-
 	const adapter = new ValibotJsonSchemaAdapter();
 	const server = new McpServer(
 		{
@@ -64,89 +51,23 @@ async function main() {
 	const thinkingServer = await initializeServer();
 	const lifecycle = new CliLifecycle(thinkingServer);
 	try {
-		if (transportType === 'sse') {
-			await startSseTransport(server, thinkingServer, lifecycle);
+		server.tool(
+			{
+				name: 'sequentialthinking_tools',
+				description: SEQUENTIAL_THINKING_TOOL.description,
+				schema: SequentialThinkingSchema,
+			},
+			async (input) => thinkingServer.processThought(input)
+		);
+		if (transportType === 'streamable-http') {
+			await startStreamableHttpTransport(server, thinkingServer, lifecycle);
 		} else {
-			server.tool(
-				{
-					name: 'sequentialthinking_tools',
-					description: SEQUENTIAL_THINKING_TOOL.description,
-					schema: SequentialThinkingSchema,
-				},
-				async (input) => thinkingServer.processThought(input)
-			);
-			if (transportType === 'streamable-http') {
-				await startStreamableHttpTransport(server, thinkingServer, lifecycle);
-			} else {
-				await startStdioTransport(server, thinkingServer, lifecycle);
-			}
+			await startStdioTransport(server, thinkingServer, lifecycle);
 		}
 		registerShutdownHandlers(lifecycle, thinkingServer, transportType === 'stdio');
 	} catch (error) {
 		await lifecycle.rollbackStartup(error);
 	}
-}
-/**
- * Start SSE transport for multi-user support
- */
-async function startSseTransport(
-	server: McpServer<GenericSchema>,
-	thinkingServer: ToolAwareSequentialThinkingServer,
-	lifecycle: CliLifecycle
-): Promise<void> {
-	const { SseTransport } = await import('./transport/SseTransport.js');
-	const { createConnectionPool } = await import('./pool/ConnectionPool.js');
-	const port = parseInt(process.env.SSE_PORT || '3000', 10);
-	const host = process.env.SSE_HOST || 'localhost';
-	const transportMetrics = thinkingServer.getContainer().resolve('Metrics');
-	const enablePool = process.env.SSE_ENABLE_POOL !== 'false';
-	const maxSessions = parseInt(process.env.SSE_MAX_SESSIONS || '100', 10);
-	const sessionTimeout = parseInt(process.env.SSE_SESSION_TIMEOUT || '300000', 10);
-	const connectionPool = enablePool
-		? createConnectionPool({
-				maxSessions,
-				sessionTimeout,
-				logger: thinkingServer['_logger'],
-				serverFactory: async () => {
-					const { createServer: createThinkingServer } = await import('./lib.js');
-					const sessionServer = await createThinkingServer({ autoDiscover: true });
-					return sessionServer;
-				},
-			})
-		: undefined;
-	const sseTransport = new SseTransport({
-		port,
-		host,
-		corsOrigin: process.env.CORS_ORIGIN || '*',
-		enableCors: process.env.ENABLE_CORS !== 'false',
-		allowedHosts: process.env.ALLOWED_HOSTS?.split(',').map((hostValue) => hostValue.trim()),
-		metrics: transportMetrics,
-		connectionPool,
-		persistence: thinkingServer.config.persistence,
-	});
-	lifecycle.attachTransport(sseTransport);
-	server.tool(
-		{
-			name: 'sequentialthinking_tools',
-			description: SEQUENTIAL_THINKING_TOOL.description,
-			schema: SequentialThinkingSchema,
-		},
-		async (input) => {
-			if (!connectionPool) {
-				return thinkingServer.processThought(input);
-			}
-			const result = await connectionPool.process(asSessionId(getOwner() ?? ''), input);
-			return {
-				content: result.content,
-				...(result.isError === undefined ? {} : { isError: result.isError }),
-			};
-		}
-	);
-	// Connect the SSE transport
-	await sseTransport.connect(server);
-	thinkingServer['_logger'].info(
-		`Sequential Thinking MCP Server running on SSE transport at http://${host}:${port}`
-	);
 }
 /**
  * Start Streamable HTTP transport (MCP spec recommended)
@@ -157,8 +78,8 @@ async function startStreamableHttpTransport(
 	lifecycle: CliLifecycle
 ): Promise<void> {
 	const { StreamableHttpTransport } = await import('./transport/StreamableHttpTransport.js');
-	const port = parseInt(process.env.STREAMABLE_HTTP_PORT || process.env.SSE_PORT || '3000', 10);
-	const host = process.env.STREAMABLE_HTTP_HOST || process.env.SSE_HOST || 'localhost';
+	const port = parseInt(process.env.STREAMABLE_HTTP_PORT || '9007', 10);
+	const host = process.env.STREAMABLE_HTTP_HOST || 'localhost';
 	const transportMetrics = thinkingServer.getContainer().resolve('Metrics');
 	const stateful = process.env.STREAMABLE_HTTP_STATEFUL !== 'false';
 	const streamableTransport = new StreamableHttpTransport({
