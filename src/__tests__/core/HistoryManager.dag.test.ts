@@ -1,4 +1,4 @@
-import { asBranchId } from '../../contracts/ids.js';
+import { asBranchId, asSessionId, asThoughtId, GLOBAL_SESSION_ID } from '../../contracts/ids.js';
 /**
  * Tests for flag-gated DAG edge emission in HistoryManager.
  *
@@ -9,11 +9,11 @@ import { asBranchId } from '../../contracts/ids.js';
 
 import { describe, it, expect } from 'vitest';
 import { HistoryManager } from '../../core/HistoryManager.js';
+import { EdgeEmitter } from '../../core/graph/EdgeEmitter.js';
 import { EdgeStore } from '../../core/graph/EdgeStore.js';
 import { generateUlid } from '../../core/ids.js';
 import { createTestThought } from '../helpers/factories.js';
 import type { ThoughtData } from '../../core/thought.js';
-import { asSessionId } from '../../contracts/ids.js';
 
 function makeThought(num: number, overrides?: Partial<ThoughtData>): ThoughtData {
 	return createTestThought({
@@ -137,12 +137,7 @@ describe('HistoryManager DAG edge emission', () => {
 	describe('verifies edges', () => {
 		it('emits a verifies edge from current.id to target.id', () => {
 			const { manager, edgeStore } = setup();
-			const targets = [
-				makeThought(1),
-				makeThought(2),
-				makeThought(3),
-				makeThought(4),
-			];
+			const targets = [makeThought(1), makeThought(2), makeThought(3), makeThought(4)];
 			for (const t of targets) manager.addThought(t);
 			const verifier = makeThought(5, {
 				thought_type: 'verification',
@@ -162,12 +157,7 @@ describe('HistoryManager DAG edge emission', () => {
 	describe('critiques edges', () => {
 		it('emits a critiques edge from current.id to target.id', () => {
 			const { manager, edgeStore } = setup();
-			const targets = [
-				makeThought(1),
-				makeThought(2),
-				makeThought(3),
-				makeThought(4),
-			];
+			const targets = [makeThought(1), makeThought(2), makeThought(3), makeThought(4)];
 			for (const t of targets) manager.addThought(t);
 			const critic = makeThought(5, {
 				thought_type: 'critique',
@@ -305,5 +295,142 @@ describe('HistoryManager DAG edge emission', () => {
 			expect(t3BranchEdge).toBeDefined();
 			expect(t3BranchEdge!.from).toBe(t2.id);
 		});
+	});
+});
+
+describe('EdgeEmitter mutation reporting', () => {
+	it('returns true when a relational edge is added', () => {
+		// Given
+		const edgeStore = new EdgeStore();
+		const emitter = new EdgeEmitter({ edgeStore, defaultSessionId: GLOBAL_SESSION_ID });
+		const parentId = asThoughtId('parent');
+		const child = makeThought(2, {
+			id: asThoughtId('child'),
+			branch_from_thought: 1,
+			branch_id: asBranchId('branch'),
+		});
+
+		// When
+		const added = emitter.emitEdgesForThought({ thought_history: [child], branches: {} }, child, {
+			resolvedReferences: { branchFromThoughtId: parentId },
+		});
+
+		// Then
+		expect(added).toBe(true);
+		expect(edgeStore.edgesForSession(GLOBAL_SESSION_ID)[0]?.kind).toBe('branch');
+	});
+
+	it('returns true when a sequence edge is added', () => {
+		// Given
+		const edgeStore = new EdgeStore();
+		const emitter = new EdgeEmitter({ edgeStore, defaultSessionId: GLOBAL_SESSION_ID });
+		const first = makeThought(1, { id: asThoughtId('first') });
+		const second = makeThought(2, { id: asThoughtId('second') });
+
+		// When
+		const added = emitter.emitEdgesForThought(
+			{ thought_history: [first, second], branches: {} },
+			second
+		);
+
+		// Then
+		expect(added).toBe(true);
+		expect(edgeStore.edgesForSession(GLOBAL_SESSION_ID)[0]?.kind).toBe('sequence');
+	});
+
+	it('returns false when the sequence edge is a duplicate', () => {
+		// Given
+		const edgeStore = new EdgeStore();
+		const emitter = new EdgeEmitter({ edgeStore, defaultSessionId: GLOBAL_SESSION_ID });
+		const first = makeThought(1, { id: asThoughtId('first') });
+		const second = makeThought(2, { id: asThoughtId('second') });
+		const session = { thought_history: [first, second], branches: {} };
+		emitter.emitEdgesForThought(session, second);
+
+		// When
+		const added = emitter.emitEdgesForThought(session, second);
+
+		// Then
+		expect(added).toBe(false);
+		expect(edgeStore.size(GLOBAL_SESSION_ID)).toBe(1);
+	});
+
+	it('returns false when a relational edge is a duplicate', () => {
+		// Given
+		const edgeStore = new EdgeStore();
+		const emitter = new EdgeEmitter({ edgeStore, defaultSessionId: GLOBAL_SESSION_ID });
+		const parent = makeThought(1, { id: asThoughtId('parent') });
+		const child = makeThought(2, {
+			id: asThoughtId('child'),
+			branch_from_thought: 1,
+			branch_id: asBranchId('branch'),
+		});
+		const session = { thought_history: [parent, child], branches: {} };
+		const context = { resolvedReferences: { branchFromThoughtId: parent.id } };
+		emitter.emitEdgesForThought(session, child, context);
+
+		// When
+		const added = emitter.emitEdgesForThought(session, child, context);
+
+		// Then
+		expect(added).toBe(false);
+		expect(edgeStore.edgesForSession(GLOBAL_SESSION_ID)).toHaveLength(1);
+	});
+
+	it('returns false when edge emission is disabled', () => {
+		// Given
+		const edgeStore = new EdgeStore();
+		const emitter = new EdgeEmitter({
+			edgeStore,
+			dagEdges: false,
+			defaultSessionId: GLOBAL_SESSION_ID,
+		});
+		const thought = makeThought(1, { id: asThoughtId('thought') });
+
+		// When
+		const added = emitter.emitEdgesForThought(
+			{ thought_history: [thought], branches: {} },
+			thought
+		);
+
+		// Then
+		expect(added).toBe(false);
+		expect(edgeStore.size(GLOBAL_SESSION_ID)).toBe(0);
+	});
+
+	it('returns false when the current thought has no id', () => {
+		// Given
+		const edgeStore = new EdgeStore();
+		const emitter = new EdgeEmitter({ edgeStore, defaultSessionId: GLOBAL_SESSION_ID });
+		const thought = createTestThought({ thought_number: 1 });
+
+		// When
+		const added = emitter.emitEdgesForThought(
+			{ thought_history: [thought], branches: {} },
+			thought
+		);
+
+		// Then
+		expect(added).toBe(false);
+		expect(edgeStore.size(GLOBAL_SESSION_ID)).toBe(0);
+	});
+
+	it('returns false when the candidate edge is invalid', () => {
+		// Given
+		const edgeStore = new EdgeStore();
+		const emitter = new EdgeEmitter({ edgeStore, defaultSessionId: GLOBAL_SESSION_ID });
+		const sharedId = asThoughtId('same-thought');
+		const first = makeThought(1, { id: sharedId });
+		const second = makeThought(2, { id: sharedId });
+
+		// When
+		const added = emitter.emitEdgesForThought(
+			{ thought_history: [first, second], branches: {} },
+			second
+		);
+
+		// Then
+		expect(added).toBe(false);
+		expect(edgeStore.size(GLOBAL_SESSION_ID)).toBe(0);
 	});
 });

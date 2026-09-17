@@ -29,7 +29,6 @@ function toolObservationThought(overrides: Partial<ThoughtData> = {}): ThoughtDa
 		thought_type: 'tool_observation',
 		continuation_token: asSuspensionToken('tok'),
 		id: asThoughtId('to-id-1'),
-		_resumedFrom: 1,
 		...overrides,
 	};
 }
@@ -39,7 +38,9 @@ describe('HistoryManager — tool_invocation edge emission', () => {
 		const edgeStore = new EdgeStore();
 		const hm = new HistoryManager({ edgeStore, dagEdges: true });
 		hm.addThought(toolCallThought());
-		hm.addThought(toolObservationThought({ tool_name: 'search' }));
+		hm.addThought(toolObservationThought({ tool_name: 'search' }), {
+			toolInvocationSourceThoughtId: asThoughtId('tc-id-1'),
+		});
 		const outs = edgeStore.outgoing(SESSION, 'tc-id-1');
 		const toolEdge = outs.find((e) => e.kind === 'tool_invocation');
 		expect(toolEdge).toBeDefined();
@@ -55,7 +56,7 @@ describe('HistoryManager — tool_invocation edge emission', () => {
 		// Pass observation without tool_name; cast preserves type narrowing for the test.
 		const obs = toolObservationThought();
 		delete (obs as Partial<ThoughtData>).tool_name;
-		hm.addThought(obs);
+		hm.addThought(obs, { toolInvocationSourceThoughtId: asThoughtId('tc-id-1') });
 		const outs = edgeStore.outgoing(SESSION, 'tc-id-1');
 		const toolEdge = outs.find((e) => e.kind === 'tool_invocation');
 		expect(toolEdge).toBeDefined();
@@ -66,7 +67,9 @@ describe('HistoryManager — tool_invocation edge emission', () => {
 		const edgeStore = new EdgeStore();
 		const hm = new HistoryManager({ edgeStore, dagEdges: false });
 		hm.addThought(toolCallThought());
-		hm.addThought(toolObservationThought({ tool_name: 'search' }));
+		hm.addThought(toolObservationThought({ tool_name: 'search' }), {
+			toolInvocationSourceThoughtId: asThoughtId('tc-id-1'),
+		});
 		expect(edgeStore.size(SESSION)).toBe(0);
 	});
 
@@ -76,18 +79,17 @@ describe('HistoryManager — tool_invocation edge emission', () => {
 		hm.addThought(toolCallThought());
 		const obs = toolObservationThought({ tool_name: 'search' });
 		delete (obs as Partial<ThoughtData>).id;
-		hm.addThought(obs);
+		hm.addThought(obs, { toolInvocationSourceThoughtId: asThoughtId('tc-id-1') });
 		// No edges referencing the (now id-less) observation should exist.
 		const outs = edgeStore.outgoing(SESSION, 'tc-id-1');
 		expect(outs.find((e) => e.kind === 'tool_invocation')).toBeUndefined();
 	});
 
-	it('falls back to a sequence edge when _resumedFrom is absent', () => {
+	it('falls back to a sequence edge when stable admission context is absent', () => {
 		const edgeStore = new EdgeStore();
 		const hm = new HistoryManager({ edgeStore, dagEdges: true });
 		hm.addThought(toolCallThought());
 		const obs = toolObservationThought({ tool_name: 'search' });
-		delete (obs as Partial<ThoughtData>)._resumedFrom;
 		hm.addThought(obs);
 		const outs = edgeStore.outgoing(SESSION, 'tc-id-1');
 		expect(outs.find((e) => e.kind === 'tool_invocation')).toBeUndefined();

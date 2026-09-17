@@ -11,7 +11,7 @@
 
 import { existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { DiscoveryCache } from '../cache/DiscoveryCache.js';
 import { NullLogger } from '../logger/NullLogger.js';
@@ -52,6 +52,8 @@ export interface BaseRegistryOptions {
 export abstract class BaseRegistry<T extends { name: string }> {
 	/** Internal storage for items indexed by name. */
 	protected _items: Map<string, T>;
+	private _manualItems: Map<string, T>;
+	private _discoveredItemsByPath: Map<string, T>;
 
 	/** Logger for diagnostics. */
 	protected _logger: Logger;
@@ -67,6 +69,7 @@ export abstract class BaseRegistry<T extends { name: string }> {
 
 	/** Promise for in-progress discovery (null if not in progress). */
 	protected _discoveryPromise: Promise<number> | null = null;
+	private _refreshRequested = false;
 
 	/** File extensions to match during discovery. */
 	protected abstract readonly _fileExtensions: string[];
@@ -119,6 +122,8 @@ export abstract class BaseRegistry<T extends { name: string }> {
 
 	constructor(options: BaseRegistryOptions) {
 		this._items = new Map();
+		this._manualItems = new Map();
+		this._discoveredItemsByPath = new Map();
 		this._logger = (options.logger ?? new NullLogger()) as Logger;
 		this._cache = (options.cache ||
 			new DiscoveryCache<T>({ maxSize: 50, ttl: 300000 })) as DiscoveryCache<T>;
@@ -148,6 +153,7 @@ export abstract class BaseRegistry<T extends { name: string }> {
 			throw this._createDuplicateError(item.name);
 		}
 		this._items.set(item.name, item);
+		this._manualItems.set(item.name, item);
 		this.log(`Added ${this._entityName}: ${item.name}`, { [`${this._entityName}Name`]: item.name });
 		// Invalidate cache when adding a new item
 		this._cache?.invalidate('all');
@@ -164,6 +170,10 @@ export abstract class BaseRegistry<T extends { name: string }> {
 			throw this._createNotFoundError(name, 'remove');
 		}
 		this._items.delete(name);
+		this._manualItems.delete(name);
+		for (const [filePath, item] of this._discoveredItemsByPath) {
+			if (item.name === name) this._discoveredItemsByPath.delete(filePath);
+		}
 		this.log(`Removed ${this._entityName}: ${name}`, { [`${this._entityName}Name`]: name });
 		// Invalidate cache when removing an item
 		this._cache?.invalidate('all');
@@ -184,6 +194,10 @@ export abstract class BaseRegistry<T extends { name: string }> {
 		const existing = this._items.get(name)!;
 		const updated = { ...existing, ...updates };
 		this._items.set(name, updated);
+		if (this._manualItems.has(name)) this._manualItems.set(name, updated);
+		for (const [filePath, item] of this._discoveredItemsByPath) {
+			if (item.name === name) this._discoveredItemsByPath.set(filePath, updated);
+		}
 		this.log(`Updated ${this._entityName}: ${name}`, { [`${this._entityName}Name`]: name });
 		// Invalidate cache when updating an item
 		this._cache?.invalidate('all');
@@ -246,6 +260,8 @@ export abstract class BaseRegistry<T extends { name: string }> {
 	 */
 	public clear(): void {
 		this._items.clear();
+		this._manualItems.clear();
+		this._discoveredItemsByPath.clear();
 		this.log(`Cleared all ${this._entityName}s`);
 		// Invalidate cache when clearing all items
 		this._cache?.clear();
@@ -269,26 +285,49 @@ export abstract class BaseRegistry<T extends { name: string }> {
 	 * @returns A Promise resolving to the number of items discovered
 	 */
 	public async discoverAsync(): Promise<number> {
-		// Return existing promise if discovery is in progress
 		if (this._discoveryPromise) {
 			return this._discoveryPromise;
 		}
 
-		// Use cached results if already discovered
 		if (this._discovered) {
 			const cached = this._cache.get('all');
 			return cached?.length ?? 0;
 		}
 
-		// Create discovery promise
-		this._discoveryPromise = this._performDiscovery();
+		return this._beginDiscovery();
+	}
 
-		try {
-			const count = await this._discoveryPromise;
-			return count;
-		} finally {
-			this._discoveryPromise = null;
+	/**
+	 * Re-scans configured directories and atomically reconciles discovered items.
+	 *
+	 * Calls made during an active scan share its promise and request at most one
+	 * follow-up pass, ensuring an event that arrives mid-scan is not lost.
+	 *
+	 * @returns A Promise resolving to the number of discovered filesystem items
+	 */
+	public async refreshAsync(): Promise<number> {
+		this._refreshRequested = true;
+		return this._discoveryPromise ?? this._beginDiscovery();
+	}
+
+	private _beginDiscovery(): Promise<number> {
+		const operation = this._runDiscoveryLoop();
+		this._discoveryPromise = operation;
+		const clearOperation = (): void => {
+			if (this._discoveryPromise === operation) this._discoveryPromise = null;
+		};
+		operation.then(clearOperation, clearOperation);
+		return operation;
+	}
+
+	private async _runDiscoveryLoop(): Promise<number> {
+		this._refreshRequested = false;
+		let count = await this._performDiscovery();
+		while (this._refreshRequested) {
+			this._refreshRequested = false;
+			count = await this._performDiscovery();
 		}
+		return count;
 	}
 
 	/**
@@ -300,7 +339,8 @@ export abstract class BaseRegistry<T extends { name: string }> {
 	 * @returns A Promise resolving to the number of items discovered
 	 */
 	protected async _performDiscovery(): Promise<number> {
-		let discoveredCount = 0;
+		const discoveredItems = new Map<string, T>();
+		const claimedNames = new Set(this._manualItems.keys());
 
 		for (const dir of this._searchDirs) {
 			try {
@@ -320,39 +360,78 @@ export abstract class BaseRegistry<T extends { name: string }> {
 							const content = await readFile(filePath, 'utf-8');
 							const parsed = this._parseFrontmatter(content);
 							if (parsed._error) {
-								this.log(`Skipped ${entry.name}: ${parsed._error}`);
+								this._retainLastKnownGood(filePath, parsed._error, discoveredItems, claimedNames);
 								continue;
 							}
 							if (parsed.name) {
-								// Check if already exists before adding
-								if (!this._items.has(parsed.name)) {
-									const item = this._buildItem(parsed);
-									if (item) {
-										this._items.set(item.name, item);
-										discoveredCount++;
-									}
+								const item = this._buildItem(parsed);
+								if (item && !claimedNames.has(item.name)) {
+									discoveredItems.set(filePath, item);
+									claimedNames.add(item.name);
 								}
 							}
 						} catch (readError) {
-							this.log(`Failed to read ${this._entityName} file ${entry.name}`, {
-								error: getErrorMessage(readError),
-							});
+							this._retainLastKnownGood(
+								filePath,
+								getErrorMessage(readError),
+								discoveredItems,
+								claimedNames
+							);
 						}
 					}
 				}
 			} catch (error) {
-				this.log(`Failed to scan ${this._entityName} directory: ${dir}`, {
+				this._logger.warn(`Failed to scan ${this._entityName} directory`, {
+					directory: dir,
 					error: getErrorMessage(error),
 				});
+				this._retainDirectory(dir, discoveredItems, claimedNames);
 			}
 		}
 
+		this._discoveredItemsByPath = discoveredItems;
+		this._items = new Map(this._manualItems);
+		for (const item of discoveredItems.values()) {
+			if (!this._items.has(item.name)) this._items.set(item.name, item);
+		}
 		this._discovered = true;
-		this._cache?.set('all', Array.from(this._items.values()));
-		this.log(`Discovery complete: found ${discoveredCount} ${this._entityName}s`, {
-			discoveredCount,
+		this._cache.clear();
+		this._cache.set('all', Array.from(this._items.values()));
+		this.log(`Discovery complete: found ${discoveredItems.size} ${this._entityName}s`, {
+			discoveredCount: discoveredItems.size,
 		});
-		return discoveredCount;
+		return discoveredItems.size;
+	}
+
+	private _retainLastKnownGood(
+		filePath: string,
+		reason: string,
+		discoveredItems: Map<string, T>,
+		claimedNames: Set<string>
+	): void {
+		const previous = this._discoveredItemsByPath.get(filePath);
+		if (previous && !claimedNames.has(previous.name)) {
+			discoveredItems.set(filePath, previous);
+			claimedNames.add(previous.name);
+		}
+		this._logger.warn(`Invalid ${this._entityName} discovery file`, {
+			filePath,
+			reason,
+			retainedLastKnownGood: previous !== undefined,
+		});
+	}
+
+	private _retainDirectory(
+		directory: string,
+		discoveredItems: Map<string, T>,
+		claimedNames: Set<string>
+	): void {
+		for (const [filePath, item] of this._discoveredItemsByPath) {
+			if (dirname(filePath) === directory && !claimedNames.has(item.name)) {
+				discoveredItems.set(filePath, item);
+				claimedNames.add(item.name);
+			}
+		}
 	}
 
 	/**

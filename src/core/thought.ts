@@ -50,8 +50,8 @@ export type ThoughtData = Omit<
 	| 'register_branch_id'
 	| 'branch_id'
 	| 'merge_branch_ids'
-| 'current_step'
-| 'previous_steps'
+	| 'current_step'
+	| 'previous_steps'
 > & {
 	/** Unique identifier for this thought (branded ThoughtId). Auto-generated when not provided. */
 	id?: ThoughtId;
@@ -75,13 +75,6 @@ export type ThoughtData = Omit<
 	 * Default: false. Not part of schema input — set by ThoughtProcessor during processing.
 	 */
 	retracted?: boolean;
-
-	/**
-	 * Internal: thought_number of the tool_call this tool_observation resumes from.
-	 * Set transiently by ThoughtProcessor; not part of the public API.
-	 * Used by HistoryManager to emit `tool_invocation` DAG edges.
-	 */
-	_resumedFrom?: number;
 
 	/** Current step recommendation (post-normalization, with defaults filled). */
 	current_step?: StepRecommendation;
@@ -137,12 +130,7 @@ export type SynthesisThought = ThoughtData & {
 export type BaseThought = ThoughtData & {
 	readonly thought_type: Exclude<
 		ThoughtType,
-		| 'tool_call'
-		| 'tool_observation'
-		| 'backtrack'
-		| 'verification'
-		| 'critique'
-		| 'synthesis'
+		'tool_call' | 'tool_observation' | 'backtrack' | 'verification' | 'critique' | 'synthesis'
 	>;
 };
 

@@ -1,20 +1,25 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, rmSync, existsSync, readdirSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import {
-	createTestThought,
-	} from './helpers/factories.js';
+import { createTestThought as createBaseTestThought } from './helpers/factories.js';
 import { asBranchId } from '../contracts/ids.js';
 import { MemoryPersistence } from '../persistence/MemoryPersistence.js';
 import { FilePersistence } from '../persistence/FilePersistence.js';
-import {
-	createPersistenceBackend,
-	} from '../persistence/PersistenceFactory.js';
+import { createPersistenceBackend } from '../persistence/PersistenceFactory.js';
 import type { PersistenceConfig } from '../contracts/PersistenceBackend.js';
 import type { IMetrics } from '../contracts/interfaces.js';
 import type { Edge } from '../core/graph/Edge.js';
 import { asSessionId, asThoughtId, type EdgeId } from '../contracts/ids.js';
+import { PersistenceCompatibilityError, PersistenceCorruptionError } from '../errors.js';
+import { parseFileSnapshotV2 } from '../persistence/FileSnapshotV2.js';
+
+let persistentThoughtSequence = 0;
+function createTestThought(overrides: Parameters<typeof createBaseTestThought>[0] = {}) {
+	persistentThoughtSequence += 1;
+	return createBaseTestThought({ id: `persistence-${persistentThoughtSequence}`, ...overrides });
+}
 
 describe('MemoryPersistence', () => {
 	let backend: MemoryPersistence;
@@ -230,7 +235,9 @@ describe('MemoryPersistence', () => {
 			await backend.saveThought(createTestThought({ thought: 'History thought' }));
 
 			// Add branch
-			await backend.saveBranch(asBranchId('branch-1'), [createTestThought({ thought: 'Branch thought' })]);
+			await backend.saveBranch(asBranchId('branch-1'), [
+				createTestThought({ thought: 'Branch thought' }),
+			]);
 
 			// History should only contain history thoughts
 			const history = await backend.loadHistory();
@@ -259,6 +266,7 @@ describe('FilePersistence', () => {
 	});
 
 	afterEach(async () => {
+		await backend.close();
 		// Clean up test directory
 		if (existsSync(testDir)) {
 			rmSync(testDir, { recursive: true, force: true });
@@ -266,6 +274,46 @@ describe('FilePersistence', () => {
 	});
 
 	describe('saveThought and loadHistory', () => {
+		it('persists sequential writes in the canonical v2 snapshot', async () => {
+			const thought = createTestThought({ thought: 'History record' });
+			const branch = [createTestThought({ thought: 'Branch record' })];
+			const edge: Edge = {
+				id: 'edge-1' as EdgeId,
+				from: asThoughtId('thought-1'),
+				to: asThoughtId('thought-2'),
+				kind: 'sequence',
+				sessionId: asSessionId('session-1'),
+				createdAt: 1,
+			};
+
+			await backend.saveThought(thought);
+			await backend.saveBranch(asBranchId('branch-1'), branch);
+			await backend.saveEdges(asSessionId('session-1'), [edge]);
+
+			const snapshotPath = join(testDir, 'snapshot.json');
+			const snapshot = parseFileSnapshotV2(await readFile(snapshotPath, 'utf-8'), snapshotPath);
+			expect(snapshot.thoughts).toEqual([{ sessionId: '__global__', thoughts: [thought] }]);
+			expect(snapshot.branches).toEqual([
+				{ sessionId: '__global__', branchId: 'branch-1', thoughts: branch },
+			]);
+			expect(snapshot.edges).toEqual([{ sessionId: 'session-1', edges: [edge] }]);
+		});
+
+		it('characterizes sequential retention as the newest v1 records', async () => {
+			const retainedBackend = new FilePersistence({ dataDir: testDir, maxHistorySize: 2 });
+			const thoughts = [1, 2, 3].map((thoughtNumber) =>
+				createTestThought({ thought_number: thoughtNumber, thought: `Thought ${thoughtNumber}` })
+			);
+
+			for (const thought of thoughts) {
+				await retainedBackend.saveThought(thought);
+			}
+
+			const history = await retainedBackend.loadHistory();
+			expect(history).toEqual(thoughts.slice(1));
+			await retainedBackend.close();
+		});
+
 		it('should save and load a single thought', async () => {
 			const thought = createTestThought();
 			await backend.saveThought(thought);
@@ -281,6 +329,7 @@ describe('FilePersistence', () => {
 
 			// Save with first instance
 			await backend.saveThought(thought);
+			await backend.close();
 
 			// Create new instance (simulates restart)
 			const backend2 = new FilePersistence({ dataDir: testDir });
@@ -288,6 +337,7 @@ describe('FilePersistence', () => {
 
 			expect(history).toHaveLength(1);
 			expect(history[0]).toEqual(thought);
+			await backend2.close();
 		});
 
 		it('should handle empty history file', async () => {
@@ -295,17 +345,15 @@ describe('FilePersistence', () => {
 			expect(history).toEqual([]);
 		});
 
-		it('should handle corrupted history file gracefully', async () => {
+		it('should reject corrupted history with a typed error', async () => {
 			const { writeFile } = await import('node:fs/promises');
 			const { join } = await import('node:path');
 
 			// Write corrupted data
-			const historyPath = join(testDir, 'history.json');
-			await writeFile(historyPath, 'invalid json', 'utf-8');
+			const snapshotPath = join(testDir, 'snapshot.json');
+			await writeFile(snapshotPath, 'invalid json', 'utf-8');
 
-			// Should return empty array instead of throwing
-			const history = await backend.loadHistory();
-			expect(history).toEqual([]);
+			await expect(backend.loadHistory()).rejects.toBeInstanceOf(PersistenceCorruptionError);
 		});
 	});
 
@@ -334,29 +382,23 @@ describe('FilePersistence', () => {
 			const thoughts = [createTestThought({ thought: 'Branch thought' })];
 
 			await backend.saveBranch(branchId, thoughts);
+			await backend.close();
 
 			// Create new instance
 			const backend2 = new FilePersistence({ dataDir: testDir });
 			const loaded = await backend2.loadBranch(branchId);
 
 			expect(loaded).toEqual(thoughts);
+			await backend2.close();
 		});
 
-		it('should handle corrupted branch file gracefully', async () => {
-			const { writeFile, mkdir } = await import('node:fs/promises');
-			const { join } = await import('node:path');
+		it('should reject corrupted branch with a typed error', async () => {
+			const { writeFile } = await import('node:fs/promises');
+			await writeFile(join(testDir, 'snapshot.json'), 'invalid json', 'utf-8');
 
-			// Create branches directory
-			const branchesDir = join(testDir, 'branches');
-			await mkdir(branchesDir, { recursive: true });
-
-			// Write corrupted data
-			const branchPath = join(branchesDir, 'corrupted.json');
-			await writeFile(branchPath, 'invalid json', 'utf-8');
-
-			// Should return undefined instead of throwing
-			const loaded = await backend.loadBranch(asBranchId('corrupted'));
-			expect(loaded).toBeUndefined();
+			await expect(backend.loadBranch(asBranchId('corrupted'))).rejects.toBeInstanceOf(
+				PersistenceCorruptionError
+			);
 		});
 	});
 
@@ -405,6 +447,54 @@ describe('FilePersistence', () => {
 			expect(history[0]!.thought_number).toBe(6);
 			expect(history[4]!.thought_number).toBe(10);
 		});
+
+		it('treats maxHistorySize 0 as unlimited and persists a non-empty history record', async () => {
+			// Given
+			const unlimitedBackend = await FilePersistence.create({
+				dataDir: testDir,
+				maxHistorySize: 0,
+			});
+			const thoughts = [
+				createTestThought({ id: 'zero-limit-first', thought_number: 20 }),
+				createTestThought({ id: 'zero-limit-second', thought_number: 10 }),
+			];
+
+			try {
+				// When
+				for (const thought of thoughts) await unlimitedBackend.saveThought(thought);
+
+				// Then
+				const snapshotPath = join(testDir, 'snapshot.json');
+				const snapshot = parseFileSnapshotV2(await readFile(snapshotPath, 'utf-8'), snapshotPath);
+				expect(snapshot.thoughts).toEqual([{ sessionId: '__global__', thoughts }]);
+			} finally {
+				await unlimitedBackend.close();
+			}
+		});
+
+		it('treats negative maxHistorySize as unlimited and persists a non-empty history record', async () => {
+			// Given
+			const unlimitedBackend = await FilePersistence.create({
+				dataDir: testDir,
+				maxHistorySize: -1,
+			});
+			const thoughts = [
+				createTestThought({ id: 'negative-limit-first', thought_number: 2 }),
+				createTestThought({ id: 'negative-limit-second', thought_number: 1 }),
+			];
+
+			try {
+				// When
+				for (const thought of thoughts) await unlimitedBackend.saveThought(thought);
+
+				// Then
+				const snapshotPath = join(testDir, 'snapshot.json');
+				const snapshot = parseFileSnapshotV2(await readFile(snapshotPath, 'utf-8'), snapshotPath);
+				expect(snapshot.thoughts).toEqual([{ sessionId: '__global__', thoughts }]);
+			} finally {
+				await unlimitedBackend.close();
+			}
+		});
 	});
 
 	describe('persistBranches option', () => {
@@ -451,7 +541,6 @@ describe('FilePersistence', () => {
 				createTestThought({ thought_number: i + 1, thought: `Thought ${i + 1}` })
 			);
 
-			// Save sequentially (FilePersistence is not designed for concurrent writes)
 			for (const thought of thoughts) {
 				await backend.saveThought(thought);
 			}
@@ -471,148 +560,168 @@ describe('FilePersistence', () => {
 			// Should succeed without error
 			const history = await backend2.loadHistory();
 			expect(history).toHaveLength(1);
+			await backend2.close();
 		});
 
-	// P0-A: Path traversal security tests
-	describe('Path traversal prevention', () => {
-		it('should reject branch IDs with path traversal patterns', async () => {
-			// These patterns are tested via integration tests that verify _safeBranchPath()
-			// rejects them. See base-transport.test.ts for adversarial origin tests.
-			expect(true).toBe(true);
-		});
-
-		it('should accept valid branch IDs', async () => {
-			const validBranchIds = [
-				'valid-branch',
-				'valid_branch',
-				'Branch123',
-				'branch-01_test',
-				'a', // single char
-				'x'.repeat(64), // max length
-			];
-
-		for (const id of validBranchIds) {
-			const branchId = asBranchId(id);
-			await backend.saveBranch(branchId, [createTestThought()]);
-			const loaded = await backend.loadBranch(branchId);
-				expect(loaded).toBeDefined();
-				expect(loaded?.[0]?.thought).toBe('Test thought');
-			}
-		});
-
-		it('should not create files outside branches directory', async () => {
-			const initialFiles = existsSync(join(testDir, 'branches'))
-				? readdirSync(join(testDir, 'branches'))
-				: [];
-
-			// Try path traversal - should throw
-			await expect(backend.saveBranch(asBranchId('../../malicious'), [createTestThought()])).rejects.toThrow();
-
-			// Verify no new files outside branches
-			const afterFiles = existsSync(join(testDir, 'branches'))
-				? readdirSync(join(testDir, 'branches'))
-				: [];
-
-			expect(afterFiles.length).toBe(initialFiles.length);
-			expect(existsSync(join(testDir, 'malicious.json'))).toBe(false);
-		});
-	});
-
-	describe('additional coverage', () => {
-		it('should delegate listBranches() to getBranchIds()', async () => {
-			await backend.saveBranch(asBranchId('branch-a'), [createTestThought()]);
-			await backend.saveBranch(asBranchId('branch-b'), [createTestThought()]);
-
-			const branches = await backend.listBranches();
-
-			expect(branches).toHaveLength(2);
-			expect(branches).toEqual(expect.arrayContaining(['branch-a', 'branch-b']));
-		});
-
-		it('should return false from healthy() when directory creation fails', async () => {
-			// Use an invalid path that will cause mkdir to throw
-			const badBackend = new FilePersistence({ dataDir: '/dev/null/impossible/path' });
-			const result = await badBackend.healthy();
-			expect(result).toBe(false);
-		});
-
-		it('should return empty array from getBranchIds() when readdir throws', async () => {
-			// Create a backend with branches dir pointing to a file (not a directory)
-			// so readdir will fail
-			const { writeFile: wf } = await import('node:fs/promises');
-			const branchesDir = join(testDir, 'branches');
-			// Write a file where the branches directory should be
-			await wf(branchesDir, 'not-a-directory', 'utf-8');
-
-			const ids = await backend.getBranchIds();
-			expect(ids).toEqual([]);
-		});
-
-		it('should be a no-op when close() is called', async () => {
-			await expect(backend.close()).resolves.toBeUndefined();
-		});
-
-		it('should record operation duration with metrics', async () => {
-			const histogramCalls: Array<{ name: string; value: number; labels: Record<string, string> }> = [];
-			const mockMetrics = {
-				histogram(name: string, value: number, labels: Record<string, string>) {
-					histogramCalls.push({ name, value, labels });
-				},
-				counter() {},
-				gauge() {},
-				getAll() { return ''; },
-			};
-			const metricsBackend = new FilePersistence({
-				dataDir: testDir,
-			metrics: mockMetrics as unknown as IMetrics,
+		// P0-A: Path traversal security tests
+		describe('Path traversal prevention', () => {
+			it('should reject branch IDs with path traversal patterns', async () => {
+				// These patterns are tested via integration tests that verify _safeBranchPath()
+				// rejects them. See base-transport.test.ts for adversarial origin tests.
+				expect(true).toBe(true);
 			});
 
-			await metricsBackend.saveThought(createTestThought());
-			await metricsBackend.loadHistory();
+			it('should accept valid branch IDs', async () => {
+				const validBranchIds = [
+					'valid-branch',
+					'valid_branch',
+					'Branch123',
+					'branch-01_test',
+					'a', // single char
+					'x'.repeat(50), // max length
+				];
 
-			const saveOps = histogramCalls.filter((c) => c.labels.operation === 'save_thought');
-			const loadOps = histogramCalls.filter((c) => c.labels.operation === 'load_history');
-			expect(saveOps.length).toBeGreaterThanOrEqual(1);
-			expect(loadOps.length).toBeGreaterThanOrEqual(1);
+				for (const id of validBranchIds) {
+					const branchId = asBranchId(id);
+					await backend.saveBranch(branchId, [createTestThought()]);
+					const loaded = await backend.loadBranch(branchId);
+					expect(loaded).toBeDefined();
+					expect(loaded?.[0]?.thought).toBe('Test thought');
+				}
+			});
+
+			it('should not create files outside branches directory', async () => {
+				const initialFiles = existsSync(join(testDir, 'branches'))
+					? readdirSync(join(testDir, 'branches'))
+					: [];
+
+				// Try path traversal - should throw
+				await expect(
+					backend.saveBranch(asBranchId('../../malicious'), [createTestThought()])
+				).rejects.toThrow();
+
+				// Verify no new files outside branches
+				const afterFiles = existsSync(join(testDir, 'branches'))
+					? readdirSync(join(testDir, 'branches'))
+					: [];
+
+				expect(afterFiles.length).toBe(initialFiles.length);
+				expect(existsSync(join(testDir, 'malicious.json'))).toBe(false);
+			});
 		});
-	});
 
-	describe('edge case data handling', () => {
-		it('should return empty array when history contains non-array JSON', async () => {
-			const { writeFile: wf, mkdir: mk } = await import('node:fs/promises');
-			await mk(testDir, { recursive: true });
-			// Write valid JSON that is not an array
-			await wf(join(testDir, 'history.json'), JSON.stringify({ not: 'an array' }), 'utf-8');
+		describe('additional coverage', () => {
+			it('should delegate listBranches() to getBranchIds()', async () => {
+				await backend.saveBranch(asBranchId('branch-a'), [createTestThought()]);
+				await backend.saveBranch(asBranchId('branch-b'), [createTestThought()]);
 
-			const history = await backend.loadHistory();
-			expect(history).toEqual([]);
+				const branches = await backend.listBranches();
+
+				expect(branches).toHaveLength(2);
+				expect(branches).toEqual(expect.arrayContaining(['branch-a', 'branch-b']));
+			});
+
+			it('should return false from healthy() when directory creation fails', async () => {
+				// Use an invalid path that will cause mkdir to throw
+				const badBackend = new FilePersistence({ dataDir: '/dev/null/impossible/path' });
+				const result = await badBackend.healthy();
+				expect(result).toBe(false);
+			});
+
+			it('should reject malformed branch records in the v2 snapshot', async () => {
+				const { writeFile: wf } = await import('node:fs/promises');
+				await wf(
+					join(testDir, 'snapshot.json'),
+					JSON.stringify({ version: 2, thoughts: [], branches: {}, edges: [], summaries: [] }),
+					'utf-8'
+				);
+
+				await expect(backend.getBranchIds()).rejects.toBeInstanceOf(PersistenceCompatibilityError);
+			});
+
+			it('should allow close() to be called repeatedly', async () => {
+				await expect(backend.close()).resolves.toBeUndefined();
+				await expect(backend.close()).resolves.toBeUndefined();
+			});
+
+			it('should record operation duration with metrics', async () => {
+				const histogramCalls: Array<{
+					name: string;
+					value: number;
+					labels: Record<string, string>;
+				}> = [];
+				const mockMetrics = {
+					histogram(name: string, value: number, labels: Record<string, string>) {
+						histogramCalls.push({ name, value, labels });
+					},
+					counter() {},
+					gauge() {},
+					getAll() {
+						return '';
+					},
+				};
+				const metricsBackend = new FilePersistence({
+					dataDir: testDir,
+					metrics: mockMetrics as unknown as IMetrics,
+				});
+
+				await metricsBackend.saveThought(createTestThought());
+				await metricsBackend.loadHistory();
+
+				const saveOps = histogramCalls.filter((c) => c.labels.operation === 'save_thought');
+				const loadOps = histogramCalls.filter((c) => c.labels.operation === 'load_history');
+				expect(saveOps.length).toBeGreaterThanOrEqual(1);
+				expect(loadOps.length).toBeGreaterThanOrEqual(1);
+				await metricsBackend.close();
+			});
 		});
 
-		it('should return undefined when branch contains non-array JSON', async () => {
-			const { writeFile: wf, mkdir: mk } = await import('node:fs/promises');
-			const branchesDir = join(testDir, 'branches');
-			await mk(branchesDir, { recursive: true });
-			// Write valid JSON that is not an array
-			await wf(join(branchesDir, 'not-array.json'), JSON.stringify('string-value'), 'utf-8');
+		describe('edge case data handling', () => {
+			it('should reject a non-array thought collection in the v2 snapshot', async () => {
+				const { writeFile: wf } = await import('node:fs/promises');
+				await wf(
+					join(testDir, 'snapshot.json'),
+					JSON.stringify({ version: 2, thoughts: {}, branches: [], edges: [], summaries: [] }),
+					'utf-8'
+				);
 
-			const loaded = await backend.loadBranch(asBranchId('not-array'));
-			expect(loaded).toBeUndefined();
-		});
+				await expect(backend.loadHistory()).rejects.toBeInstanceOf(PersistenceCompatibilityError);
+			});
 
-		it('should skip non-json files during clear()', async () => {
-			const { writeFile: wf, mkdir: mk } = await import('node:fs/promises');
-			const branchesDir = join(testDir, 'branches');
-			await mk(branchesDir, { recursive: true });
-			// Create a non-json file in branches dir
-			await wf(join(branchesDir, 'readme.txt'), 'not a branch', 'utf-8');
-			// Also create a valid branch
-			await backend.saveBranch(asBranchId('valid'), [createTestThought()]);
+			it('should reject a non-array branch collection in the v2 snapshot', async () => {
+				const { writeFile: wf } = await import('node:fs/promises');
+				await wf(
+					join(testDir, 'snapshot.json'),
+					JSON.stringify({
+						version: 2,
+						thoughts: [],
+						branches: 'invalid',
+						edges: [],
+						summaries: [],
+					}),
+					'utf-8'
+				);
 
-			// Clear should succeed without throwing
-			await expect(backend.clear()).resolves.toBeUndefined();
+				await expect(backend.loadBranch(asBranchId('not-array'))).rejects.toBeInstanceOf(
+					PersistenceCompatibilityError
+				);
+			});
 
-			// Non-json file should still exist
-			expect(existsSync(join(branchesDir, 'readme.txt'))).toBe(true);
+			it('should skip non-json files during clear()', async () => {
+				const { writeFile: wf, mkdir: mk } = await import('node:fs/promises');
+				const branchesDir = join(testDir, 'branches');
+				await mk(branchesDir, { recursive: true });
+				// Create a non-json file in branches dir
+				await wf(join(branchesDir, 'readme.txt'), 'not a branch', 'utf-8');
+				// Also create a valid branch
+				await backend.saveBranch(asBranchId('valid'), [createTestThought()]);
+
+				// Clear should succeed without throwing
+				await expect(backend.clear()).resolves.toBeUndefined();
+
+				// Non-json file should still exist
+				expect(existsSync(join(branchesDir, 'readme.txt'))).toBe(true);
+			});
 		});
 	});
 });
@@ -652,10 +761,32 @@ describe('createPersistenceBackend', () => {
 
 		expect(backend).toBeInstanceOf(FilePersistence);
 		expect((backend as FilePersistence).getDataDir()).toBe(testDir);
+		await backend?.close();
 
 		// Cleanup
 		if (existsSync(testDir)) {
 			rmSync(testDir, { recursive: true, force: true });
+		}
+	});
+
+	it('should acquire file writer ownership before returning from the factory', async () => {
+		const testDir = join(tmpdir(), `claude-factory-owner-${Date.now()}`);
+		const config: PersistenceConfig = {
+			enabled: true,
+			backend: 'file',
+			options: { dataDir: testDir },
+		};
+		const owner = await createPersistenceBackend(config);
+
+		try {
+			await expect(createPersistenceBackend(config)).rejects.toMatchObject({
+				code: 'PERSISTENCE_OWNERSHIP',
+			});
+		} finally {
+			await owner?.close();
+			if (existsSync(testDir)) {
+				rmSync(testDir, { recursive: true, force: true });
+			}
 		}
 	});
 
@@ -668,21 +799,6 @@ describe('createPersistenceBackend', () => {
 		await expect(async () => await createPersistenceBackend(config)).rejects.toThrow(
 			'Unknown persistence backend: unknown'
 		);
-	});
-
-	it('should throw error for sqlite when better-sqlite3 is not installed', async () => {
-		const config: PersistenceConfig = {
-			enabled: true,
-			backend: 'sqlite',
-		};
-
-		// This will fail because better-sqlite3 is not installed
-		try {
-			await createPersistenceBackend(config);
-			// If it somehow succeeds (e.g., if package is installed), that's ok too
-		} catch (error) {
-			expect((error as Error).message).toContain('better-sqlite3');
-		}
 	});
 });
 
@@ -697,6 +813,7 @@ describe('PersistenceBackend Interface Compliance', () => {
 		await backend.clear();
 		expect(await backend.loadHistory()).toHaveLength(0);
 		expect(await backend.healthy()).toBe(true);
+		await backend.close();
 	});
 
 	it('FilePersistence should comply with interface', async () => {
@@ -710,13 +827,12 @@ describe('PersistenceBackend Interface Compliance', () => {
 		await backend.clear();
 		expect(await backend.loadHistory()).toHaveLength(0);
 		expect(await backend.healthy()).toBe(true);
+		await backend.close();
 
 		// Cleanup
 		rmSync(testDir, { recursive: true, force: true });
 	});
 });
-});
-
 
 describe('FilePersistence — edge persistence roundtrip', () => {
 	let testDir: string;
@@ -733,9 +849,30 @@ describe('FilePersistence — edge persistence roundtrip', () => {
 	it('saves edges then loads them back identically (sorted by createdAt)', async () => {
 		const backend = new FilePersistence({ dataDir: testDir });
 		const edges: Edge[] = [
-			{ id: 'e2' as EdgeId, from: asThoughtId('a'), to: asThoughtId('c'), kind: 'sequence' as const, sessionId: asSessionId('s1'), createdAt: 200 },
-			{ id: 'e1' as EdgeId, from: asThoughtId('a'), to: asThoughtId('b'), kind: 'branch' as const, sessionId: asSessionId('s1'), createdAt: 100 },
-			{ id: 'e3' as EdgeId, from: asThoughtId('b'), to: asThoughtId('d'), kind: 'merge' as const, sessionId: asSessionId('s1'), createdAt: 300 },
+			{
+				id: 'e2' as EdgeId,
+				from: asThoughtId('a'),
+				to: asThoughtId('c'),
+				kind: 'sequence' as const,
+				sessionId: asSessionId('s1'),
+				createdAt: 200,
+			},
+			{
+				id: 'e1' as EdgeId,
+				from: asThoughtId('a'),
+				to: asThoughtId('b'),
+				kind: 'branch' as const,
+				sessionId: asSessionId('s1'),
+				createdAt: 100,
+			},
+			{
+				id: 'e3' as EdgeId,
+				from: asThoughtId('b'),
+				to: asThoughtId('d'),
+				kind: 'merge' as const,
+				sessionId: asSessionId('s1'),
+				createdAt: 300,
+			},
 		];
 		await backend.saveEdges(asSessionId('s1'), edges);
 		const loaded = await backend.loadEdges(asSessionId('s1'));
@@ -743,34 +880,53 @@ describe('FilePersistence — edge persistence roundtrip', () => {
 		// Sorted by createdAt ascending on save
 		expect(loaded.map((e) => e.id)).toEqual(['e1', 'e2', 'e3']);
 		expect(loaded[0]).toMatchObject({ from: 'a', to: 'b', kind: 'branch' });
+		await backend.close();
 	});
 
 	it('saveEdges with empty array deletes the existing edge file', async () => {
 		const backend = new FilePersistence({ dataDir: testDir });
 		await backend.saveEdges(asSessionId('s2'), [
-			{ id: 'e1' as EdgeId, from: asThoughtId('a'), to: asThoughtId('b'), kind: 'sequence', sessionId: asSessionId('s2'), createdAt: 1 },
+			{
+				id: 'e1' as EdgeId,
+				from: asThoughtId('a'),
+				to: asThoughtId('b'),
+				kind: 'sequence',
+				sessionId: asSessionId('s2'),
+				createdAt: 1,
+			},
 		]);
 		expect(await backend.loadEdges(asSessionId('s2'))).toHaveLength(1);
 		await backend.saveEdges(asSessionId('s2'), []);
 		expect(await backend.loadEdges(asSessionId('s2'))).toEqual([]);
+		await backend.close();
 	});
 
 	it('loadEdges returns [] for missing session file (no error)', async () => {
 		const backend = new FilePersistence({ dataDir: testDir });
 		const loaded = await backend.loadEdges(asSessionId('never-saved'));
 		expect(loaded).toEqual([]);
+		await backend.close();
 	});
 
-	it('loadEdges returns [] for corrupted JSON file', async () => {
+	it('loadEdges rejects corrupted JSON with a typed error', async () => {
 		const backend = new FilePersistence({ dataDir: testDir });
 		// Force file creation by saving + then corrupting
 		await backend.saveEdges(asSessionId('corrupt'), [
-			{ id: 'e1' as EdgeId, from: asThoughtId('a'), to: asThoughtId('b'), kind: 'sequence', sessionId: asSessionId('corrupt'), createdAt: 1 },
+			{
+				id: 'e1' as EdgeId,
+				from: asThoughtId('a'),
+				to: asThoughtId('b'),
+				kind: 'sequence',
+				sessionId: asSessionId('corrupt'),
+				createdAt: 1,
+			},
 		]);
 		const { writeFileSync } = await import('node:fs');
-		writeFileSync(join(testDir, 'edges', 'corrupt.json'), '{not valid json', 'utf-8');
-		const loaded = await backend.loadEdges(asSessionId('corrupt'));
-		expect(loaded).toEqual([]);
+		writeFileSync(join(testDir, 'snapshot.json'), '{not valid json', 'utf-8');
+		await expect(backend.loadEdges(asSessionId('corrupt'))).rejects.toBeInstanceOf(
+			PersistenceCorruptionError
+		);
+		await backend.close();
 	});
 
 	it('rejects invalid sessionId (path traversal / bad chars)', async () => {
@@ -778,21 +934,38 @@ describe('FilePersistence — edge persistence roundtrip', () => {
 		await expect(
 			(async () =>
 				backend.saveEdges(asSessionId('../etc'), [
-					{ id: 'e1' as EdgeId, from: asThoughtId('a'), to: asThoughtId('b'), kind: 'sequence', sessionId: 'safe-session' as ReturnType<typeof asSessionId>, createdAt: 1 },
+					{
+						id: 'e1' as EdgeId,
+						from: asThoughtId('a'),
+						to: asThoughtId('b'),
+						kind: 'sequence',
+						sessionId: 'safe-session' as ReturnType<typeof asSessionId>,
+						createdAt: 1,
+					},
 				]))()
 		).rejects.toThrow();
 		await expect((async () => backend.loadEdges(asSessionId('../etc')))()).rejects.toThrow();
 		await expect((async () => backend.loadEdges(asSessionId('has space')))()).rejects.toThrow();
+		await backend.close();
 	});
 
 	it('persists edges across separate FilePersistence instances (durability)', async () => {
 		const backendA = new FilePersistence({ dataDir: testDir });
 		await backendA.saveEdges(asSessionId('durable'), [
-			{ id: 'd1' as EdgeId, from: asThoughtId('x'), to: asThoughtId('y'), kind: 'verifies', sessionId: asSessionId('durable'), createdAt: 50 },
+			{
+				id: 'd1' as EdgeId,
+				from: asThoughtId('x'),
+				to: asThoughtId('y'),
+				kind: 'verifies',
+				sessionId: asSessionId('durable'),
+				createdAt: 50,
+			},
 		]);
+		await backendA.close();
 		const backendB = new FilePersistence({ dataDir: testDir });
 		const loaded = await backendB.loadEdges(asSessionId('durable'));
 		expect(loaded).toHaveLength(1);
 		expect(loaded[0]).toMatchObject({ id: 'd1', kind: 'verifies' });
+		await backendB.close();
 	});
 });

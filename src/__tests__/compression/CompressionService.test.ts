@@ -7,11 +7,20 @@ import { CompressionService } from '../../core/compression/CompressionService.js
 import { InMemorySummaryStore } from '../../core/compression/InMemorySummaryStore.js';
 import { EdgeStore } from '../../core/graph/EdgeStore.js';
 import { generateUlid } from '../../core/ids.js';
-import type { IHistoryManager } from '../../core/IHistoryManager.js';
+import type { HistorySessionSnapshot, IHistoryManager } from '../../core/IHistoryManager.js';
+import type { ThoughtReferenceResolution } from '../../core/ThoughtReferenceIndex.js';
 import type { ThoughtData } from '../../core/thought.js';
 import type { ConfidenceSignals } from '../../core/reasoning.js';
 import type { Edge } from '../../core/graph/Edge.js';
-import { asBranchId, asSessionId, asThoughtId, type BranchId, type EdgeId, type SessionId, type ThoughtId } from '../../contracts/ids.js';
+import {
+	asBranchId,
+	asSessionId,
+	asThoughtId,
+	type BranchId,
+	type EdgeId,
+	type SessionId,
+	type ThoughtId,
+} from '../../contracts/ids.js';
 
 const SESSION: SessionId = asSessionId('s1');
 const BRANCH: BranchId = asBranchId('b1');
@@ -23,7 +32,7 @@ function makeThought(
 	thought: string,
 	thought_number: number,
 	confidence?: number,
-	signals?: Signals,
+	signals?: Signals
 ): ThoughtData {
 	const t: ThoughtData & { confidence_signals?: ConfidenceSignals } = {
 		id: id as ThoughtId,
@@ -41,6 +50,9 @@ class FakeHistoryManager implements IHistoryManager {
 	constructor(private readonly _thoughts: ThoughtData[] = []) {}
 	addThought(t: ThoughtData): void {
 		this._thoughts.push(t);
+	}
+	resolveThoughtReference(): ThoughtReferenceResolution {
+		return { kind: 'missing' };
 	}
 	getHistory(): ThoughtData[] {
 		return this._thoughts;
@@ -60,6 +72,30 @@ class FakeHistoryManager implements IHistoryManager {
 	}
 	clear(): void {
 		this._thoughts.length = 0;
+	}
+	async resetSession(): Promise<void> {
+		this.clear();
+	}
+	async resetSessionWithinExclusive(): Promise<void> {
+		this.clear();
+	}
+	async resetAll(): Promise<void> {
+		this.clear();
+	}
+	async resetAllWithinExclusive(): Promise<void> {
+		this.clear();
+	}
+	inspectSession(): HistorySessionSnapshot {
+		return {
+			history: [...this._thoughts],
+			branches: {},
+			branchIds: [],
+			availableMcpTools: undefined,
+			availableSkills: undefined,
+		};
+	}
+	getSessionIds(): string[] {
+		return ['__global__'];
 	}
 	getAvailableSkills(): string[] | undefined {
 		return undefined;
@@ -157,9 +193,7 @@ describe('CompressionService', () => {
 	});
 
 	it('filters stopwords from topic extraction', () => {
-		h.hm.addThought(
-			makeThought('root', 'this that with from have will would could should', 1),
-		);
+		h.hm.addThought(makeThought('root', 'this that with from have will would could should', 1));
 		const summary = h.svc.compressBranch(SESSION, BRANCH, asThoughtId('root'));
 		expect(summary.topics).toEqual([]);
 	});
@@ -174,9 +208,7 @@ describe('CompressionService', () => {
 	it('ranks topics by frequency, breaking ties by first-occurrence order', () => {
 		// "alpha" 3x, "bravo" 2x, "delta" 2x, "gamma" 1x
 		// Expect order: alpha (most freq), bravo (tied 2 with delta but appears first), delta
-		h.hm.addThought(
-			makeThought('root', 'alpha bravo alpha delta bravo alpha gamma delta', 1),
-		);
+		h.hm.addThought(makeThought('root', 'alpha bravo alpha delta bravo alpha gamma delta', 1));
 		const summary = h.svc.compressBranch(SESSION, BRANCH, asThoughtId('root'));
 		expect(summary.topics).toEqual(['alpha', 'bravo', 'delta']);
 	});
@@ -231,9 +263,7 @@ describe('CompressionService', () => {
 	});
 
 	it('limits topics to top 3', () => {
-		h.hm.addThought(
-			makeThought('root', 'alpha bravo delta gamma kappa lambda omega', 1),
-		);
+		h.hm.addThought(makeThought('root', 'alpha bravo delta gamma kappa lambda omega', 1));
 		const summary = h.svc.compressBranch(SESSION, BRANCH, asThoughtId('root'));
 		expect(summary.topics).toHaveLength(3);
 	});

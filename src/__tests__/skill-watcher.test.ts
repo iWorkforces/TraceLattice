@@ -1,471 +1,192 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { FSWatcher } from 'chokidar';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Event handler storage for the mock watcher
-type WatcherEventHandler = (...args: unknown[]) => void;
+type WatcherEventHandler = (path: string) => Promise<void> | void;
 let eventHandlers: Map<string, WatcherEventHandler>;
 let mockWatcher: {
 	on: ReturnType<typeof vi.fn>;
 	close: ReturnType<typeof vi.fn>;
 };
 
-// Mock chokidar before importing SkillWatcher
-vi.mock('chokidar', () => {
-	return {
-		watch: vi.fn(() => {
-			eventHandlers = new Map();
-			mockWatcher = {
-				on: vi.fn((event: string, handler: WatcherEventHandler) => {
-					eventHandlers.set(event, handler);
-					return mockWatcher;
-				}),
-				close: vi.fn(),
-			};
-			return mockWatcher as unknown as FSWatcher;
-		}),
-	};
-});
-
-// Mock node:os to avoid real homedir
-vi.mock('node:os', () => ({
-	homedir: () => '/mock/home',
+vi.mock('chokidar', () => ({
+	watch: vi.fn(() => {
+		eventHandlers = new Map();
+		mockWatcher = {
+			on: vi.fn((event: string, handler: WatcherEventHandler) => {
+				eventHandlers.set(event, handler);
+				return mockWatcher;
+			}),
+			close: vi.fn().mockResolvedValue(undefined),
+		};
+		return mockWatcher as unknown as FSWatcher;
+	}),
 }));
 
-import { SkillWatcher } from '../watchers/SkillWatcher.js';
+vi.mock('node:os', () => ({ homedir: () => '/mock/home' }));
+
 import { watch } from 'chokidar';
-import type { SkillRegistry } from '../registry/SkillRegistry.js';
-import type { Logger } from '../logger/StructuredLogger.js';
+import type { Logger, LogLevel } from '../logger/StructuredLogger.js';
+import { SkillRegistry } from '../registry/SkillRegistry.js';
+import { SkillWatcher } from '../watchers/SkillWatcher.js';
 
-function createMockRegistry(): SkillRegistry {
-	return {
-		discoverAsync: vi.fn().mockResolvedValue(0),
-		remove: vi.fn(),
-		// Satisfy the SkillRegistry interface shape used by SkillWatcher
-		add: vi.fn(),
-		has: vi.fn(),
-		get: vi.fn(),
-		getAll: vi.fn().mockReturnValue([]),
-		size: vi.fn().mockReturnValue(0),
-		clear: vi.fn(),
-	} as unknown as SkillRegistry;
-}
-
-function createMockLogger(): Logger {
+function createLogger(): Logger {
 	return {
 		info: vi.fn(),
 		warn: vi.fn(),
 		error: vi.fn(),
 		debug: vi.fn(),
 		setLevel: vi.fn(),
-		getLevel: vi.fn().mockReturnValue('info'),
+		getLevel: vi.fn((): LogLevel => 'info'),
 	};
 }
 
+function handler(event: string): WatcherEventHandler {
+	const registered = eventHandlers.get(event);
+	if (!registered) throw new Error(`Missing ${event} handler`);
+	return registered;
+}
+
 describe('SkillWatcher', () => {
-	let mockRegistry: SkillRegistry;
-	let mockLogger: Logger;
+	let registry: SkillRegistry;
+	let logger: Logger;
+	let refresh: ReturnType<typeof vi.spyOn>;
 
 	beforeEach(() => {
 		vi.clearAllMocks();
-		mockRegistry = createMockRegistry();
-		mockLogger = createMockLogger();
+		registry = new SkillRegistry({ skillDirs: [] });
+		refresh = vi.spyOn(registry, 'refreshAsync').mockResolvedValue(0);
+		logger = createLogger();
 	});
 
 	afterEach(() => {
+		delete process.env.WATCHER_VERBOSE;
 		vi.restoreAllMocks();
 	});
 
-	describe('constructor', () => {
-		it('should create a watcher with a valid SkillRegistry', () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			expect(watcher).toBeInstanceOf(SkillWatcher);
-			watcher.stop();
-		});
+	it('watches default directories and all reconciliation events', async () => {
+		// Given/When
+		const watcher = new SkillWatcher(registry, logger);
 
-		it('should call chokidar.watch with skill directories on construction', () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			expect(watch).toHaveBeenCalledWith(
-				['.claude/skills', '/mock/home/.claude/skills'],
-				expect.objectContaining({
-					persistent: true,
-				})
-			);
-			watcher.stop();
-		});
-
-		it('should configure chokidar to ignore node_modules and .DS_Store', () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			expect(watch).toHaveBeenCalledWith(
-				expect.any(Array),
-				expect.objectContaining({
-					ignored: [/node_modules/, /\.DS_Store$/],
-				})
-			);
-			watcher.stop();
-		});
-
-		it('should register event handlers for add, change, and unlink', () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			expect(mockWatcher.on).toHaveBeenCalledWith('add', expect.any(Function));
-			expect(mockWatcher.on).toHaveBeenCalledWith('change', expect.any(Function));
-			expect(mockWatcher.on).toHaveBeenCalledWith('unlink', expect.any(Function));
-			watcher.stop();
-		});
-
-		it('should work without a logger (uses noop logger)', () => {
-			const watcher = new SkillWatcher(mockRegistry);
-			expect(watcher).toBeInstanceOf(SkillWatcher);
-			watcher.stop();
-		});
-
-		it('should use noop logger that handles add events without errors', async () => {
-			const watcher = new SkillWatcher(mockRegistry);
-			const addHandler = eventHandlers.get('add');
-			expect(addHandler).toBeDefined();
-
-			// Trigger event on watcher with noop logger — should not throw
-			await addHandler!('/path/to/.claude/skills/test-skill.md');
-			expect(mockRegistry.discoverAsync).toHaveBeenCalledTimes(1);
-			watcher.stop();
-		});
-
-		it('should use noop logger that handles change events without errors', async () => {
-			const watcher = new SkillWatcher(mockRegistry);
-			const changeHandler = eventHandlers.get('change');
-			expect(changeHandler).toBeDefined();
-
-			await changeHandler!('/path/to/.claude/skills/test-skill.md');
-			expect(mockRegistry.discoverAsync).toHaveBeenCalledTimes(1);
-			watcher.stop();
-		});
-
-		it('should use noop logger that handles unlink events without errors', async () => {
-			const watcher = new SkillWatcher(mockRegistry);
-			const unlinkHandler = eventHandlers.get('unlink');
-			expect(unlinkHandler).toBeDefined();
-
-			await unlinkHandler!('/path/to/.claude/skills/remove-skill.md');
-			expect(mockRegistry.remove).toHaveBeenCalledWith('remove-skill.md');
-			watcher.stop();
-		});
-
-		it('should use noop logger verbose add path without errors', async () => {
-			process.env.WATCHER_VERBOSE = 'true';
-			const watcher = new SkillWatcher(mockRegistry);
-			const addHandler = eventHandlers.get('add');
-
-			// With verbose + noop logger, log() calls _logger.error() which is a no-op
-			await addHandler!('/path/to/.claude/skills/verbose-skill.md');
-			expect(mockRegistry.discoverAsync).toHaveBeenCalledTimes(1);
-
-			delete process.env.WATCHER_VERBOSE;
-			watcher.stop();
-		});
-
-		it('should use noop logger verbose change path without errors', async () => {
-			process.env.WATCHER_VERBOSE = 'true';
-			const watcher = new SkillWatcher(mockRegistry);
-			const changeHandler = eventHandlers.get('change');
-
-			await changeHandler!('/path/to/.claude/skills/verbose-change.md');
-			expect(mockRegistry.discoverAsync).toHaveBeenCalledTimes(1);
-
-			delete process.env.WATCHER_VERBOSE;
-			watcher.stop();
-		});
-
-		it('should use noop logger verbose unlink path without errors', async () => {
-			process.env.WATCHER_VERBOSE = 'true';
-			const watcher = new SkillWatcher(mockRegistry);
-			const unlinkHandler = eventHandlers.get('unlink');
-
-			await unlinkHandler!('/path/to/.claude/skills/verbose-unlink.md');
-			expect(mockRegistry.remove).toHaveBeenCalledWith('verbose-unlink.md');
-
-			delete process.env.WATCHER_VERBOSE;
-			watcher.stop();
-		});
+		// Then
+		expect(watch).toHaveBeenCalledWith(
+			['.claude/skills', '/mock/home/.claude/skills'],
+			expect.objectContaining({ persistent: true })
+		);
+		expect(mockWatcher.on).toHaveBeenCalledWith('add', expect.any(Function));
+		expect(mockWatcher.on).toHaveBeenCalledWith('change', expect.any(Function));
+		expect(mockWatcher.on).toHaveBeenCalledWith('unlink', expect.any(Function));
+		await watcher.stop();
 	});
 
-	describe('start (auto-setup)', () => {
-		it('should begin watching immediately upon construction', () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			expect(watch).toHaveBeenCalledTimes(1);
-			watcher.stop();
+	it('resolves ready only after Chokidar signals readiness', async () => {
+		// Given
+		const watcher = new SkillWatcher(registry, logger);
+		let ready = false;
+		const readiness = watcher.ready().then(() => {
+			ready = true;
 		});
+
+		// When
+		await Promise.resolve();
+		expect(ready).toBe(false);
+		handler('ready')('');
+		await readiness;
+
+		// Then
+		expect(ready).toBe(true);
+		await watcher.stop();
 	});
 
-	describe('stop', () => {
-		it('should close the underlying watcher', () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			watcher.stop();
-			expect(mockWatcher.close).toHaveBeenCalledTimes(1);
-		});
+	it.each(['add', 'change', 'unlink'])('refreshes the registry on %s', async (event) => {
+		// Given
+		const watcher = new SkillWatcher(registry, logger);
 
-		it('should set watcher to null after stopping', () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			watcher.stop();
-			// Calling stop again should not throw (watcher is null)
-			watcher.stop();
-			expect(mockWatcher.close).toHaveBeenCalledTimes(1);
-		});
+		// When
+		await handler(event)('/skills/example.md');
 
-		it('should be safe to call stop multiple times', () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			watcher.stop();
-			watcher.stop();
-			watcher.stop();
-			// close should only be called once since watcher is nulled
-			expect(mockWatcher.close).toHaveBeenCalledTimes(1);
-		});
+		// Then
+		expect(refresh).toHaveBeenCalledTimes(1);
+		await watcher.stop();
 	});
 
-	describe('file change detection - add event', () => {
-		it('should trigger discoverAsync when a skill file is added', async () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const addHandler = eventHandlers.get('add');
-			expect(addHandler).toBeDefined();
-
-			await addHandler!('/path/to/.claude/skills/commit.md');
-			expect(mockRegistry.discoverAsync).toHaveBeenCalledTimes(1);
-			watcher.stop();
+	it('coalesces duplicate events while preserving one trailing refresh', async () => {
+		// Given
+		let release: (() => void) | undefined;
+		const gate = new Promise<number>((resolve) => {
+			release = () => resolve(1);
 		});
+		refresh.mockImplementationOnce(() => gate).mockResolvedValue(1);
+		const watcher = new SkillWatcher(registry, logger);
 
-		it('should trigger discoverAsync even for .DS_Store files (still discovers)', async () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const addHandler = eventHandlers.get('add');
+		// When
+		const events = [
+			handler('add')('/skills/example.md'),
+			handler('change')('/skills/example.md'),
+			handler('change')('/skills/example.md'),
+		];
+		expect(refresh).toHaveBeenCalledTimes(1);
+		release?.();
+		await Promise.all(events);
 
-			await addHandler!('/path/to/.DS_Store');
-			// discoverAsync is still called, just logging is suppressed for .DS_Store
-			expect(mockRegistry.discoverAsync).toHaveBeenCalledTimes(1);
-			watcher.stop();
-		});
+		// Then
+		expect(refresh).toHaveBeenCalledTimes(2);
+		await watcher.stop();
 	});
 
-	describe('file change detection - change event', () => {
-		it('should trigger discoverAsync when a skill file is modified', async () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const changeHandler = eventHandlers.get('change');
-			expect(changeHandler).toBeDefined();
+	it('reports refresh failures without rejecting the event callback', async () => {
+		// Given
+		refresh.mockRejectedValue(new Error('refresh failed'));
+		const watcher = new SkillWatcher(registry, logger);
 
-			await changeHandler!('/path/to/.claude/skills/review-pr.md');
-			expect(mockRegistry.discoverAsync).toHaveBeenCalledTimes(1);
-			watcher.stop();
+		// When
+		await expect(handler('change')('/skills/example.md')).resolves.toBeUndefined();
+
+		// Then
+		expect(logger.error).toHaveBeenCalledWith('Skill discovery refresh failed', {
+			path: '/skills/example.md',
+			error: 'refresh failed',
 		});
+		await watcher.stop();
 	});
 
-	describe('file change detection - unlink event (skill removal)', () => {
-		it('should call remove when a skill file is deleted', async () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const unlinkHandler = eventHandlers.get('unlink');
-			expect(unlinkHandler).toBeDefined();
-
-			await unlinkHandler!('/path/to/.claude/skills/commit.md');
-			expect(mockRegistry.remove).toHaveBeenCalledWith('commit.md');
-			watcher.stop();
+	it('joins a pending refresh and ignores events after stop begins', async () => {
+		// Given
+		let release: (() => void) | undefined;
+		const gate = new Promise<number>((resolve) => {
+			release = () => resolve(1);
 		});
+		refresh.mockImplementationOnce(() => gate);
+		const watcher = new SkillWatcher(registry, logger);
+		const event = handler('add')('/skills/example.md');
 
-		it('should extract correct skill name from path with directories', async () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const unlinkHandler = eventHandlers.get('unlink');
-
-			await unlinkHandler!('/home/user/.claude/skills/review-pr.yml');
-			expect(mockRegistry.remove).toHaveBeenCalledWith('review-pr.yml');
-			watcher.stop();
+		// When
+		let stopped = false;
+		const stopping = watcher.stop().then(() => {
+			stopped = true;
 		});
+		await Promise.resolve();
+		expect(stopped).toBe(false);
+		await handler('change')('/skills/ignored.md');
+		release?.();
+		await Promise.all([event, stopping]);
 
-		it('should handle Windows-style paths', async () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const unlinkHandler = eventHandlers.get('unlink');
-
-			await unlinkHandler!('C:\\Users\\test\\.claude\\skills\\my-skill.md');
-			expect(mockRegistry.remove).toHaveBeenCalledWith('my-skill.md');
-			watcher.stop();
-		});
-
-		it('should not call remove for empty path segments', async () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const unlinkHandler = eventHandlers.get('unlink');
-
-			// Path ending with a separator yields empty last segment -> null
-			await unlinkHandler!('/path/to/skills/');
-			expect(mockRegistry.remove).not.toHaveBeenCalled();
-			watcher.stop();
-		});
+		// Then
+		expect(refresh).toHaveBeenCalledTimes(1);
+		expect(mockWatcher.close).toHaveBeenCalledTimes(1);
+		await watcher.stop();
+		expect(mockWatcher.close).toHaveBeenCalledTimes(1);
 	});
 
-	describe('error handling', () => {
-		it('should not throw when remove throws', async () => {
-			(mockRegistry.remove as ReturnType<typeof vi.fn>).mockImplementation(() => {
-				throw new Error('Skill not found');
-			});
+	it('uses debug logging only when watcher verbosity is enabled', async () => {
+		// Given
+		process.env.WATCHER_VERBOSE = 'true';
+		const watcher = new SkillWatcher(registry, logger);
 
-			const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const unlinkHandler = eventHandlers.get('unlink');
+		// When
+		await handler('add')('/skills/example.md');
 
-			// Should not throw
-			await unlinkHandler!('/path/to/.claude/skills/nonexistent.md');
-			expect(consoleSpy).toHaveBeenCalledWith(
-				expect.stringContaining('Failed to remove skill nonexistent.md'),
-				expect.stringContaining('Skill not found')
-			);
-
-			consoleSpy.mockRestore();
-			watcher.stop();
-		});
-
-		it('should handle non-Error objects thrown by remove', async () => {
-			(mockRegistry.remove as ReturnType<typeof vi.fn>).mockImplementation(() => {
-				throw 'string error';
-			});
-
-			const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const unlinkHandler = eventHandlers.get('unlink');
-
-			await unlinkHandler!('/path/to/.claude/skills/bad-skill.md');
-			expect(consoleSpy).toHaveBeenCalledWith(
-				expect.stringContaining('Failed to remove skill bad-skill.md'),
-				'string error'
-			);
-
-			consoleSpy.mockRestore();
-			watcher.stop();
-		});
-
-		it('should not swallow errors from discoverAsync', async () => {
-			(mockRegistry.discoverAsync as ReturnType<typeof vi.fn>).mockRejectedValue(
-				new Error('Discovery failed')
-			);
-
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const addHandler = eventHandlers.get('add');
-
-			// The handler is async - the error will propagate as a rejected promise
-			await expect(addHandler!('/path/to/skills/new-skill.md')).rejects.toThrow('Discovery failed');
-			watcher.stop();
-		});
-	});
-
-	describe('logging behavior', () => {
-		it('should not log when WATCHER_VERBOSE is not set', async () => {
-			delete process.env.WATCHER_VERBOSE;
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const addHandler = eventHandlers.get('add');
-
-			await addHandler!('/path/to/skills/test.md');
-			// Logger error should not be called because WATCHER_VERBOSE is not 'true'
-			expect(mockLogger.error).not.toHaveBeenCalled();
-			watcher.stop();
-		});
-
-		it('should log when WATCHER_VERBOSE is true', async () => {
-			process.env.WATCHER_VERBOSE = 'true';
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const addHandler = eventHandlers.get('add');
-
-			await addHandler!('/path/to/skills/test.md');
-			expect(mockLogger.error).toHaveBeenCalledWith(
-				expect.stringContaining('[Watcher] Skill added: test.md')
-			);
-
-			delete process.env.WATCHER_VERBOSE;
-			watcher.stop();
-		});
-
-		it('should not log .DS_Store file events even when verbose', async () => {
-			process.env.WATCHER_VERBOSE = 'true';
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const addHandler = eventHandlers.get('add');
-
-			await addHandler!('/path/to/.DS_Store');
-			// Logging is suppressed for .DS_Store
-			expect(mockLogger.error).not.toHaveBeenCalled();
-
-			delete process.env.WATCHER_VERBOSE;
-			watcher.stop();
-		});
-
-		it('should log change events when WATCHER_VERBOSE is true', async () => {
-			process.env.WATCHER_VERBOSE = 'true';
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const changeHandler = eventHandlers.get('change');
-
-			await changeHandler!('/path/to/skills/modified.md');
-			expect(mockLogger.error).toHaveBeenCalledWith(
-				expect.stringContaining('[Watcher] Skill modified: modified.md')
-			);
-
-			delete process.env.WATCHER_VERBOSE;
-			watcher.stop();
-		});
-
-		it('should log unlink events when WATCHER_VERBOSE is true', async () => {
-			process.env.WATCHER_VERBOSE = 'true';
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const unlinkHandler = eventHandlers.get('unlink');
-
-			await unlinkHandler!('/path/to/skills/removed.md');
-			expect(mockLogger.error).toHaveBeenCalledWith(
-				expect.stringContaining('[Watcher] Skill removed: removed.md')
-			);
-
-			delete process.env.WATCHER_VERBOSE;
-			watcher.stop();
-		});
-
-		it('should not log .DS_Store change events even when verbose', async () => {
-			process.env.WATCHER_VERBOSE = 'true';
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const changeHandler = eventHandlers.get('change');
-
-			await changeHandler!('/path/to/.DS_Store');
-			expect(mockLogger.error).not.toHaveBeenCalled();
-
-			delete process.env.WATCHER_VERBOSE;
-			watcher.stop();
-		});
-
-		it('should not log .DS_Store unlink events even when verbose', async () => {
-			process.env.WATCHER_VERBOSE = 'true';
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const unlinkHandler = eventHandlers.get('unlink');
-
-			await unlinkHandler!('/path/to/.DS_Store');
-			expect(mockLogger.error).not.toHaveBeenCalled();
-
-			delete process.env.WATCHER_VERBOSE;
-			watcher.stop();
-		});
-	});
-
-	describe('registry delegation', () => {
-		it('should delegate discovery to the skill registry on add', async () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const addHandler = eventHandlers.get('add');
-
-			await addHandler!('/path/to/skills/new.md');
-			expect(mockRegistry.discoverAsync).toHaveBeenCalled();
-			watcher.stop();
-		});
-
-		it('should delegate discovery to the skill registry on change', async () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const changeHandler = eventHandlers.get('change');
-
-			await changeHandler!('/path/to/skills/existing.md');
-			expect(mockRegistry.discoverAsync).toHaveBeenCalled();
-			watcher.stop();
-		});
-
-		it('should delegate removal to the skill registry on unlink', async () => {
-			const watcher = new SkillWatcher(mockRegistry, mockLogger);
-			const unlinkHandler = eventHandlers.get('unlink');
-
-			await unlinkHandler!('/path/to/skills/removed.md');
-			expect(mockRegistry.remove).toHaveBeenCalledWith('removed.md');
-			watcher.stop();
-		});
+		// Then
+		expect(logger.debug).toHaveBeenCalledWith('[Watcher] Skill added: example.md');
+		await watcher.stop();
 	});
 });

@@ -1,482 +1,383 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { join } from 'node:path';
 import type { IMetrics } from '../contracts/interfaces.js';
-import type { ThoughtData } from '../core/thought.js';
-import type { Edge } from '../core/graph/Edge.js';
+import type {
+	PersistenceConfig,
+	SessionScopedPersistenceBackend,
+} from '../contracts/PersistenceBackend.js';
+import { asSessionId, GLOBAL_SESSION_ID, type BranchId, type SessionId } from '../contracts/ids.js';
 import type { Summary } from '../core/compression/Summary.js';
-import type { PersistenceBackend, PersistenceConfig } from '../contracts/PersistenceBackend.js';
-import { asBranchId, asSessionId, type BranchId, type SessionId } from '../contracts/ids.js';
-import * as v from 'valibot';
-import { SequentialThinkingSchema, EdgeSchema } from '../schema.js';
-import { SummarySchema } from '../core/compression/Summary.js';
-import { getErrorMessage } from '../errors.js';
+import type { Edge } from '../core/graph/Edge.js';
+import type { ThoughtData } from '../core/thought.js';
+import { PersistenceImportRequiredError } from '../errors.js';
+import {
+	EMPTY_FILE_SNAPSHOT_V2,
+	parseFileSnapshotV2,
+	serializeFileSnapshotV2,
+	sessionsInSnapshot,
+	type FileSnapshotV2,
+} from './FileSnapshotV2.js';
+import { FileWriter, isFileNotFound, type FileWriterOperations } from './FileWriter.js';
+import {
+	assertBranchScope,
+	assertEdgeScopes,
+	assertPersistableThoughtCollections,
+	assertPersistableThoughts,
+	assertSummaryScopes,
+	assertThoughtScope,
+	compareCodePoint,
+	parsePersistenceBranchId,
+} from './PersistenceScope.js';
 
-const ThoughtArraySchema = v.array(SequentialThinkingSchema);
-const EdgeArraySchema = v.array(EdgeSchema);
-const SummaryArraySchema = v.array(SummarySchema);
+type FilePersistenceOptions = NonNullable<PersistenceConfig['options']> & {
+	readonly metrics?: IMetrics;
+	readonly writerOperations?: FileWriterOperations;
+};
 
-/**
- * File-based persistence backend using JSON files.
- *
- * Stores thoughts and branches as JSON files in a configured directory.
- * Simple and reliable, with no external dependencies.
- *
- * File structure:
- * ```
- * dataDir/
- *   history.json          # Main thought history
- *   branches/
- *     <branch-id>.json    # Individual branch files
- * ```
- */
-export class FilePersistence implements PersistenceBackend {
-	private _dataDir: string;
-	private _historyPath: string;
-	private _branchesDir: string;
-	private _edgesDir: string;
-	private _summariesDir: string;
-	private _maxHistorySize: number;
-	private _persistBranches: boolean;
-	private _metrics?: IMetrics;
+const SNAPSHOT_NAME = 'snapshot.json';
+const LEGACY_DIRECTORIES = ['branches', 'edges', 'summaries'] as const;
 
-	constructor(options?: PersistenceConfig['options'] & { metrics?: IMetrics }) {
-		// Default to .claude/data in current directory or home directory
+export class FilePersistence implements SessionScopedPersistenceBackend {
+	private readonly _dataDir: string;
+	private readonly _maxHistorySize: number;
+	private readonly _persistBranches: boolean;
+	private readonly _metrics: IMetrics | undefined;
+	private readonly _writer: FileWriter;
+
+	constructor(options?: FilePersistenceOptions) {
 		const defaultDataDir = existsSync('.claude/data')
 			? '.claude/data'
 			: join(homedir(), '.claude/data');
 		this._dataDir = options?.dataDir ?? defaultDataDir;
-		this._historyPath = join(this._dataDir, 'history.json');
-		this._branchesDir = join(this._dataDir, 'branches');
-		this._edgesDir = join(this._dataDir, 'edges');
-		this._summariesDir = join(this._dataDir, 'summaries');
 		this._maxHistorySize = options?.maxHistorySize ?? 10000;
 		this._persistBranches = options?.persistBranches ?? true;
 		this._metrics = options?.metrics;
+		this._writer = new FileWriter(this._dataDir, options?.writerOperations);
 	}
 
-	private _recordOperationDuration(operation: string, startTime: number): void {
-		const durationSeconds = (Date.now() - startTime) / 1000;
-		this._metrics?.histogram('persistence_op_duration_seconds', durationSeconds, { operation });
-	}
-
-	/**
-	 * Initialize the persistence directory structure.
-	 */
-	private async _ensureDirectories(): Promise<void> {
-		if (!existsSync(this._dataDir)) {
-			await mkdir(this._dataDir, { recursive: true });
+	public static async create(options?: FilePersistenceOptions): Promise<FilePersistence> {
+		const persistence = new FilePersistence(options);
+		try {
+			await persistence._writer.ready();
+			await persistence._writer.run(async (dataDir) => await persistence._loadSnapshot(dataDir));
+			return persistence;
+		} catch (error) {
+			await persistence.close();
+			throw error;
 		}
-		if (this._persistBranches && !existsSync(this._branchesDir)) {
-			await mkdir(this._branchesDir, { recursive: true });
-		}
-		if (!existsSync(this._edgesDir)) {
-			await mkdir(this._edgesDir, { recursive: true });
-		}
-		if (!existsSync(this._summariesDir)) {
-			await mkdir(this._summariesDir, { recursive: true });
-		}
-	}
-
-	/**
-	 * Validates branch ID format and resolves the path safely.
-	 *
-	 * This method provides defense-in-depth security by:
-	 * 1. Validating the branch ID format (alphanumeric, hyphens, underscores only)
-	 * 2. Preventing path traversal attacks
-	 *
-	 * @param branchId - The branch ID to validate and resolve
-	 * @returns The safe, resolved branch file path
-	 * @throws Error if branch ID is invalid or path traversal is detected
-	 */
-	private _safeBranchPath(branchId: string): string {
-		// Validate format first (must be alphanumeric with hyphens/underscores, 1-64 chars)
-		const validBranchIdPattern = /^[a-zA-Z0-9_-]{1,64}$/;
-		if (!validBranchIdPattern.test(branchId)) {
-			throw new Error(
-				`Invalid branch ID: must be 1-64 alphanumeric characters, hyphens, or underscores only`
-			);
-		}
-
-		const resolved = resolve(this._branchesDir, `${branchId}.json`);
-		const normalizedBranchesDir = resolve(this._branchesDir);
-
-		// Ensure the resolved path is still within branches directory
-		if (!resolved.startsWith(normalizedBranchesDir + sep)) {
-			throw new Error(`Invalid branch ID: path traversal detected`);
-		}
-
-		return resolved;
 	}
 
 	public async saveThought(thought: ThoughtData): Promise<void> {
-		const startTime = Date.now();
-		try {
-			await this._ensureDirectories();
+		assertThoughtScope('saveThought', GLOBAL_SESSION_ID, thought);
+		await this._saveThought(GLOBAL_SESSION_ID, thought);
+	}
 
-			const history = await this.loadHistory();
-			history.push(thought);
+	public async saveThoughtForSession(sessionId: SessionId, thought: ThoughtData): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		assertThoughtScope('saveThoughtForSession', validatedSessionId, thought);
+		await this._saveThought(validatedSessionId, thought);
+	}
 
-			if (history.length > this._maxHistorySize) {
-				history.splice(0, history.length - this._maxHistorySize);
-			}
-
-			await writeFile(this._historyPath, JSON.stringify(history, null, 2), 'utf-8');
-		} finally {
-			this._recordOperationDuration('save_thought', startTime);
-		}
+	private async _saveThought(sessionId: SessionId, thought: ThoughtData): Promise<void> {
+		assertPersistableThoughts([thought], `${sessionId}/thoughts`);
+		await this._mutate('save_thought', (snapshot) => {
+			const current =
+				snapshot.thoughts.find((record) => record.sessionId === sessionId)?.thoughts ?? [];
+			const prospective = [...current, thought];
+			assertPersistableThoughtCollections(
+				[
+					{ sessionId, thoughts: prospective },
+					...snapshot.branches
+						.filter((record) => record.sessionId === sessionId)
+						.map((record) => ({ sessionId, thoughts: record.thoughts })),
+				],
+				`${sessionId}/thoughts`
+			);
+			const retained =
+				this._maxHistorySize > 0 ? prospective.slice(-this._maxHistorySize) : prospective;
+			return {
+				...snapshot,
+				thoughts: [
+					...snapshot.thoughts.filter((record) => record.sessionId !== sessionId),
+					{ sessionId, thoughts: retained },
+				],
+			};
+		});
 	}
 
 	public async loadHistory(): Promise<ThoughtData[]> {
-		const startTime = Date.now();
-		try {
-			if (!existsSync(this._historyPath)) {
-				return [];
-			}
+		return await this.loadHistoryForSession(GLOBAL_SESSION_ID);
+	}
 
-			const content = await readFile(this._historyPath, 'utf-8');
-			try {
-				const raw: unknown = JSON.parse(content);
-				const data = v.parse(ThoughtArraySchema, raw);
-				return data as unknown as ThoughtData[];
-			} catch (e) {
-				console.warn('Persistence validation error in history.json:', getErrorMessage(e));
-				this._metrics?.counter('persistence_validation_errors', 1, { file: 'history' });
-				return [];
-			}
-		} finally {
-			this._recordOperationDuration('load_history', startTime);
-		}
+	public async loadHistoryForSession(sessionId: SessionId): Promise<ThoughtData[]> {
+		const validatedSessionId = asSessionId(sessionId);
+		return await this._read('load_history', (snapshot) => [
+			...(snapshot.thoughts.find((record) => record.sessionId === validatedSessionId)?.thoughts ??
+				[]),
+		]);
 	}
 
 	public async saveBranch(branchId: BranchId, thoughts: ThoughtData[]): Promise<void> {
-		const startTime = Date.now();
-		try {
-			if (!this._persistBranches) {
-				return;
-			}
+		const validatedBranchId = parsePersistenceBranchId(branchId, 'global/branches');
+		assertBranchScope('saveBranch', GLOBAL_SESSION_ID, validatedBranchId, thoughts);
+		await this._saveBranch(GLOBAL_SESSION_ID, validatedBranchId, thoughts);
+	}
 
-			await this._ensureDirectories();
+	public async saveBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId,
+		thoughts: readonly ThoughtData[]
+	): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		const validatedBranchId = parsePersistenceBranchId(branchId, `${validatedSessionId}/branches`);
+		assertBranchScope('saveBranchForSession', validatedSessionId, validatedBranchId, thoughts);
+		await this._saveBranch(validatedSessionId, validatedBranchId, thoughts);
+	}
 
-			const branchPath = this._safeBranchPath(branchId);
-			await writeFile(branchPath, JSON.stringify(thoughts, null, 2), 'utf-8');
-		} finally {
-			this._recordOperationDuration('save_branch', startTime);
+	private async _saveBranch(
+		sessionId: SessionId,
+		branchId: BranchId,
+		thoughts: readonly ThoughtData[]
+	): Promise<void> {
+		assertPersistableThoughtCollections(
+			[{ sessionId, thoughts }],
+			`${sessionId}/branches/${branchId}`
+		);
+		if (!this._persistBranches) {
+			await this._writer.run(async (dataDir) => {
+				const snapshot = await this._loadSnapshot(dataDir);
+				assertPersistableThoughtCollections(
+					[
+						{
+							sessionId,
+							thoughts:
+								snapshot.thoughts.find((record) => record.sessionId === sessionId)?.thoughts ?? [],
+						},
+						...snapshot.branches
+							.filter((record) => record.sessionId === sessionId)
+							.map((record) => ({ sessionId, thoughts: record.thoughts })),
+						{ sessionId, thoughts },
+					],
+					`${sessionId}/branches/${branchId}`
+				);
+			});
+			return;
 		}
+		await this._mutate('save_branch', (snapshot) => ({
+			...snapshot,
+			branches: [
+				...snapshot.branches.filter(
+					(record) => record.sessionId !== sessionId || record.branchId !== branchId
+				),
+				{ sessionId, branchId, thoughts: [...thoughts] },
+			],
+		}));
+	}
+
+	public async deleteBranch(branchId: BranchId): Promise<void> {
+		await this.deleteBranchForSession(GLOBAL_SESSION_ID, branchId);
+	}
+
+	public async deleteBranchForSession(sessionId: SessionId, branchId: BranchId): Promise<void> {
+		if (!this._persistBranches) return;
+		const validatedSessionId = asSessionId(sessionId);
+		const validatedBranchId = parsePersistenceBranchId(branchId, `${validatedSessionId}/branches`);
+		await this._mutate('delete_branch', (snapshot) => ({
+			...snapshot,
+			branches: snapshot.branches.filter(
+				(record) => record.sessionId !== validatedSessionId || record.branchId !== validatedBranchId
+			),
+		}));
 	}
 
 	public async loadBranch(branchId: BranchId): Promise<ThoughtData[] | undefined> {
-		const startTime = Date.now();
-		try {
-			if (!this._persistBranches) {
-				return undefined;
-			}
+		return await this.loadBranchForSession(GLOBAL_SESSION_ID, branchId);
+	}
 
-			const branchPath = this._safeBranchPath(branchId);
-
-			try {
-				if (!existsSync(branchPath)) {
-					return undefined;
-				}
-
-				const content = await readFile(branchPath, 'utf-8');
-				try {
-					const raw: unknown = JSON.parse(content);
-					const data = v.parse(ThoughtArraySchema, raw);
-					return data as unknown as ThoughtData[];
-				} catch (e) {
-					console.warn(`Persistence validation error in branch ${branchId}:`, getErrorMessage(e));
-					this._metrics?.counter('persistence_validation_errors', 1, { file: 'branch' });
-					return undefined;
-				}
-			} catch {
-				return undefined;
-			}
-		} finally {
-			this._recordOperationDuration('load_branch', startTime);
-		}
+	public async loadBranchForSession(
+		sessionId: SessionId,
+		branchId: BranchId
+	): Promise<ThoughtData[] | undefined> {
+		if (!this._persistBranches) return undefined;
+		const validatedSessionId = asSessionId(sessionId);
+		const validatedBranchId = parsePersistenceBranchId(branchId, `${validatedSessionId}/branches`);
+		return await this._read('load_branch', (snapshot) => {
+			const thoughts = snapshot.branches.find(
+				(record) => record.sessionId === validatedSessionId && record.branchId === validatedBranchId
+			)?.thoughts;
+			return thoughts === undefined ? undefined : [...thoughts];
+		});
 	}
 
 	public async listBranches(): Promise<BranchId[]> {
-		return (await this.getBranchIds()).map((id) => asBranchId(id));
+		return await this.listBranchesForSession(GLOBAL_SESSION_ID);
+	}
+
+	public async listBranchesForSession(sessionId: SessionId): Promise<BranchId[]> {
+		if (!this._persistBranches) return [];
+		const validatedSessionId = asSessionId(sessionId);
+		return await this._read('list_branches', (snapshot) =>
+			snapshot.branches
+				.filter((record) => record.sessionId === validatedSessionId)
+				.map((record) => record.branchId)
+				.sort(compareCodePoint)
+		);
+	}
+
+	public async listSessions(): Promise<SessionId[]> {
+		return await this._read('list_sessions', sessionsInSnapshot);
 	}
 
 	public async clear(): Promise<void> {
-		try {
-			// Clear history
-			if (existsSync(this._historyPath)) {
-				await unlink(this._historyPath);
-			}
+		await this._mutate('clear', () => EMPTY_FILE_SNAPSHOT_V2);
+	}
 
-			// Clear all branches
-			if (this._persistBranches && existsSync(this._branchesDir)) {
-				const files = await readdir(this._branchesDir);
-				for (const file of files) {
-					if (file.endsWith('.json')) {
-						await unlink(join(this._branchesDir, file));
-					}
-				}
-			}
+	public async clearSession(sessionId: SessionId): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		await this._mutate('clear_session', (snapshot) => ({
+			version: 2,
+			thoughts: snapshot.thoughts.filter((record) => record.sessionId !== validatedSessionId),
+			branches: snapshot.branches.filter((record) => record.sessionId !== validatedSessionId),
+			edges: snapshot.edges.filter((record) => record.sessionId !== validatedSessionId),
+			summaries: snapshot.summaries.filter((record) => record.sessionId !== validatedSessionId),
+		}));
+	}
 
-			// Clear all edges
-			if (existsSync(this._edgesDir)) {
-				const edgeFiles = await readdir(this._edgesDir);
-				for (const file of edgeFiles) {
-					if (file.endsWith('.json')) {
-						await unlink(join(this._edgesDir, file));
-					}
-				}
-			}
+	public async saveEdges(sessionId: SessionId, edges: readonly Edge[]): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		assertEdgeScopes(validatedSessionId, edges);
+		await this._mutate('save_edges', (snapshot) => ({
+			...snapshot,
+			edges: [
+				...snapshot.edges.filter((record) => record.sessionId !== validatedSessionId),
+				...(edges.length === 0 ? [] : [{ sessionId: validatedSessionId, edges: [...edges] }]),
+			],
+		}));
+	}
 
-			// Clear all summaries
-			if (existsSync(this._summariesDir)) {
-				const summaryFiles = await readdir(this._summariesDir);
-				for (const file of summaryFiles) {
-					if (file.endsWith('.json')) {
-						await unlink(join(this._summariesDir, file));
-					}
-				}
-			}
-		} catch {
-			// Ignore errors during clear
-		}
+	public async loadEdges(sessionId: SessionId): Promise<Edge[]> {
+		const validatedSessionId = asSessionId(sessionId);
+		return await this._read('load_edges', (snapshot) => [
+			...(snapshot.edges.find((record) => record.sessionId === validatedSessionId)?.edges ?? []),
+		]);
+	}
+
+	public async listEdgeSessions(): Promise<SessionId[]> {
+		return await this._read('list_edge_sessions', (snapshot) =>
+			snapshot.edges.map((record) => record.sessionId).sort(compareCodePoint)
+		);
+	}
+
+	public async saveSummaries(sessionId: SessionId, summaries: readonly Summary[]): Promise<void> {
+		const validatedSessionId = asSessionId(sessionId);
+		assertSummaryScopes(validatedSessionId, summaries);
+		await this._mutate('save_summaries', (snapshot) => ({
+			...snapshot,
+			summaries: [
+				...snapshot.summaries.filter((record) => record.sessionId !== validatedSessionId),
+				...(summaries.length === 0
+					? []
+					: [{ sessionId: validatedSessionId, summaries: [...summaries] }]),
+			],
+		}));
+	}
+
+	public async loadSummaries(sessionId: SessionId): Promise<Summary[]> {
+		const validatedSessionId = asSessionId(sessionId);
+		return await this._read('load_summaries', (snapshot) => [
+			...(snapshot.summaries.find((record) => record.sessionId === validatedSessionId)?.summaries ??
+				[]),
+		]);
 	}
 
 	public async healthy(): Promise<boolean> {
 		try {
-			await this._ensureDirectories();
+			await this._writer.run(async (dataDir) => await this._loadSnapshot(dataDir));
 			return true;
-		} catch {
-			return false;
+		} catch (error) {
+			if (error instanceof Error) return false;
+			throw error;
 		}
 	}
 
-	/**
-	 * Get the data directory path.
-	 */
 	public getDataDir(): string {
 		return this._dataDir;
 	}
 
-	/**
-	 * Get all branch IDs that are persisted.
-	 */
 	public async getBranchIds(): Promise<string[]> {
-		if (!this._persistBranches || !existsSync(this._branchesDir)) {
-			return [];
-		}
-
-		try {
-			const files = await readdir(this._branchesDir);
-			return files.filter((f) => f.endsWith('.json')).map((f) => f.replace('.json', ''));
-		} catch {
-			return [];
-		}
+		return await this.listBranches();
 	}
 
-	/**
-	 * Close the backend and release resources.
-	 * No resources to release for file backend.
-	 */
 	public async close(): Promise<void> {
-		// No-op for file backend (files are already flushed on write)
+		await this._writer.close();
 	}
 
-	/**
-	 * Validates session ID format and resolves the edge file path safely.
-	 *
-	 * @param sessionId - The session ID to validate and resolve
-	 * @returns The safe, resolved edge file path
-	 * @throws Error if session ID is invalid or path traversal is detected
-	 */
-	private _safeEdgePath(sessionId: string): string {
-		const validSessionIdPattern = /^[a-zA-Z0-9_-]{1,100}$/;
-		if (!validSessionIdPattern.test(sessionId)) {
-			throw new Error(
-				`Invalid session ID for edges: must be 1-100 alphanumeric characters, hyphens, or underscores only`
-			);
-		}
-
-		const resolved = resolve(this._edgesDir, `${sessionId}.json`);
-		const normalizedEdgesDir = resolve(this._edgesDir);
-
-		if (!resolved.startsWith(normalizedEdgesDir + sep)) {
-			throw new Error(`Invalid session ID: path traversal detected`);
-		}
-
-		return resolved;
+	private async _read<T>(operation: string, select: (snapshot: FileSnapshotV2) => T): Promise<T> {
+		return await this._measure(
+			operation,
+			async () =>
+				await this._writer.run(async (dataDir) => select(await this._loadSnapshot(dataDir)))
+		);
 	}
 
-	/**
-	 * Save edges for a session to a JSON file.
-	 *
-	 * @param sessionId - The session ID
-	 * @param edges - Edges to persist (sorted by createdAt before write)
-	 */
-	public async saveEdges(sessionId: SessionId, edges: readonly Edge[]): Promise<void> {
-		const startTime = Date.now();
+	private async _mutate(
+		operation: string,
+		mutate: (snapshot: FileSnapshotV2) => FileSnapshotV2
+	): Promise<void> {
+		await this._measure(operation, async () => {
+			await this._writer.run(async (dataDir) => {
+				const snapshotPath = join(dataDir, SNAPSHOT_NAME);
+				const updated = mutate(await this._loadSnapshot(dataDir));
+				await this._writer.publish(snapshotPath, serializeFileSnapshotV2(updated, snapshotPath));
+			});
+		});
+	}
+
+	private async _loadSnapshot(dataDir: string): Promise<FileSnapshotV2> {
+		const snapshotPath = join(dataDir, SNAPSHOT_NAME);
 		try {
-			await this._ensureDirectories();
-
-			if (!existsSync(this._edgesDir)) {
-				await mkdir(this._edgesDir, { recursive: true });
-			}
-
-			const edgePath = this._safeEdgePath(sessionId);
-
-			if (edges.length === 0) {
-				if (existsSync(edgePath)) {
-					await unlink(edgePath);
-				}
-				return;
-			}
-
-			const sorted = [...edges].sort((a, b) => a.createdAt - b.createdAt);
-			await writeFile(edgePath, JSON.stringify(sorted, null, 2), 'utf-8');
-		} finally {
-			this._recordOperationDuration('save_edges', startTime);
+			return parseFileSnapshotV2(await readFile(snapshotPath, 'utf-8'), snapshotPath);
+		} catch (error) {
+			if (!isFileNotFound(error)) throw error;
 		}
+		const legacyArtifacts = await this._legacyArtifacts(dataDir);
+		if (legacyArtifacts.length > 0) {
+			throw new PersistenceImportRequiredError(dataDir, legacyArtifacts);
+		}
+		return EMPTY_FILE_SNAPSHOT_V2;
 	}
 
-	/**
-	 * Load edges for a session from a JSON file.
-	 *
-	 * @param sessionId - The session ID
-	 * @returns Edges array (empty if file is missing or corrupted)
-	 */
-	public async loadEdges(sessionId: SessionId): Promise<Edge[]> {
-		const startTime = Date.now();
+	private async _legacyArtifacts(dataDir: string): Promise<string[]> {
+		const artifacts: string[] = [];
 		try {
-			const edgePath = this._safeEdgePath(sessionId);
-
-			if (!existsSync(edgePath)) {
-				return [];
-			}
-
+			await readFile(join(dataDir, 'history.json'), 'utf-8');
+			artifacts.push('history.json');
+		} catch (error) {
+			if (!isFileNotFound(error)) throw error;
+		}
+		for (const directory of LEGACY_DIRECTORIES) {
 			try {
-				const content = await readFile(edgePath, 'utf-8');
-				try {
-					const raw: unknown = JSON.parse(content);
-					const data = v.parse(EdgeArraySchema, raw);
-					return data as unknown as Edge[];
-				} catch (e) {
-					console.warn(`Persistence validation error in edges ${sessionId}:`, getErrorMessage(e));
-					this._metrics?.counter('persistence_validation_errors', 1, { file: 'edges' });
-					return [];
-				}
-			} catch {
-				return [];
+				const files = await readdir(join(dataDir, directory));
+				artifacts.push(
+					...files.filter((file) => file.endsWith('.json')).map((file) => `${directory}/${file}`)
+				);
+			} catch (error) {
+				if (!isFileNotFound(error)) throw error;
 			}
-		} finally {
-			this._recordOperationDuration('load_edges', startTime);
 		}
+		return artifacts.sort(compareCodePoint);
 	}
 
-	/**
-	 * List all session IDs that have persisted edge files.
-	 *
-	 * @returns Array of session identifiers (filenames without .json extension)
-	 */
-	public async listEdgeSessions(): Promise<SessionId[]> {
-		try {
-			const files = await readdir(this._edgesDir);
-			return files.filter((f) => f.endsWith('.json')).map((f) => asSessionId(f.slice(0, -5)));
-		} catch {
-			return [];
-		}
-	}
-
-	/**
-	 * Validates session ID format and resolves the summary file path safely.
-	 *
-	 * @param sessionId - The session ID to validate and resolve
-	 * @returns The safe, resolved summary file path
-	 * @throws Error if session ID is invalid or path traversal is detected
-	 */
-	private _safeSummaryPath(sessionId: string): string {
-		const validSessionIdPattern = /^[a-zA-Z0-9_-]{1,100}$/;
-		if (!validSessionIdPattern.test(sessionId)) {
-			throw new Error(
-				`Invalid session ID for summaries: must be 1-100 alphanumeric characters, hyphens, or underscores only`
-			);
-		}
-
-		const resolved = resolve(this._summariesDir, `${sessionId}.json`);
-		const normalizedSummariesDir = resolve(this._summariesDir);
-
-		if (!resolved.startsWith(normalizedSummariesDir + sep)) {
-			throw new Error(`Invalid session ID: path traversal detected`);
-		}
-
-		return resolved;
-	}
-
-	/**
-	 * Save summaries for a session to a JSON file using an atomic
-	 * write (tmp file + rename) to prevent partial-write corruption.
-	 *
-	 * @param sessionId - The session ID
-	 * @param summaries - Summaries to persist (sorted by createdAt before write)
-	 */
-	public async saveSummaries(sessionId: SessionId, summaries: readonly Summary[]): Promise<void> {
+	private async _measure<T>(operation: string, action: () => Promise<T>): Promise<T> {
 		const startTime = Date.now();
 		try {
-			await this._ensureDirectories();
-
-			if (!existsSync(this._summariesDir)) {
-				await mkdir(this._summariesDir, { recursive: true });
-			}
-
-			const summaryPath = this._safeSummaryPath(sessionId);
-
-			if (summaries.length === 0) {
-				if (existsSync(summaryPath)) {
-					await unlink(summaryPath);
-				}
-				return;
-			}
-
-			const sorted = [...summaries].sort((a, b) => a.createdAt - b.createdAt);
-			const tmpPath = `${summaryPath}.tmp`;
-			await writeFile(tmpPath, JSON.stringify(sorted, null, 2), 'utf-8');
-			await rename(tmpPath, summaryPath);
+			return await action();
 		} finally {
-			this._recordOperationDuration('save_summaries', startTime);
-		}
-	}
-
-	/**
-	 * Load summaries for a session from a JSON file.
-	 *
-	 * @param sessionId - The session ID
-	 * @returns Summaries array (empty if file is missing or corrupted)
-	 */
-	public async loadSummaries(sessionId: SessionId): Promise<Summary[]> {
-		const startTime = Date.now();
-		try {
-			const summaryPath = this._safeSummaryPath(sessionId);
-
-			if (!existsSync(summaryPath)) {
-				return [];
-			}
-
-			try {
-				const content = await readFile(summaryPath, 'utf-8');
-				try {
-					const raw: unknown = JSON.parse(content);
-					const data = v.parse(SummaryArraySchema, raw);
-					return [...data].sort((a, b) => a.createdAt - b.createdAt) as unknown as Summary[];
-				} catch (e) {
-					console.warn(`Persistence validation error in summaries ${sessionId}:`, getErrorMessage(e));
-					this._metrics?.counter('persistence_validation_errors', 1, { file: 'summaries' });
-					return [];
-				}
-			} catch {
-				return [];
-			}
-		} finally {
-			this._recordOperationDuration('load_summaries', startTime);
+			this._metrics?.histogram('persistence_op_duration_seconds', (Date.now() - startTime) / 1000, {
+				operation,
+			});
 		}
 	}
 }

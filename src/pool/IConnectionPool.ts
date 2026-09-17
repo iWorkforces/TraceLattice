@@ -8,9 +8,12 @@
  * @module IConnectionPool
  */
 
-import type { ThoughtData } from '../core/thought.js';
+import type { InferInput } from 'valibot';
 import type { SessionId } from '../contracts/ids.js';
+import type { SequentialThinkingSchema } from '../schema.js';
 import type { IDisposable } from '../types/disposable.js';
+
+export type SessionThoughtInput = InferInput<typeof SequentialThinkingSchema>;
 
 /**
  * Represents a content block in a process result.
@@ -23,7 +26,7 @@ export interface ProcessResult {
 }
 
 export interface SessionServer {
-	processThought(input: ThoughtData): Promise<ProcessResult>;
+	processThought(input: SessionThoughtInput): Promise<ProcessResult>;
 	stop(): void | Promise<void>;
 }
 
@@ -34,6 +37,14 @@ export interface SessionInfo {
 	lastActivityAt: number;
 	isActive: boolean;
 }
+
+/**
+ * Result of running callback-scoped work against a pooled session.
+ */
+export type SessionRunResult<T> =
+	| { readonly status: 'completed'; readonly value: T }
+	| { readonly status: 'inactive' }
+	| { readonly status: 'missing' };
 
 /**
  * Statistics describing the current state of the connection pool.
@@ -79,7 +90,19 @@ export interface IConnectionPool extends IDisposable {
 	 * @returns The processing result
 	 * @throws SessionNotFoundError if the session does not exist
 	 */
-	process(sessionId: SessionId, input: ThoughtData): Promise<ProcessResult>;
+	process(sessionId: SessionId, input: SessionThoughtInput): Promise<ProcessResult>;
+
+	/**
+	 * Run an operation while atomically holding an active session open.
+	 *
+	 * @param sessionId - The session ID
+	 * @param operation - Callback that receives the admitted child server
+	 * @returns The callback value or an explicit unavailable status
+	 */
+	runWithSession<T>(
+		sessionId: SessionId,
+		operation: (session: SessionServer) => Promise<T>
+	): Promise<SessionRunResult<T>>;
 
 	/**
 	 * Close a session and release its resources.

@@ -28,7 +28,7 @@ export async function createPersistenceBackend(
 	switch (config.backend) {
 		case 'file': {
 			const { FilePersistence } = await import('./FilePersistence.js');
-			return new FilePersistence(config.options);
+			return await FilePersistence.create(config.options);
 		}
 
 		case 'sqlite': {
@@ -38,7 +38,10 @@ export async function createPersistenceBackend(
 
 		case 'memory': {
 			const { MemoryPersistence } = await import('./MemoryPersistence.js');
-			return new MemoryPersistence();
+			return new MemoryPersistence({
+				maxHistorySize: config.options?.maxHistorySize,
+				persistBranches: config.options?.persistBranches,
+			});
 		}
 
 		default:

@@ -97,7 +97,7 @@ describe('ConnectionPool additional coverage', () => {
 			await expect(pool.process(sessionId, thought)).rejects.toThrow();
 
 			await pool.terminate();
-		})
+		});
 	});
 
 	describe('auto cleanup', () => {
@@ -123,8 +123,8 @@ describe('ConnectionPool additional coverage', () => {
 
 			await pool.terminate();
 			vi.useRealTimers();
-		})
-	})
+		});
+	});
 
 	describe('dispose', () => {
 		it('should delegate to terminate', async () => {
@@ -140,8 +140,8 @@ describe('ConnectionPool additional coverage', () => {
 			await pool.dispose();
 			expect(pool.isRunning()).toBe(false);
 			expect(pool.getStats().totalSessions).toBe(0);
-		})
-	})
+		});
+	});
 
 	describe('concurrent session creation', () => {
 		it('should handle concurrent createSession calls', async () => {
@@ -162,8 +162,8 @@ describe('ConnectionPool additional coverage', () => {
 			expect(pool.getStats().totalSessions).toBe(3);
 
 			await pool.terminate();
-		})
-	})
+		});
+	});
 
 	describe('session isTimedOut', () => {
 		it('should detect timed-out session via auto cleanup', async () => {
@@ -195,12 +195,13 @@ describe('ConnectionPool additional coverage', () => {
 	});
 
 	describe('error handling in terminate', () => {
-		it('should handle errors when closing sessions during terminate', async () => {
+		it('should report errors when closing sessions during terminate', async () => {
+			const stopFailure = new Error('Stop failed');
 			const failingFactory = vi.fn().mockImplementation(async () => ({
 				processThought: vi.fn().mockResolvedValue({
 					content: [{ type: 'text', text: 'test' }],
 				}),
-				stop: vi.fn().mockRejectedValue(new Error('Stop failed')),
+				stop: vi.fn().mockRejectedValue(stopFailure),
 			}));
 
 			const pool = new ConnectionPool({
@@ -211,10 +212,9 @@ describe('ConnectionPool additional coverage', () => {
 
 			await pool.createSession();
 
-			// Should not throw even if stop fails
-			await expect(pool.terminate()).resolves.toBeUndefined();
-		})
-	})
+			await expect(pool.terminate()).rejects.toMatchObject({ errors: [stopFailure] });
+		});
+	});
 
 	describe('createConnectionPool factory', () => {
 		it('should create pool with all options', () => {
@@ -229,8 +229,8 @@ describe('ConnectionPool additional coverage', () => {
 			expect(pool.getStats().maxSessions).toBe(50);
 
 			pool.terminate();
-		})
-	})
+		});
+	});
 
 	describe('Session timeout timer with existing timer', () => {
 		it('should clear existing timer when _startTimeout is called again (via process)', async () => {
@@ -408,7 +408,6 @@ describe('ConnectionPool additional coverage', () => {
 			await pool.terminate();
 			vi.useRealTimers();
 		});
-
 	});
 
 	describe('terminate edge cases', () => {

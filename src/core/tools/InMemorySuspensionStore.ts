@@ -9,8 +9,14 @@
  */
 
 import type { ISuspensionStore, SuspensionRecord } from '../../contracts/suspension.js';
-import { generateSuspensionToken, asSessionId, type SessionId, type SuspensionToken } from '../../contracts/ids.js';
+import {
+	generateSuspensionToken,
+	asSessionId,
+	type SessionId,
+	type SuspensionToken,
+} from '../../contracts/ids.js';
 import type { Logger } from '../../logger/StructuredLogger.js';
+import { SuspensionExpiredError, SuspensionNotFoundError } from '../../errors.js';
 
 /**
  * Configuration for {@link InMemorySuspensionStore}.
@@ -38,6 +44,7 @@ const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
  * const rec = store.suspend({
  *   sessionId: 's1',
  *   toolCallThoughtNumber: 3,
+ *   toolCallThoughtId: 'thought-3',
  *   toolName: 'search',
  *   toolArguments: { q: 'foo' },
  *   expiresAt: 0,
@@ -49,6 +56,7 @@ const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
 export class InMemorySuspensionStore implements ISuspensionStore {
 	private readonly _byToken: Map<SuspensionToken, SuspensionRecord> = new Map();
 	private readonly _bySession: Map<SessionId, Set<SuspensionToken>> = new Map();
+	private readonly _admissionTails: Map<SuspensionToken, Promise<void>> = new Map();
 	private readonly _ttlMs: number;
 	private readonly _sweepIntervalMs: number;
 	private _timer: ReturnType<typeof setInterval> | null = null;
@@ -59,7 +67,7 @@ export class InMemorySuspensionStore implements ISuspensionStore {
 	}
 
 	suspend(
-		record: Omit<SuspensionRecord, 'token' | 'createdAt'> & { ttlMs?: number },
+		record: Omit<SuspensionRecord, 'token' | 'createdAt'> & { ttlMs?: number }
 	): SuspensionRecord {
 		const token = generateSuspensionToken();
 		const createdAt = Date.now();
@@ -70,6 +78,7 @@ export class InMemorySuspensionStore implements ISuspensionStore {
 			token,
 			sessionId: record.sessionId,
 			toolCallThoughtNumber: record.toolCallThoughtNumber,
+			toolCallThoughtId: record.toolCallThoughtId,
 			toolName: record.toolName,
 			toolArguments: record.toolArguments,
 			createdAt,
@@ -98,6 +107,48 @@ export class InMemorySuspensionStore implements ISuspensionStore {
 		return rec;
 	}
 
+	async compareAndAdmit(
+		token: SuspensionToken,
+		expectedSessionId: SessionId,
+		admit: (record: SuspensionRecord) => void
+	): Promise<SuspensionRecord> {
+		const previous = this._admissionTails.get(token) ?? Promise.resolve();
+		const release = Promise.withResolvers<void>();
+		const tail = previous.then(
+			() => release.promise,
+			() => release.promise
+		);
+		this._admissionTails.set(token, tail);
+
+		try {
+			await previous.then(
+				() => undefined,
+				() => undefined
+			);
+			const record = this._byToken.get(token);
+			if (record === undefined) {
+				throw new SuspensionNotFoundError('Suspension token not found: ' + token);
+			}
+			const now = Date.now();
+			if (record.expiresAt <= now) {
+				this._delete(token, record.sessionId);
+				throw new SuspensionExpiredError('Suspension token expired: ' + token);
+			}
+			if (record.sessionId !== expectedSessionId) {
+				throw new SuspensionNotFoundError('Suspension token not found: ' + token);
+			}
+
+			admit(record);
+			this._delete(token, record.sessionId);
+			return record;
+		} finally {
+			release.resolve();
+			if (this._admissionTails.get(token) === tail) {
+				this._admissionTails.delete(token);
+			}
+		}
+	}
+
 	peek(token: string): SuspensionRecord | null {
 		return this._byToken.get(token as SuspensionToken) ?? null;
 	}
@@ -120,6 +171,11 @@ export class InMemorySuspensionStore implements ISuspensionStore {
 			this._byToken.delete(token);
 		}
 		this._bySession.delete(asSessionId(sessionId));
+	}
+
+	clearAll(): void {
+		this._byToken.clear();
+		this._bySession.clear();
 	}
 
 	size(sessionId?: string): number {

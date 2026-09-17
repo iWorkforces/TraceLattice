@@ -60,6 +60,11 @@ export class SessionLock implements ISessionLock {
 		return this._locks.size;
 	}
 
+	/** Returns whether a session currently has a holder or queued operation. */
+	public isActive(sessionId: SessionId | undefined): boolean {
+		return this._locks.has(lockKey(sessionId));
+	}
+
 	/**
 	 * Execute `fn` while holding the lock for the given session.
 	 *
@@ -75,7 +80,7 @@ export class SessionLock implements ISessionLock {
 	public async withLock<T>(
 		sessionId: SessionId | undefined,
 		fn: () => Promise<T>,
-		timeoutMs: number = DEFAULT_LOCK_TIMEOUT_MS,
+		timeoutMs: number = DEFAULT_LOCK_TIMEOUT_MS
 	): Promise<T> {
 		const key = lockKey(sessionId);
 		const previous = this._locks.get(key) ?? Promise.resolve();
@@ -83,27 +88,26 @@ export class SessionLock implements ISessionLock {
 		// `next` is the tail this acquirer publishes to the chain. It only
 		// resolves after `previous` settles, guaranteeing serialization even
 		// when the current acquirer times out before holding the lock.
-		let release!: () => void;
+		const release = Promise.withResolvers<void>();
 		const next = previous.then(
-			() => new Promise<void>((resolve) => {
-				release = resolve;
-			}),
-			() => new Promise<void>((resolve) => {
-				release = resolve;
-			}),
+			() => release.promise,
+			() => release.promise
 		);
 		this._locks.set(key, next);
+		// Identity protects a later acquisition from an earlier tail's cleanup.
+		void next.then(() => {
+			if (this._locks.get(key) === next) {
+				this._locks.delete(key);
+			}
+		});
 
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 		try {
 			await new Promise<void>((resolve, reject) => {
-				timeoutId = setTimeout(
-					() => reject(new LockTimeoutError(key, timeoutMs)),
-					timeoutMs,
-				);
+				timeoutId = setTimeout(() => reject(new LockTimeoutError(key, timeoutMs)), timeoutMs);
 				previous.then(
 					() => resolve(),
-					() => resolve(), // previous holder's failure must not poison the chain
+					() => resolve() // previous holder's failure must not poison the chain
 				);
 			});
 			return await fn();
@@ -111,21 +115,7 @@ export class SessionLock implements ISessionLock {
 			if (timeoutId !== undefined) {
 				clearTimeout(timeoutId);
 			}
-			// Only purge the chain tail if no later acquisition chained on top.
-			if (this._locks.get(key) === next) {
-				this._locks.delete(key);
-			}
-			// `release` is assigned inside the `previous.then(...)` callback.
-			// If the timeout fired before `previous` resolved, `release` may
-			// not yet exist — wait for `previous` to settle, then release.
-			if (release) {
-				release();
-			} else {
-				const safeRelease = (): void => {
-					if (release) release();
-				};
-				previous.then(safeRelease, safeRelease);
-			}
+			release.resolve();
 		}
 	}
 }

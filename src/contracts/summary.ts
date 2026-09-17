@@ -96,6 +96,12 @@ export interface ISummaryStore {
 	clearSession(sessionId: SessionId): void;
 
 	/**
+	 * Discard summaries from every session namespace.
+	 * Use only for a trusted process-wide reset; scoped callers must use `clearSession`.
+	 */
+	clearAll(): void;
+
+	/**
 	 * Count summaries.
 	 *
 	 * @param sessionId - If provided, count for that session only;

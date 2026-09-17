@@ -10,7 +10,6 @@
 import type { IOutcomeRecorder, VerificationOutcome } from '../../contracts/interfaces.js';
 import { asSessionId, type SessionId } from '../../contracts/ids.js';
 
-
 /**
  * Configuration for OutcomeRecorder.
  */
@@ -112,5 +111,9 @@ export class OutcomeRecorder implements IOutcomeRecorder {
 	 */
 	clearOutcomes(sessionId: string): void {
 		this._outcomes.delete(asSessionId(sessionId));
+	}
+
+	clearAllOutcomes(): void {
+		this._outcomes.clear();
 	}
 }

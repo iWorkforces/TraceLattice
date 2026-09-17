@@ -12,7 +12,12 @@
  */
 
 import { ValidationError } from '../errors.js';
-import { sanitizeString, sanitizeRationale, sanitizeStepField, sanitizeSuggestedInputs } from '../sanitize.js';
+import {
+	sanitizeString,
+	sanitizeRationale,
+	sanitizeStepField,
+	sanitizeSuggestedInputs,
+} from '../sanitize.js';
 import type { ThoughtData } from './thought.js';
 import { SESSION_ID_PATTERN, MAX_SESSION_ID_LENGTH } from './ids.js';
 import { asBranchId, asSessionId, generateThoughtId, type BranchId } from '../contracts/ids.js';
@@ -73,8 +78,6 @@ export function sanitizeRecursive(value: unknown): unknown {
  */
 const BRANCH_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 
-
-
 /**
  * Sanitizes and validates a branch ID to prevent path traversal attacks.
  *
@@ -121,7 +124,6 @@ export function sanitizeSessionId(sessionId: string): string | undefined {
 	return cleaned;
 }
 
-
 /**
  * Normalizes a recommendation object (tool or skill) with default values.
  *
@@ -167,7 +169,7 @@ function normalizeRecommendation(rec: Record<string, unknown>): Record<string, u
 		!Array.isArray(normalized.suggested_inputs)
 	) {
 		normalized.suggested_inputs = sanitizeSuggestedInputs(
-			normalized.suggested_inputs as Record<string, unknown>,
+			normalized.suggested_inputs as Record<string, unknown>
 		);
 	}
 
@@ -249,8 +251,8 @@ function normalizeStepRecommendation(
 		normalized.expected_outcome = sanitizeStepField(normalized.expected_outcome);
 	}
 	if (Array.isArray(normalized.next_step_conditions)) {
-		normalized.next_step_conditions = normalized.next_step_conditions.map(
-			(cond: unknown) => (typeof cond === 'string' ? sanitizeStepField(cond) : cond),
+		normalized.next_step_conditions = normalized.next_step_conditions.map((cond: unknown) =>
+			typeof cond === 'string' ? sanitizeStepField(cond) : cond
 		);
 	}
 	// In lenient mode, fill in default expected_outcome if missing
@@ -260,7 +262,6 @@ function normalizeStepRecommendation(
 
 	return normalized;
 }
-
 
 /**
  * Normalizes reasoning-specific fields on a thought input object.
@@ -413,7 +414,6 @@ export function normalizeInput(input: unknown): ThoughtData {
 		);
 	}
 
-
 	// Normalize all items in previous_steps if present (lenient mode - with defaults)
 	if (Array.isArray(normalized.previous_steps) && normalized.previous_steps.length > 0) {
 		normalized.previous_steps = normalized.previous_steps.map((step) =>
@@ -428,14 +428,13 @@ export function normalizeInput(input: unknown): ThoughtData {
 		normalized.branch_id = sanitizeBranchId(normalized.branch_id);
 	}
 
-	// Sanitize session_id (same pattern as branch_id but allows 1-100 chars)
+	// Explicit identity is validated, never sanitized into another namespace.
 	if (typeof normalized.session_id === 'string') {
-		const sanitized = sanitizeSessionId(normalized.session_id);
-		if (sanitized === undefined) {
-			delete normalized.session_id;
-		} else {
-			normalized.session_id = asSessionId(sanitized);
-		}
+		normalized.session_id = asSessionId(normalized.session_id);
+	}
+
+	if (typeof normalized.register_branch_id === 'string') {
+		normalized.register_branch_id = sanitizeBranchId(normalized.register_branch_id);
 	}
 
 	// Auto-generate id if not provided (for DAG node identity)
@@ -450,7 +449,6 @@ export function normalizeInput(input: unknown): ThoughtData {
 	if (typeof normalized.meta_observation === 'string') {
 		normalized.meta_observation = sanitizeStepField(normalized.meta_observation);
 	}
-
 
 	// Sanitize all free-text string fields recursively (dangerous HTML tags + null bytes)
 	// This was moved from schema transforms because v.transform() cannot be converted to JSON Schema

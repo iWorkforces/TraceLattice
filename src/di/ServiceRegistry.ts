@@ -25,6 +25,7 @@ import type { ISummaryStore } from '../contracts/summary.js';
 import type { CompressionService } from '../core/compression/CompressionService.js';
 import type { ISuspensionStore } from '../contracts/suspension.js';
 import type { ConfigFileOptions } from '../config/ConfigLoader.js';
+import type { SessionLifecycleCoordinator } from '../core/SessionLifecycleCoordinator.js';
 
 export interface ServiceRegistry {
 	Logger: StructuredLogger;
@@ -46,6 +47,7 @@ export interface ServiceRegistry {
 	compressionService: CompressionService;
 	suspensionStore: ISuspensionStore;
 	sessionLock: ISessionLock;
+	sessionLifecycle: SessionLifecycleCoordinator;
 }
 
 export type ServiceKey = keyof ServiceRegistry;

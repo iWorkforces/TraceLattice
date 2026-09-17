@@ -6,8 +6,13 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { normalizeInput, normalizeReasoningFields, sanitizeRecursive } from '../core/InputNormalizer.js';
+import {
+	normalizeInput,
+	normalizeReasoningFields,
+	sanitizeRecursive,
+} from '../core/InputNormalizer.js';
 import type { ThoughtData } from '../core/thought.js';
+import { ValidationError } from '../errors.js';
 
 /**
  * Helper for creating tool recommendations.
@@ -23,6 +28,51 @@ function createToolRecommendation(overrides?: Record<string, unknown>): Record<s
 }
 
 describe('InputNormalizer', () => {
+	describe('session identity boundary', () => {
+		it.each(['', 'bad session!', 'a/b', 'x'.repeat(101)])(
+			'rejects malformed explicit session id %j without mutating caller input',
+			(sessionId) => {
+				const input = {
+					thought: 'reset safely',
+					thought_number: 1,
+					total_thoughts: 1,
+					next_thought_needed: false,
+					session_id: sessionId,
+					reset_state: true,
+					register_branch_id: 'future-branch',
+					tool_arguments: { nested: { values: ['one', 'two'] } },
+				};
+				const before = structuredClone(input);
+
+				expect(() => normalizeInput(input)).toThrowError(ValidationError);
+				expect(input).toEqual(before);
+			}
+		);
+
+		it('preserves omitted identity and deep caller input while returning a fresh normalized copy', () => {
+			const input = {
+				thought: 'global thought',
+				thought_number: 1,
+				total_thoughts: 1,
+				next_thought_needed: false,
+				register_branch_id: 'future-branch',
+				current_step: {
+					step_description: 'inspect',
+					recommended_tools: [{ tool_name: 'Read', confidence: 1, rationale: 'read' }],
+					expected_outcome: 'known',
+				},
+			};
+			const before = structuredClone(input);
+
+			const normalized = normalizeInput(input);
+
+			expect(normalized.session_id).toBeUndefined();
+			expect(normalized).not.toBe(input);
+			expect(normalized.current_step).not.toBe(input.current_step);
+			expect(input).toEqual(before);
+		});
+	});
+
 	describe('current_step normalization', () => {
 		it('should transform recommended_tool (singular) to recommended_tools (plural)', () => {
 			const input = {
@@ -459,7 +509,7 @@ describe('InputNormalizer', () => {
 			expect(normalized.next_thought_needed).toBe(false);
 			expect(normalized.available_mcp_tools).toEqual(['tool1', 'tool2']);
 			expect(normalized.available_skills).toEqual(['skill1']);
-		expect(normalized.remaining_steps).toEqual(['Step 3', 'Step 4']);
+			expect(normalized.remaining_steps).toEqual(['Step 3', 'Step 4']);
 		});
 	});
 });
@@ -573,9 +623,7 @@ describe('reasoning fields normalization', () => {
 
 	describe('thought_type', () => {
 		it('should default thought_type to regular when missing', () => {
-			const normalized = normalizeInput(
-				createMinimalInput()
-			) as ThoughtData;
+			const normalized = normalizeInput(createMinimalInput()) as ThoughtData;
 			expect(normalized.thought_type).toBe('regular');
 		});
 
@@ -589,46 +637,34 @@ describe('reasoning fields normalization', () => {
 
 	describe('quality_score', () => {
 		it('should clamp quality_score above 1 to 1', () => {
-			const normalized = normalizeInput(
-				createMinimalInput({ quality_score: 1.5 })
-			) as ThoughtData;
+			const normalized = normalizeInput(createMinimalInput({ quality_score: 1.5 })) as ThoughtData;
 			expect(normalized.quality_score).toBe(1);
 		});
 
 		it('should clamp quality_score below 0 to 0', () => {
-			const normalized = normalizeInput(
-				createMinimalInput({ quality_score: -0.3 })
-			) as ThoughtData;
+			const normalized = normalizeInput(createMinimalInput({ quality_score: -0.3 })) as ThoughtData;
 			expect(normalized.quality_score).toBe(0);
 		});
 
 		it('should leave quality_score within range unchanged', () => {
-			const normalized = normalizeInput(
-				createMinimalInput({ quality_score: 0.75 })
-			) as ThoughtData;
+			const normalized = normalizeInput(createMinimalInput({ quality_score: 0.75 })) as ThoughtData;
 			expect(normalized.quality_score).toBe(0.75);
 		});
 	});
 
 	describe('confidence', () => {
 		it('should clamp confidence above 1 to 1', () => {
-			const normalized = normalizeInput(
-				createMinimalInput({ confidence: 2.0 })
-			) as ThoughtData;
+			const normalized = normalizeInput(createMinimalInput({ confidence: 2.0 })) as ThoughtData;
 			expect(normalized.confidence).toBe(1);
 		});
 
 		it('should clamp confidence below 0 to 0', () => {
-			const normalized = normalizeInput(
-				createMinimalInput({ confidence: -1 })
-			) as ThoughtData;
+			const normalized = normalizeInput(createMinimalInput({ confidence: -1 })) as ThoughtData;
 			expect(normalized.confidence).toBe(0);
 		});
 
 		it('should leave confidence within range unchanged', () => {
-			const normalized = normalizeInput(
-				createMinimalInput({ confidence: 0.9 })
-			) as ThoughtData;
+			const normalized = normalizeInput(createMinimalInput({ confidence: 0.9 })) as ThoughtData;
 			expect(normalized.confidence).toBe(0.9);
 		});
 	});
@@ -827,9 +863,7 @@ describe('sanitizeRecursive', () => {
 });
 
 describe('suggested_inputs sanitization', () => {
-	function createInputWithSuggestedInputs(
-		suggestedInputs: Record<string, unknown>
-	): unknown {
+	function createInputWithSuggestedInputs(suggestedInputs: Record<string, unknown>): unknown {
 		return {
 			thought: 'Test thought',
 			thought_number: 1,
@@ -837,9 +871,7 @@ describe('suggested_inputs sanitization', () => {
 			next_thought_needed: false,
 			current_step: {
 				step_description: 'Test step',
-				recommended_tools: [
-					createToolRecommendation({ suggested_inputs: suggestedInputs }),
-				],
+				recommended_tools: [createToolRecommendation({ suggested_inputs: suggestedInputs })],
 				expected_outcome: 'Test outcome',
 			},
 		};
@@ -907,24 +939,28 @@ describe('session_id sanitization', () => {
 		expect(result.session_id).toBe('analysis-task-42');
 	});
 
-	it('sanitizes control characters from session_id', () => {
-		const result = normalizeInput({ ...baseInput, session_id: 'session\x00name' }) as ThoughtData;
-		expect(result.session_id).toBe('sessionname');
+	it('rejects control characters in explicit session_id', () => {
+		expect(() => normalizeInput({ ...baseInput, session_id: 'session\x00name' })).toThrowError(
+			ValidationError
+		);
 	});
 
-	it('strips session_id with invalid characters after sanitization', () => {
-		const result = normalizeInput({ ...baseInput, session_id: 'bad session!' }) as ThoughtData;
-		expect(result.session_id).toBeUndefined();
+	it('rejects session_id with invalid characters', () => {
+		expect(() => normalizeInput({ ...baseInput, session_id: 'bad session!' })).toThrowError(
+			ValidationError
+		);
 	});
 
-	it('strips session_id exceeding 100 characters', () => {
-		const result = normalizeInput({ ...baseInput, session_id: 'a'.repeat(101) }) as ThoughtData;
-		expect(result.session_id).toBeUndefined();
+	it('rejects session_id exceeding 100 characters', () => {
+		expect(() => normalizeInput({ ...baseInput, session_id: 'a'.repeat(101) })).toThrowError(
+			ValidationError
+		);
 	});
 
-	it('strips session_id containing path traversal sequences', () => {
-		const result = normalizeInput({ ...baseInput, session_id: '../etc/passwd' }) as ThoughtData;
-		expect(result.session_id).toBeUndefined();
+	it('rejects session_id containing path traversal sequences', () => {
+		expect(() => normalizeInput({ ...baseInput, session_id: '../etc/passwd' })).toThrowError(
+			ValidationError
+		);
 	});
 
 	it('preserves undefined session_id', () => {

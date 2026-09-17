@@ -1,8 +1,9 @@
 /**
  * Ambient module declaration for the optional 'better-sqlite3' dependency.
  *
- * Since better-sqlite3 is an optional peer dependency and @types/better-sqlite3
- * is not installed, this declaration provides minimal typing for the dynamic import.
+ * better-sqlite3 is an optional runtime dependency installed as an exact development
+ * dependency for native conformance. Since @types/better-sqlite3 is not installed,
+ * this declaration provides minimal typing for the dynamic import.
  * The exported constructor returns a Database instance matching the local interface
  * defined in SqlitePersistence.ts.
  */
@@ -25,6 +26,9 @@ declare module 'better-sqlite3' {
 		lastInsertRowid: number;
 	}
 
-	const DatabaseCtor: new (path: string) => Database;
+	const DatabaseCtor: new (
+		path: string,
+		options?: { readonly readonly?: boolean; readonly fileMustExist?: boolean }
+	) => Database;
 	export default DatabaseCtor;
 }

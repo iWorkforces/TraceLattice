@@ -1,74 +1,29 @@
-/**
- * File system watcher for tool directory changes.
- *
- * This module provides the `ToolWatcher` class which monitors configured
- * tool directories for file changes using chokidar. It watches for
- * file additions and removals to enable dynamic tool discovery and registration.
- *
- * @module watcher
- */
-
 import { watch, type FSWatcher } from 'chokidar';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
+import { getErrorMessage } from '../errors.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import type { ToolRegistry } from '../registry/ToolRegistry.js';
-import { getErrorMessage } from '../errors.js';
 
-/**
- * File system watcher for tool directories.
- *
- * This class monitors configured tool directories for file system changes,
- * watching for tool file additions and removals. When tool files are added
- * or removed, it automatically updates the tool registry.
- *
- * The watched directories are:
- * - `.claude/tools` (project-local)
- * - `~/.claude/tools` (user-global)
- *
- * @remarks
- * **Watched Events:**
- * - `add` - A new tool file was added (triggers rediscovery)
- * - `unlink` - A tool file was removed (unregisters the tool)
- *
- * **Ignored Paths:**
- * - `node_modules` directories are ignored
- *
- * **Watcher Behavior:**
- * - Uses persistent mode to continue watching even if files are temporarily deleted
- * - Automatically starts watching when instantiated
- * - On file add: Triggers tool rediscovery to pick up new tools
- * - On file remove: Extracts tool name and unregisters it
- *
- * @example
- * ```typescript
- * import { ToolWatcher } from './ToolWatcher.js';
- * import { ToolRegistry } from './registry/ToolRegistry.js';
- *
- * const registry = new ToolRegistry();
- * const watcher = new ToolWatcher(registry);
- * // Watcher automatically starts monitoring tool directories
- *
- * // When done, stop the watcher
- * watcher.stop();
- * ```
- */
+/** Watches tool discovery directories and serializes registry refreshes. */
 export class ToolWatcher {
-	/** The underlying chokidar file system watcher. */
 	private _watcher: FSWatcher | null = null;
-	/** The tool registry to update when tools change. */
-	private readonly _toolRegistry: ToolRegistry;
-	private _logger: Logger;
+	private readonly _logger: Logger;
+	private readonly _readyPromise: Promise<void>;
+	private _pendingRefresh: Promise<void> | null = null;
+	private _refreshQueued = false;
+	private _stopped = false;
+	private _stopPromise: Promise<void> | null = null;
 
-	constructor(toolRegistry: ToolRegistry, logger?: Logger) {
-		this._toolRegistry = toolRegistry;
+	constructor(
+		private readonly _toolRegistry: ToolRegistry,
+		logger?: Logger,
+		watchDirs: readonly string[] = ['.claude/tools', join(homedir(), '.claude/tools')]
+	) {
 		this._logger = logger ?? this._createNoopLogger();
-		this.setupWatcher();
+		this._readyPromise = this._setupWatcher(watchDirs);
 	}
 
-	/**
-	 * Create a no-op logger when none is provided.
-	 */
 	private _createNoopLogger(): Logger {
 		return {
 			info: () => {},
@@ -80,105 +35,60 @@ export class ToolWatcher {
 		};
 	}
 
-	/**
-	 * Sets up the file system watcher for tool directories.
-	 *
-	 * Configures chokidar to watch the tool directories and sets up
-	 * event handlers for file additions and removals.
-	 *
-	 * @private
-	 */
-	private setupWatcher(): void {
-		const toolDirs = ['.claude/tools', join(homedir(), '.claude/tools')];
-
-		this._watcher = watch(toolDirs, {
+	private _setupWatcher(watchDirs: readonly string[]): Promise<void> {
+		const watcher = watch([...watchDirs], {
 			ignored: [/node_modules/, /\.DS_Store$/],
 			persistent: true,
 		});
-
-		this._watcher.on('add', async (path) => {
-			await this.handleToolFileAdd(path);
-		});
-
-		this._watcher.on('unlink', async (path) => {
-			await this.handleToolFileRemoval(path);
-		});
+		this._watcher = watcher;
+		watcher.on('add', (path) => this._handleEvent(path));
+		watcher.on('change', (path) => this._handleEvent(path));
+		watcher.on('unlink', (path) => this._handleEvent(path));
+		return new Promise((resolve) => watcher.on('ready', () => resolve()));
 	}
 
-	/**
-	 * Handles the event when a tool file is added.
-	 *
-	 * When a new `.tool.md` file is detected, this method triggers
-	 * tool rediscovery to pick up the new tool.
-	 *
-	 * @param toolPath - The file path of the added tool file
-	 * @returns A Promise that resolves when handling is complete
-	 * @private
-	 */
-	private async handleToolFileAdd(toolPath: string): Promise<void> {
-		// Only process .tool.md files
-		if (!toolPath.endsWith('.tool.md')) {
-			return;
-		}
-
-		// Trigger rediscovery to pick up the new tool
-		try {
-			await this._toolRegistry.discoverAsync();
-		} catch (error) {
-			this._logger.error(`Failed to discover tools:`, { error });
-		}
+	private _handleEvent(path: string): Promise<void> {
+		if (this._stopped || !path.endsWith('.tool.md')) return Promise.resolve();
+		return this._scheduleRefresh(path);
 	}
 
-	/**
-	 * Handles the event when a tool file is removed.
-	 *
-	 * When a `.tool.md` file is deleted, this method extracts the tool
-	 * name from the filename and removes it from the registry.
-	 *
-	 * @param toolPath - The file path of the removed tool file
-	 * @returns A Promise that resolves when handling is complete
-	 * @private
-	 */
-	private async handleToolFileRemoval(toolPath: string): Promise<void> {
-		// Only process .tool.md files
-		if (!toolPath.endsWith('.tool.md')) {
-			return;
+	private _scheduleRefresh(path: string): Promise<void> {
+		this._refreshQueued = true;
+		if (!this._pendingRefresh) {
+			this._pendingRefresh = this._drainRefreshes(path).finally(() => {
+				this._pendingRefresh = null;
+			});
 		}
+		return this._pendingRefresh;
+	}
 
-		// Extract tool name from filename (e.g., "my-tool.tool.md" -> "my-tool")
-		const fileName = basename(toolPath);
-		const toolName = fileName.replace('.tool.md', '');
-
-		if (toolName) {
+	private async _drainRefreshes(path: string): Promise<void> {
+		while (this._refreshQueued) {
+			this._refreshQueued = false;
 			try {
-				this._toolRegistry.removeTool(toolName);
+				await this._toolRegistry.refreshAsync();
 			} catch (error) {
-				this._logger.error(
-					`Tool '${toolName}' not registered: ${getErrorMessage(error)}`
-				);
+				this._logger.error('Tool discovery refresh failed', {
+					path,
+					error: getErrorMessage(error),
+				});
 			}
 		}
 	}
 
-	/**
-	 * Stops watching tool directories and cleans up resources.
-	 *
-	 * This method closes the underlying chokidar watcher and releases
-	 * file system resources. After calling this method, the watcher
-	 * cannot be restarted.
-	 *
-	 * @example
-	 * ```typescript
-	 * const registry = new ToolRegistry();
-	 * const watcher = new ToolWatcher(registry);
-	 * // ... use watcher ...
-	 * watcher.stop();
-	 * ```
-	 */
-	public stop(): void {
-		if (this._watcher) {
-			this._watcher.close();
-			this._watcher = null;
-		}
+	/** Resolves when Chokidar has completed its initial scan. */
+	public ready(): Promise<void> {
+		return this._readyPromise;
+	}
+
+	/** Closes Chokidar and joins any refresh accepted before shutdown. */
+	public stop(): Promise<void> {
+		if (this._stopPromise) return this._stopPromise;
+		this._stopped = true;
+		const watcher = this._watcher;
+		const pendingRefresh = this._pendingRefresh;
+		this._watcher = null;
+		this._stopPromise = Promise.all([watcher?.close(), pendingRefresh]).then(() => undefined);
+		return this._stopPromise;
 	}
 }

@@ -10,6 +10,7 @@ vi.mock('node:os', () => ({
 
 import { readFileSync, existsSync } from 'node:fs';
 import { ConfigLoader } from '../../config/ConfigLoader.js';
+import { ConfigurationError } from '../../errors.js';
 import { ServerConfig } from '../../ServerConfig.js';
 
 const mockReadFileSync = readFileSync as unknown as ReturnType<typeof vi.fn>;
@@ -23,6 +24,8 @@ const FEATURE_ENV_VARS = [
 	'TRACELATTICE_FEATURES_TOOL_INTERLEAVE',
 	'TRACELATTICE_FEATURES_NEW_THOUGHT_TYPES',
 	'TRACELATTICE_FEATURES_OUTCOME_RECORDING',
+	'TRACELATTICE_TOOL_INTERLEAVE_TTL_MS',
+	'TRACELATTICE_TOOL_INTERLEAVE_SWEEP_MS',
 ];
 
 describe('ConfigLoader feature flags', () => {
@@ -53,6 +56,38 @@ describe('ConfigLoader feature flags', () => {
 		expect(config.features.reasoningStrategy).toBe('sequential');
 	});
 
+	it('preserves caller values and unknown fields when no environment override is present', () => {
+		const extension = { enabled: true };
+		const raw = {
+			features: { dagEdges: false, reasoningStrategy: 'tot' as const },
+			discoveryCache: { ttl: 4321, maxSize: 17 },
+			persistence: { enabled: true, backend: 'memory' as const },
+			extension,
+		};
+
+		const effective = new ConfigLoader().applyEnvironmentOverrides(raw);
+
+		expect(effective).not.toBe(raw);
+		expect(effective).toEqual(raw);
+		expect(Reflect.get(effective, 'extension')).toBe(extension);
+	});
+
+	it('restores original feature values when the same raw input is reused after env cleanup', () => {
+		const raw = {
+			features: { dagEdges: true, calibration: false },
+		};
+		const loader = new ConfigLoader();
+		process.env.TRACELATTICE_FEATURES_DAG_EDGES = 'false';
+
+		const overridden = loader.applyEnvironmentOverrides(raw);
+		delete process.env.TRACELATTICE_FEATURES_DAG_EDGES;
+		const restored = loader.applyEnvironmentOverrides(raw);
+
+		expect(overridden.features?.dagEdges).toBe(false);
+		expect(restored.features).toEqual({ dagEdges: true, calibration: false });
+		expect(raw.features).toEqual({ dagEdges: true, calibration: false });
+	});
+
 	it('TRACELATTICE_FEATURES_DAG_EDGES=true enables dagEdges', () => {
 		process.env.TRACELATTICE_FEATURES_DAG_EDGES = 'true';
 		const loader = new ConfigLoader();
@@ -73,18 +108,22 @@ describe('ConfigLoader feature flags', () => {
 		expect(config.features.reasoningStrategy).toBe('tot');
 	});
 
-	it('invalid reasoningStrategy value falls back to sequential and warns', () => {
+	it('rejects an invalid reasoning strategy instead of silently falling back', () => {
 		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		process.env.TRACELATTICE_FEATURES_REASONING_STRATEGY = 'bogus';
 
 		const loader = new ConfigLoader();
-		const loaded = loader.load();
-		const config = new ServerConfig(loader.toServerConfigOptions(loaded ?? {}));
 
-		expect(config.features.reasoningStrategy).toBe('sequential');
-		expect(warnSpy).toHaveBeenCalledWith(
-			expect.stringContaining('TRACELATTICE_FEATURES_REASONING_STRATEGY')
-		);
+		expect(() => loader.load()).toThrow(ConfigurationError);
+		expect(warnSpy).not.toHaveBeenCalled();
+	});
+
+	it('rejects a numeric environment value with trailing characters', () => {
+		process.env.TRACELATTICE_TOOL_INTERLEAVE_TTL_MS = '1234garbage';
+
+		const loader = new ConfigLoader();
+
+		expect(() => loader.load()).toThrow(ConfigurationError);
 	});
 
 	it('all boolean feature flags respond to env vars', () => {
@@ -140,29 +179,34 @@ describe('ConfigLoader feature flags', () => {
 		);
 	});
 
-	it('feature flags from JSON config file merge with env var overrides (env wins)', () => {
+	it('environment values override distinct feature and timing values from the config file', () => {
 		mockExistsSync.mockImplementation((path: string) => path === '.claude/config.json');
 		mockReadFileSync.mockReturnValue(
 			JSON.stringify({
 				features: {
 					dagEdges: true,
-					reasoningStrategy: 'tot',
+					reasoningStrategy: 'sequential',
 					calibration: true,
 				},
+				toolInterleaveTtlMs: 9000,
+				toolInterleaveSweepMs: 8000,
 			})
 		);
-		// Env overrides one boolean and the strategy; calibration stays true from file.
 		process.env.TRACELATTICE_FEATURES_DAG_EDGES = 'false';
 		process.env.TRACELATTICE_FEATURES_REASONING_STRATEGY = 'tot';
+		process.env.TRACELATTICE_TOOL_INTERLEAVE_TTL_MS = '1234';
+		process.env.TRACELATTICE_TOOL_INTERLEAVE_SWEEP_MS = '4321';
 
 		const loader = new ConfigLoader();
 		const loaded = loader.load();
 		const config = new ServerConfig(loader.toServerConfigOptions(loaded ?? {}));
 
-		expect(config.features.dagEdges).toBe(false); // env wins
-		expect(config.features.reasoningStrategy).toBe('tot'); // env wins
-		expect(config.features.calibration).toBe(true); // from file
-		expect(config.features.compression).toBe(true); // default (now ON)
+		expect(config.features.dagEdges).toBe(false);
+		expect(config.features.reasoningStrategy).toBe('tot');
+		expect(config.features.calibration).toBe(true);
+		expect(config.features.compression).toBe(true);
+		expect(config.toolInterleaveTtlMs).toBe(1234);
+		expect(config.toolInterleaveSweepMs).toBe(4321);
 	});
 
 	it('feature flags from YAML config file are loaded', () => {
