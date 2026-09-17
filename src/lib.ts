@@ -37,7 +37,6 @@ import { createPersistenceBackend } from './persistence/PersistenceFactory.js';
 import { SkillRegistry } from './registry/SkillRegistry.js';
 import { ToolRegistry } from './registry/ToolRegistry.js';
 import { ServerConfig } from './ServerConfig.js';
-import type { SseTransportOptions } from './transport/SseTransport.js';
 import { SkillWatcher } from './watchers/SkillWatcher.js';
 import { ToolWatcher } from './watchers/ToolWatcher.js';
 
@@ -65,15 +64,6 @@ export interface ServerOptions {
 	 * @default true
 	 */
 	loadFromPersistence?: boolean;
-	/**
-	 * Transport type to use
-	 * @default 'stdio'
-	 */
-	transport?: 'stdio' | 'sse';
-	/**
-	 * SSE transport options (used when transport: 'sse')
-	 */
-	sseTransportOptions?: SseTransportOptions;
 }
 
 /**
