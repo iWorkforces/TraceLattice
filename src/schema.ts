@@ -45,6 +45,8 @@ Each thought can build on, question, or revise previous insights as understandin
 
 IMPORTANT: This server facilitates sequential thinking with MCP tool coordination and skill recommendations. The LLM analyzes available tools and skills to make intelligent recommendations, which are then tracked and organized by this server.
 
+Each invocation records exactly one authored thought and returns. When strategy_hint.action is continue, invoke this tool again with the next thought; do not stop or provide a final answer. terminate permits stopping. The server does not author later thoughts or call itself.
+
 When to use this tool:
 - Breaking down complex problems into steps
 - Planning and design with room for revision
@@ -82,7 +84,7 @@ Parameters explained:
 * Hypothesis generation
 * Hypothesis verification
 * Tool recommendations and rationale
-- next_thought_needed: True if you need more thinking, even if at what seemed like the end
+- next_thought_needed: True if you need more thinking, even if at what seemed like the end. Omission defaults to true; the effective next action is in strategy_hint.
 - thought_number: Current number in sequence (can go beyond initial total if needed)
 - total_thoughts: Current estimate of thoughts needed (can be adjusted up/down)
 - is_revision: A boolean indicating if this thought revises previous thinking
@@ -468,7 +470,9 @@ export const SequentialThinkingSchema = v.object({
 	next_thought_needed: v.optional(
 		v.pipe(
 			v.boolean(),
-			v.description('Whether another thought step is needed (defaults to true if not provided)')
+			v.description(
+				'Omission defaults to true; the effective next action is returned in strategy_hint.'
+			)
 		)
 	),
 	thought_number: v.pipe(v.number(), v.minValue(1), v.description('Current thought number')),
