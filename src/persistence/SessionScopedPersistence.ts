@@ -4,7 +4,7 @@ import type {
 	SessionScopedPersistenceOperation,
 } from '../contracts/PersistenceBackend.js';
 import { supportsSessionScopedPersistence } from '../contracts/PersistenceBackend.js';
-import { PersistenceCapabilityError } from '../errors.js';
+import { PersistenceCapabilityError } from './PersistenceErrors.js';
 
 /** Require the complete scoped capability without falling back to legacy global operations. */
 export function requireSessionScopedPersistence(

@@ -5,10 +5,12 @@ import type { Summary } from '../core/compression/Summary.js';
 import { asBranchId, GLOBAL_SESSION_ID, type BranchId, type SessionId } from '../contracts/ids.js';
 import {
 	PersistenceCompatibilityError,
+} from '../errors.js';
+import {
 	PersistenceScopeMismatchError,
 	type PersistenceScope,
 	type PersistenceWriteOperation,
-} from '../errors.js';
+} from './PersistenceErrors.js';
 
 const BRANCH_ID_PATTERN = /^[A-Za-z0-9_-]{1,50}$/;
 

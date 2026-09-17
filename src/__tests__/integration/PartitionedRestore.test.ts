@@ -23,9 +23,10 @@ import { InMemorySummaryStore } from '../../core/compression/InMemorySummaryStor
 import type { Edge } from '../../core/graph/Edge.js';
 import { EdgeStore } from '../../core/graph/EdgeStore.js';
 import type { ThoughtData } from '../../core/thought.js';
-import { PersistenceCapabilityError, SessionAccessDeniedError } from '../../errors.js';
+import { SessionAccessDeniedError } from '../../core/SessionErrors.js';
 import { MemoryPersistence } from '../../persistence/MemoryPersistence.js';
 import { FilePersistence } from '../../persistence/FilePersistence.js';
+import { PersistenceCapabilityError } from '../../persistence/PersistenceErrors.js';
 import { SqlitePersistence } from '../../persistence/SqlitePersistence.js';
 import { createTestThought } from '../helpers/factories.js';
 import { StatefulSqliteDatabase } from '../helpers/StatefulSqliteDatabase.js';
