@@ -8,11 +8,9 @@ import { createTestThought } from './helpers/factories.js';
 import { useFakeTimers, useRealTimers } from './helpers/timers.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import type { ThoughtData } from '../core/thought.js';
-import {
-	AsyncResetRequiredError,
-	PersistenceDrainError,
-	PersistenceUnavailableError,
-} from '../errors.js';
+import { PersistenceDrainError } from '../core/PersistenceBufferErrors.js';
+import { AsyncResetRequiredError } from '../core/SessionErrors.js';
+import { PersistenceUnavailableError } from '../errors.js';
 
 import { asBranchId, type BranchId } from '../contracts/ids.js';
 import type { SessionId } from '../contracts/ids.js';
