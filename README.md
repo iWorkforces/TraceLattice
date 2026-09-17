@@ -65,6 +65,20 @@ Or via CLI:
 codex mcp add tracelattice -- tracelattice
 ```
 
+### Grok Build
+
+Add TraceLattice as a local MCP server:
+
+```bash
+grok mcp add tracelattice -- tracelattice
+```
+
+For a project-scoped MCP configuration, add `--scope project`:
+
+```bash
+grok mcp add --scope project tracelattice -- tracelattice
+```
+
 ### OpenCode
 
 Global (`~/.config/opencode/opencode.json`) or project-scoped (`.opencode.json`):
