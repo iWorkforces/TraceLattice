@@ -12,14 +12,21 @@ import {
 } from '../../contracts/ids.js';
 import { runWithContext } from '../../context/RequestContext.js';
 import { HistoryManager } from '../../core/HistoryManager.js';
+import { SessionLock } from '../../core/SessionLock.js';
+import { ThoughtEvaluator } from '../../core/ThoughtEvaluator.js';
+import { ThoughtFormatter } from '../../core/ThoughtFormatter.js';
+import { ThoughtProcessor } from '../../core/ThoughtProcessor.js';
+import { Calibrator } from '../../core/evaluator/Calibrator.js';
+import { OutcomeRecorder } from '../../core/reasoning/OutcomeRecorder.js';
 import type { Summary } from '../../core/compression/Summary.js';
 import { InMemorySummaryStore } from '../../core/compression/InMemorySummaryStore.js';
 import type { Edge } from '../../core/graph/Edge.js';
 import { EdgeStore } from '../../core/graph/EdgeStore.js';
 import type { ThoughtData } from '../../core/thought.js';
-import { PersistenceCapabilityError, SessionAccessDeniedError } from '../../errors.js';
+import { SessionAccessDeniedError } from '../../core/SessionErrors.js';
 import { MemoryPersistence } from '../../persistence/MemoryPersistence.js';
 import { FilePersistence } from '../../persistence/FilePersistence.js';
+import { PersistenceCapabilityError } from '../../persistence/PersistenceErrors.js';
 import { SqlitePersistence } from '../../persistence/SqlitePersistence.js';
 import { createTestThought } from '../helpers/factories.js';
 import { StatefulSqliteDatabase } from '../helpers/StatefulSqliteDatabase.js';
@@ -242,6 +249,64 @@ afterEach(async () => {
 });
 
 describe('Task 10 partitioned startup restore', () => {
+	it('restores verification thoughts without replaying outcomes or duplicate indexes', async () => {
+		const persistence = new MemoryPersistence();
+		const sessionId = asSessionId('verification-restore');
+		await persistence.saveThoughtForSession(
+			sessionId,
+			thought(sessionId, 1, { confidence: 0.99, thought_type: 'hypothesis' })
+		);
+		await persistence.saveThoughtForSession(
+			sessionId,
+			thought(sessionId, 2, {
+				thought_type: 'verification',
+				verification_target: 1,
+				verification_result: 0,
+			})
+		);
+		const history = manager(persistence);
+		const recorder = new OutcomeRecorder({ enabled: true });
+		const calibrator = new Calibrator(recorder, true);
+		const processor = new ThoughtProcessor(
+			history,
+			new ThoughtFormatter(),
+			new ThoughtEvaluator(calibrator),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			new SessionLock(),
+			recorder,
+			undefined,
+			calibrator
+		);
+
+		await history.loadFromPersistence();
+
+		expect(history.getHistory(sessionId)).toHaveLength(2);
+		expect(recorder.getOutcomes(sessionId)).toEqual([]);
+		expect(calibrator.metrics(sessionId).sampleCount).toBe(0);
+		expect(calibrator.calibrate(0.9, 'hypothesis', sessionId).temperature).toBe(1);
+
+		const admitted = await processor.process({
+			thought: 'fresh explicit label',
+			thought_number: 3,
+			total_thoughts: 3,
+			next_thought_needed: false,
+			session_id: sessionId,
+			thought_type: 'verification',
+			verification_target: 1,
+			verification_result: 1,
+		});
+
+		expect(admitted.isError).toBeUndefined();
+		expect(recorder.getOutcomes(sessionId)).toEqual([
+			expect.objectContaining({ actual: 1, predicted: 0.99, thoughtNumber: 1 }),
+		]);
+	});
+
 	it('T10-R01/R02/R03 restores the authoritative global/A/B namespace union', async () => {
 		// Given
 		const persistence = new MemoryPersistence();

@@ -94,9 +94,24 @@ function validateScalarReference(
 	warnings: string[]
 ): ThoughtId | undefined {
 	const target = input[field];
-	if (target === undefined) return undefined;
+	const strictVerificationTarget =
+		field === 'verification_target' &&
+		input.thought_type === 'verification' &&
+		input.verification_result !== undefined;
+	if (target === undefined) {
+		if (strictVerificationTarget) {
+			throw new ValidationError('verification_result', 'requires verification_target');
+		}
+		return undefined;
+	}
 	const resolution = context.resolveThoughtReference(target);
 	if (resolution.kind === 'unique') return resolution.thoughtId;
+	if (strictVerificationTarget) {
+		throw new ValidationError(
+			'verification_result',
+			`verification_target ${target} is ${resolution.kind} in session history`
+		);
+	}
 	const descriptor = resolution.kind === 'missing' ? 'dangling' : 'ambiguous';
 	warnings.push(
 		`Dropped ${descriptor} ${field}: ${target} (history has ${context.snapshot.history.length} thoughts)`

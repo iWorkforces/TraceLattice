@@ -9,10 +9,13 @@ import { ALL_THOUGHT_TYPES } from '../../core/evaluator/internals.js';
 import type { IOutcomeRecorder, VerificationOutcome } from '../../contracts/interfaces.js';
 import type { ThoughtType } from '../../core/reasoning.js';
 import { asSessionId, asThoughtId, GLOBAL_SESSION_ID } from '../../contracts/ids.js';
+import type { SessionId, ThoughtId } from '../../contracts/ids.js';
 
 class MockOutcomeRecorder implements IOutcomeRecorder {
 	public readonly enabled = true;
 	private readonly _bySession = new Map<string, VerificationOutcome[]>();
+
+	assertCanRecord(_sessionId: SessionId, _thoughtId: ThoughtId): void {}
 
 	recordVerification(outcome: Omit<VerificationOutcome, 'recordedAt'>): void {
 		const full: VerificationOutcome = { ...outcome, recordedAt: Date.now() };
@@ -21,7 +24,7 @@ class MockOutcomeRecorder implements IOutcomeRecorder {
 		this._bySession.set(full.sessionId, list);
 	}
 
-	getOutcomes(sessionId: string): VerificationOutcome[] {
+	getOutcomes(sessionId: SessionId): VerificationOutcome[] {
 		return this._bySession.get(sessionId) ?? [];
 	}
 
@@ -31,7 +34,7 @@ class MockOutcomeRecorder implements IOutcomeRecorder {
 		return all;
 	}
 
-	clearOutcomes(sessionId: string): void {
+	clearOutcomes(sessionId: SessionId): void {
 		this._bySession.delete(sessionId);
 	}
 

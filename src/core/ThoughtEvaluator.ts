@@ -20,6 +20,12 @@ import { Aggregator } from './evaluator/Aggregator.js';
 import { PatternDetector } from './evaluator/PatternDetector.js';
 import { SignalComputer } from './evaluator/SignalComputer.js';
 
+/** Explicit thought and canonical session used for response calibration. */
+export interface ConfidenceSignalContext {
+	readonly currentThought: ThoughtData;
+	readonly sessionId: SessionId;
+}
+
 /**
  * No-op calibrator used when calibration is disabled or no calibrator is injected.
  *
@@ -101,24 +107,26 @@ export class ThoughtEvaluator {
 	/** Compute confidence signals from history context. Pure computation. */
 	public computeConfidenceSignals(
 		history: ThoughtData[],
-		branches: Record<string, ThoughtData[]>
+		branches: Record<string, ThoughtData[]>,
+		context?: ConfidenceSignalContext
 	): ConfidenceSignals {
 		const { history: h, branches: b } = filterRetracted(history, branches);
 		const signals = this._signalComputer.computeConfidenceSignals(h, b);
 		if (!this._calibrator.enabled) return signals;
 
-		const lastThought = h[h.length - 1];
-		if (lastThought?.confidence === undefined) return signals;
+		const thought = context?.currentThought ?? h[h.length - 1];
+		if (thought?.confidence === undefined) return signals;
+		const sessionId = context?.sessionId ?? thought.session_id ?? GLOBAL_SESSION_ID;
 
 		const result = this._calibrator.calibrate(
-			lastThought.confidence,
-			lastThought.thought_type ?? 'regular',
-			lastThought.session_id ?? GLOBAL_SESSION_ID
+			thought.confidence,
+			thought.thought_type ?? 'regular',
+			sessionId
 		);
 		return {
 			...signals,
 			calibrated_confidence: result.calibrated,
-			calibration_metrics: this._calibrator.metrics(lastThought.session_id),
+			calibration_metrics: this._calibrator.metrics(sessionId),
 		};
 	}
 

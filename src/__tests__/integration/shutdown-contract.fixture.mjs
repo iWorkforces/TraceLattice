@@ -349,6 +349,40 @@ async function runReloadFile() {
 	await finish(0, { event: 'reload-final', thoughts });
 }
 
+function createPooledChildServerFactory(context) {
+	const { libModule, childConfig, childStopGate, state } = context;
+	return async () => {
+		state.childCount++;
+		const childNumber = state.childCount;
+		const child = await libModule.createServer({
+			config: childConfig,
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		let stopPromise;
+		await send({ event: 'child-created', childCount: state.childCount });
+		return {
+			processThought: async (input) => {
+				await send({ event: 'child-dispatched', child: childNumber });
+				return child.processThought(input);
+			},
+			stop: () => {
+				if (stopPromise) return stopPromise;
+				stopPromise = (async () => {
+					state.childStopCount++;
+					state.order.push('child-stop-started');
+					await send({ event: 'child-stop-started', stopCount: state.childStopCount });
+					await childStopGate.promise;
+					await child.stop();
+					state.order.push('child-stop-completed');
+					await send({ event: 'child-stop-completed', stopCount: state.childStopCount });
+				})();
+				return stopPromise;
+			},
+		};
+	};
+}
+
 async function runPooledSse() {
 	await nextControl('start');
 	const [
@@ -369,44 +403,13 @@ async function runPooledSse() {
 		import('../../../dist/contracts/ids.js'),
 	]);
 	const childStopGate = deferred();
-	let childCount = 0;
-	let childStopCount = 0;
+	const state = { childCount: 0, childStopCount: 0, order: [] };
 	let shutdownSettled = false;
-	const order = [];
 	const exits = [];
 	const childConfig = cleanConfig(configModule.ServerConfig);
 	const pool = new poolModule.ConnectionPool({
 		autoCleanup: false,
-		serverFactory: async () => {
-			childCount++;
-			const childNumber = childCount;
-			const child = await libModule.createServer({
-				config: childConfig,
-				autoDiscover: false,
-				loadFromPersistence: false,
-			});
-			let stopPromise;
-			await send({ event: 'child-created', childCount });
-			return {
-				processThought: async (input) => {
-					await send({ event: 'child-dispatched', child: childNumber });
-					return child.processThought(input);
-				},
-				stop: () => {
-					if (stopPromise) return stopPromise;
-					stopPromise = (async () => {
-						childStopCount++;
-						order.push('child-stop-started');
-						await send({ event: 'child-stop-started', stopCount: childStopCount });
-						await childStopGate.promise;
-						await child.stop();
-						order.push('child-stop-completed');
-						await send({ event: 'child-stop-completed', stopCount: childStopCount });
-					})();
-					return stopPromise;
-				},
-			};
-		},
+		serverFactory: createPooledChildServerFactory({ libModule, childConfig, childStopGate, state }),
 	});
 	const protocolServer = await createProtocolServer(async (input) => {
 		const owner = contextModule.getOwner();
@@ -449,12 +452,12 @@ async function runPooledSse() {
 	await nextControl('release-child-stop');
 	childStopGate.resolve();
 	await shutdown;
-	order.push('lifecycle-completed');
+	state.order.push('lifecycle-completed');
 	await finish(0, {
 		event: 'pooled-sse-final',
-		childCount,
-		childStopCount,
-		order,
+		childCount: state.childCount,
+		childStopCount: state.childStopCount,
+		order: state.order,
 		exits,
 		unhandledRejections,
 		uncaughtExceptions,

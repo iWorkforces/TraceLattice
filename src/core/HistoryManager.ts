@@ -22,11 +22,9 @@ import {
 } from '../contracts/ids.js';
 import type { ISummaryStore } from '../contracts/summary.js';
 import {
-	AsyncResetRequiredError,
 	InvalidBacktrackError,
 	MaxSessionsReachedError,
 	ValidationError,
-	SessionAccessDeniedError,
 } from '../errors.js';
 import { NullLogger } from '../logger/NullLogger.js';
 import type { Logger } from '../logger/StructuredLogger.js';
@@ -37,6 +35,7 @@ import {
 	type HydratedEntry,
 } from './compression/DehydrationPolicy.js';
 import type { Summary } from './compression/Summary.js';
+import { AsyncResetRequiredError, SessionAccessDeniedError } from './SessionErrors.js';
 import { EdgeEmitter } from './graph/EdgeEmitter.js';
 import type {
 	HistorySessionSnapshot,

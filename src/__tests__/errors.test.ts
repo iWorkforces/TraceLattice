@@ -11,17 +11,16 @@ import {
 	InvalidThoughtError,
 	SkillDiscoveryError,
 	HistoryLimitExceededError,
-	SessionNotActiveError,
-	SessionNotFoundError,
 	MaxSessionsReachedError,
 	PoolTerminatedError,
 	PersistenceCompatibilityError,
 	PersistenceUnavailableError,
-	SessionLifecycleClosedError,
 	ValidationError,
 } from '../errors.js';
 import { asSessionId } from '../contracts/ids.js';
 import type { ErrorCode } from '../errors.js';
+import { SessionLifecycleClosedError } from '../core/SessionErrors.js';
+import { SessionNotActiveError, SessionNotFoundError } from '../pool/PoolErrors.js';
 
 describe('Custom Error Types', () => {
 	describe('SequentialThinkingError', () => {
@@ -160,7 +159,30 @@ describe('Custom Error Types', () => {
 			expect(error.name).toBe('ValidationError');
 			expect(error.field).toBe('branchId');
 		});
+
+		it('is the imported constructor when asSessionId rejects an invalid value', () => {
+			let caught: unknown;
+
+			try {
+				asSessionId('invalid session');
+			} catch (error) {
+				caught = error;
+			}
+
+			expect(caught).toBeInstanceOf(ValidationError);
+			if (!(caught instanceof ValidationError)) {
+				throw new Error('Expected asSessionId to throw ValidationError');
+			}
+			expect(caught.constructor).toBe(ValidationError);
+			expect(caught).toMatchObject({
+				field: 'session_id',
+				code: 'VALIDATION_ERROR',
+				message:
+					"Validation failed for 'session_id': must match alphanumeric, hyphens, underscores",
+			});
+		});
 	});
+
 });
 
 describe('SessionNotActiveError', () => {
@@ -170,6 +192,12 @@ describe('SessionNotActiveError', () => {
 		expect(error.code).toBe('SESSION_NOT_ACTIVE');
 		expect(error.name).toBe('SessionNotActiveError');
 	});
+
+	it('remains a SequentialThinkingError and Error', () => {
+		const error = new SessionNotActiveError(asSessionId('test-session'));
+		expect(error).toBeInstanceOf(SequentialThinkingError);
+		expect(error).toBeInstanceOf(Error);
+	});
 });
 
 describe('SessionNotFoundError', () => {
@@ -178,6 +206,12 @@ describe('SessionNotFoundError', () => {
 		expect(error.message).toBe('Session not found: missing-session');
 		expect(error.code).toBe('SESSION_NOT_FOUND');
 		expect(error.name).toBe('SessionNotFoundError');
+	});
+
+	it('remains a SequentialThinkingError and Error', () => {
+		const error = new SessionNotFoundError(asSessionId('missing-session'));
+		expect(error).toBeInstanceOf(SequentialThinkingError);
+		expect(error).toBeInstanceOf(Error);
 	});
 });
 

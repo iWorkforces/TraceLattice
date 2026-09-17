@@ -7,7 +7,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 import type { SessionId } from '../contracts/ids.js';
-import { SessionLifecycleClosedError } from '../errors.js';
+import { SessionLifecycleClosedError } from './SessionErrors.js';
 
 /** Global lifecycle phases owned by the coordinator. */
 export type GlobalLifecyclePhase =

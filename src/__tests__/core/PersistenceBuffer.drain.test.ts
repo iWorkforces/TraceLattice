@@ -25,7 +25,7 @@ import {
 import { PersistenceWorkQueue } from '../../core/PersistenceWorkQueue.js';
 import { PersistenceWriter, type PersistenceDelay } from '../../core/PersistenceWriter.js';
 import type { ThoughtData } from '../../core/thought.js';
-import { PersistenceSessionBarrierReentrancyError } from '../../errors.js';
+import { PersistenceSessionBarrierReentrancyError } from '../../core/PersistenceBufferErrors.js';
 import { createTestThought } from '../helpers/factories.js';
 
 interface Deferred {

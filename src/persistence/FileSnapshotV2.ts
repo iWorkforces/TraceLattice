@@ -1,13 +1,12 @@
 import * as v from 'valibot';
-import type { BranchId, SessionId } from '../contracts/ids.js';
+import type { SessionId } from '../contracts/ids.js';
 import { asSessionId, GLOBAL_SESSION_ID } from '../contracts/ids.js';
-import type { Summary } from '../core/compression/Summary.js';
 import { SummarySchema } from '../core/compression/Summary.js';
-import type { Edge } from '../core/graph/Edge.js';
 import type { ThoughtData } from '../core/thought.js';
 import { PersistenceCompatibilityError, PersistenceCorruptionError } from '../errors.js';
 import { EdgeSchema, SequentialThinkingSchema } from '../schema.js';
 import { parseEdge, parseSummary, parseThoughtData } from './PersistenceCodec.js';
+import type { FileSnapshotV2 } from './FileSnapshotTypes.js';
 import {
 	compareCodePoint,
 	compareCreatedThenId,
@@ -42,31 +41,6 @@ export const FileSnapshotV2Schema = v.strictObject({
 	edges: v.array(EdgeSessionV2Schema),
 	summaries: v.array(SummarySessionV2Schema),
 });
-
-export type ThoughtSessionV2 = {
-	readonly sessionId: SessionId;
-	readonly thoughts: readonly ThoughtData[];
-};
-
-export type BranchRecordV2 = {
-	readonly sessionId: SessionId;
-	readonly branchId: BranchId;
-	readonly thoughts: readonly ThoughtData[];
-};
-
-export type EdgeSessionV2 = { readonly sessionId: SessionId; readonly edges: readonly Edge[] };
-export type SummarySessionV2 = {
-	readonly sessionId: SessionId;
-	readonly summaries: readonly Summary[];
-};
-
-export type FileSnapshotV2 = {
-	readonly version: 2;
-	readonly thoughts: readonly ThoughtSessionV2[];
-	readonly branches: readonly BranchRecordV2[];
-	readonly edges: readonly EdgeSessionV2[];
-	readonly summaries: readonly SummarySessionV2[];
-};
 
 export const EMPTY_FILE_SNAPSHOT_V2: FileSnapshotV2 = {
 	version: 2,

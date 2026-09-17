@@ -16,6 +16,7 @@ import { SessionLifecycleCoordinator } from '../../core/SessionLifecycleCoordina
 import { ThoughtEvaluator } from '../../core/ThoughtEvaluator.js';
 import { ThoughtFormatter } from '../../core/ThoughtFormatter.js';
 import { ThoughtProcessor } from '../../core/ThoughtProcessor.js';
+import { Calibrator } from '../../core/evaluator/Calibrator.js';
 import { InMemorySummaryStore } from '../../core/compression/InMemorySummaryStore.js';
 import { EdgeStore } from '../../core/graph/EdgeStore.js';
 import { OutcomeRecorder } from '../../core/reasoning/OutcomeRecorder.js';
@@ -177,11 +178,13 @@ function createHarness(persistence: ControlledPersistence): {
 	readonly summaryStore: InMemorySummaryStore;
 	readonly suspensionStore: InMemorySuspensionStore;
 	readonly outcomeRecorder: OutcomeRecorder;
+	readonly calibrator: Calibrator;
 } {
 	const edgeStore = new EdgeStore();
 	const summaryStore = new InMemorySummaryStore();
 	const suspensionStore = new InMemorySuspensionStore();
 	const outcomeRecorder = new OutcomeRecorder({ enabled: true });
+	const calibrator = new Calibrator(outcomeRecorder, true);
 	const lifecycle = new SessionLifecycleCoordinator();
 	const history = new HistoryManager({
 		persistence,
@@ -195,7 +198,7 @@ function createHarness(persistence: ControlledPersistence): {
 	const processor = new ThoughtProcessor(
 		history,
 		new ThoughtFormatter(),
-		new ThoughtEvaluator(),
+		new ThoughtEvaluator(calibrator),
 		undefined,
 		undefined,
 		undefined,
@@ -204,9 +207,18 @@ function createHarness(persistence: ControlledPersistence): {
 		undefined,
 		new SessionLock(),
 		outcomeRecorder,
-		lifecycle
+		lifecycle,
+		calibrator
 	);
-	return { history, processor, edgeStore, summaryStore, suspensionStore, outcomeRecorder };
+	return {
+		history,
+		processor,
+		edgeStore,
+		summaryStore,
+		suspensionStore,
+		outcomeRecorder,
+		calibrator,
+	};
 }
 
 function testEdge(sessionId: SessionId, suffix: string): Edge {
@@ -395,7 +407,8 @@ describe('ordered scoped session reset', () => {
 
 	it('quarantines A after scoped deletion failure and permits explicit successful recovery only', async () => {
 		const persistence = new ControlledPersistence();
-		const { history, processor, suspensionStore, outcomeRecorder } = createHarness(persistence);
+		const { history, processor, suspensionStore, outcomeRecorder, calibrator } =
+			createHarness(persistence);
 		await processor.process({
 			thought: 'A stale',
 			thought_number: 1,
@@ -416,10 +429,22 @@ describe('ordered scoped session reset', () => {
 			thoughtId: asThoughtId('a-old'),
 			thoughtNumber: 1,
 			sessionId: SESSION_A,
-			predicted: 0.7,
-			actual: 1,
+			predicted: 0.99,
+			actual: 0,
 			type: 'verification',
 		});
+		for (let index = 1; index < 10; index++) {
+			outcomeRecorder.recordVerification({
+				thoughtId: asThoughtId(`a-old-${index}`),
+				thoughtNumber: index + 1,
+				sessionId: SESSION_A,
+				predicted: 0.99,
+				actual: 0,
+				type: 'verification',
+			});
+		}
+		calibrator.refit(SESSION_A);
+		expect(calibrator.calibrate(0.9, 'verification', SESSION_A).temperature).toBeGreaterThan(1);
 		persistence.failClearA = true;
 		const failed = await processor.process({
 			thought: 'must not enter',
@@ -435,7 +460,9 @@ describe('ordered scoped session reset', () => {
 		expect(history.getHistory(SESSION_A).map((thought) => thought.thought)).toEqual(['A stale']);
 		expect(history.branchExists(SESSION_A, asBranchId('not-yet'))).toBe(false);
 		expect(suspensionStore.size(SESSION_A)).toBe(1);
-		expect(outcomeRecorder.getOutcomes(SESSION_A)).toHaveLength(1);
+		expect(outcomeRecorder.getOutcomes(SESSION_A)).toHaveLength(10);
+		expect(() => outcomeRecorder.assertCanRecord(SESSION_A, asThoughtId('a-old'))).toThrow();
+		expect(calibrator.calibrate(0.9, 'verification', SESSION_A).temperature).toBeGreaterThan(1);
 		const quarantinedSnapshot = history.inspectSession(SESSION_A);
 
 		expect(() => history.registerBranch(SESSION_A, asBranchId('direct-blocked'))).toThrow(
@@ -475,6 +502,9 @@ describe('ordered scoped session reset', () => {
 		]);
 		expect(suspensionStore.size(SESSION_A)).toBe(0);
 		expect(outcomeRecorder.getOutcomes(SESSION_A)).toEqual([]);
+		expect(() => outcomeRecorder.assertCanRecord(SESSION_A, asThoughtId('a-old'))).not.toThrow();
+		expect(calibrator.metrics(SESSION_A).sampleCount).toBe(0);
+		expect(calibrator.calibrate(0.9, 'verification', SESSION_A).temperature).toBe(1);
 		expect(
 			(await persistence.loadHistoryForSession(SESSION_A)).map((thought) => thought.thought)
 		).toEqual(['recovered fresh']);

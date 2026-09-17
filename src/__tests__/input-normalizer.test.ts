@@ -669,6 +669,20 @@ describe('reasoning fields normalization', () => {
 		});
 	});
 
+	describe('verification_result', () => {
+		it('preserves numeric zero without treating it as absent', () => {
+			const normalized = normalizeInput(createMinimalInput({ verification_result: 0 }));
+
+			expect(normalized.verification_result).toBe(0);
+		});
+
+		it.each(['0', '1', true, false])('does not coerce boundary value %j', (actual) => {
+			const normalized = normalizeInput(createMinimalInput({ verification_result: actual }));
+
+			expect(normalized.verification_result).toBe(actual);
+		});
+	});
+
 	describe('hypothesis_id', () => {
 		it('should pass through valid hypothesis_id', () => {
 			const normalized = normalizeInput(

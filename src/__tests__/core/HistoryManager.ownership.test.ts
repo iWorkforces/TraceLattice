@@ -10,7 +10,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { runWithContext } from '../../context/RequestContext.js';
 import { HistoryManager } from '../../core/HistoryManager.js';
-import { SessionAccessDeniedError, ERROR_CODES, isErrorCode } from '../../errors.js';
+import { SessionAccessDeniedError } from '../../core/SessionErrors.js';
+import { ERROR_CODES, isErrorCode } from '../../errors.js';
 import { createTestThought } from '../helpers/factories.js';
 
 describe('HistoryManager — session ownership', () => {

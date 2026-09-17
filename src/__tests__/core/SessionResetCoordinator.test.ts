@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { asSessionId } from '../../contracts/ids.js';
 import { SessionResetCoordinator } from '../../core/SessionResetCoordinator.js';
-import { AsyncResetRequiredError } from '../../errors.js';
+import { AsyncResetRequiredError } from '../../core/SessionErrors.js';
 import { NullLogger } from '../../logger/NullLogger.js';
 import { MemoryPersistence } from '../../persistence/MemoryPersistence.js';
 
