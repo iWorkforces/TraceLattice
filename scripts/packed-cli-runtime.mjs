@@ -176,6 +176,9 @@ async function exerciseProtocol(artifact) {
 				'initialize result omitted protocolVersion'
 			);
 		}
+		if (!isRecord(initialized.serverInfo) || initialized.serverInfo.name !== 'tracelattice') {
+			throw new PackedCliError('PACKED_PROTOCOL_INVALID', 'serverInfo.name must be tracelattice');
+		}
 		client.notify({ jsonrpc: '2.0', method: 'notifications/initialized' });
 		const listed = requireResult(
 			await client.request({

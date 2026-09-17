@@ -146,7 +146,7 @@ async function createFixture(fixtureCase: FixtureCase): Promise<string> {
 	await writeFile(join(root, 'dist/cli.js'), cliBody);
 	await chmod(join(root, 'dist/cli.js'), 0o755);
 	const manifest: FixtureManifest = {
-		name: 'tracelattice',
+		name: '@iworkforces/tracelattice',
 		version: '1.2.3',
 		type: 'module',
 		main: 'dist/lib.js',
@@ -206,6 +206,25 @@ describe('packed CLI artifact contract', () => {
 		},
 		120_000
 	);
+
+	it('rejects a packed CLI with the wrong MCP server name', async () => {
+		// Given
+		const packageDirectory = await createFixture({
+			label: 'wrong MCP server name',
+			code: 'PACKED_PROTOCOL_INVALID',
+			mutate: async (root) =>
+				writeFile(
+					join(root, 'dist/cli.js'),
+					cliBody.replace("serverInfo: { name: 'tracelattice'", "serverInfo: { name: 'wrong-name'")
+				),
+		});
+		// When
+		const result = await runVerifier(packageDirectory);
+		// Then
+		expect(result.code).not.toBe(0);
+		expect(result.stderr).toContain('PACKED_PROTOCOL_INVALID');
+		expect(result.stderr).toContain('serverInfo.name must be tracelattice');
+	}, 120_000);
 
 	it('preserves the semantic failure when package inspection cleanup also fails', async () => {
 		// Given

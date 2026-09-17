@@ -24,16 +24,17 @@ import { SEQUENTIAL_THINKING_TOOL, SequentialThinkingSchema } from './schema.js'
 import { assertPooledSsePersistence } from './transport/SseTransport.js';
 
 // Get version from package.json
+const CLI_NAME = 'tracelattice' as const;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const package_json = JSON.parse(readFileSync(join(__dirname, '../package.json'), 'utf-8'));
-const { name, version } = package_json;
+const { version } = package_json;
 // Handle CLI arguments
 const args = process.argv.slice(2);
 const shouldShowVersion = args.includes('--version') || args.includes('-v');
 
 if (shouldShowVersion) {
-	console.log(`${name} v${version}`);
+	console.log(`${CLI_NAME} v${version}`);
 	process.exit(0);
 }
 async function main() {
@@ -48,7 +49,7 @@ async function main() {
 	const adapter = new ValibotJsonSchemaAdapter();
 	const server = new McpServer(
 		{
-			name,
+			name: CLI_NAME,
 			version,
 			description: 'Semantic Sequential Thinking MCP Server',
 		},

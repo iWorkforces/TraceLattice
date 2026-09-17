@@ -77,7 +77,7 @@ jobs:
           const version = receipt.version;
           const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
           if (receipt.schemaVersion !== 1 || receipt.sourceSha !== expectedSha) throw new Error('receipt sourceSha is invalid');
-          if (receipt.name !== 'tracelattice' || typeof version !== 'string' || !versionPattern.test(version)) {
+          if (receipt.name !== '@iworkforces/tracelattice' || typeof version !== 'string' || !versionPattern.test(version)) {
             throw new Error('receipt package identity is invalid');
           }
           if (manifest.name !== receipt.name || manifest.version !== version) throw new Error('receipt manifest is inconsistent');
@@ -127,7 +127,7 @@ jobs:
 
           const entries = await readdir(artifactDirectory);
           const tarballs = entries.filter((entry) => entry.endsWith('.tgz'));
-          const expectedBasename = `tracelattice-${version}.tgz`;
+          const expectedBasename = `iworkforces-tracelattice-${version}.tgz`;
           if (tarballs.length !== 1 || tarball.basename !== expectedBasename || tarballs[0] !== expectedBasename) {
             throw new Error('tarball.basename does not match the downloaded .tgz');
           }
@@ -162,7 +162,7 @@ jobs:
       - name: Check if version already published
         id: check
         run: |
-          if npm view "tracelattice@${{ steps.artifact.outputs.version }}" version 2>/dev/null; then
+          if npm view "@iworkforces/tracelattice@${{ steps.artifact.outputs.version }}" version 2>/dev/null; then
             echo "published=true" >> "$GITHUB_OUTPUT"
           else
             echo "published=false" >> "$GITHUB_OUTPUT"

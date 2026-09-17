@@ -1,5 +1,5 @@
 {
-	"name": "tracelattice",
+	"name": "@iworkforces/tracelattice",
 	"version": "2.0.2",
 	"description": "Semantic Sequential Thinking Layer For Agentic Tools",
 	"type": "module",
