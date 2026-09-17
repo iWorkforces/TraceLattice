@@ -1,6 +1,6 @@
 {
-	"name": "tracelattice",
-	"version": "2.0.1",
+	"name": "@iworkforces/tracelattice",
+	"version": "2.0.2",
 	"description": "Semantic Sequential Thinking Layer For Agentic Tools",
 	"type": "module",
 	"main": "dist/lib.js",
@@ -65,12 +65,12 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/OCWorkforces/TraceLattice.git"
+		"url": "git+https://github.com/iWorkforces/TraceLattice.git"
 	},
 	"bugs": {
-		"url": "https://github.com/OCWorkforces/TraceLattice/issues"
+		"url": "https://github.com/iWorkforces/TraceLattice/issues"
 	},
-	"homepage": "https://github.com/OCWorkforces/TraceLattice#readme",
+	"homepage": "https://github.com/iWorkforces/TraceLattice#readme",
 	"dependencies": {
 		"@tmcp/adapter-valibot": "^0.1.6",
 		"@tmcp/transport-stdio": "^0.5.0",

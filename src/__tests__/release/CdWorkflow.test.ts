@@ -147,7 +147,7 @@ describe('CD workflow artifact verification policy', () => {
 		});
 		for (const contract of [
 			'sourceSha',
-			'tracelattice',
+			"receipt.name !== '@iworkforces/tracelattice'",
 			"manifest.main !== 'dist/lib.js'",
 			"manifest.types !== 'dist/lib.d.ts'",
 			'manifest.exports',
@@ -177,6 +177,9 @@ describe('CD workflow artifact verification policy', () => {
 		]) {
 			expect(artifact.run).toContain(contract);
 		}
+		expect(artifact.run).toContain(
+			'const expectedBasename = `iworkforces-tracelattice-${version}.tgz`;'
+		);
 		expect(artifact.run).toContain('GITHUB_OUTPUT');
 		expect(artifact.run).toContain('tag=v${version}');
 	});
@@ -201,7 +204,7 @@ describe('CD workflow publication policy', () => {
 		const publishStep = getStepByName(publish, 'Publish to npm');
 		// Then
 		expect(check.run).toContain(
-			'npm view "tracelattice@${{ steps.artifact.outputs.version }}" version'
+			'npm view "@iworkforces/tracelattice@${{ steps.artifact.outputs.version }}" version'
 		);
 		expect(check.run).toContain('published=true');
 		expect(check.run).toContain('published=false');

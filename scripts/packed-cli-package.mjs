@@ -101,7 +101,8 @@ function inPackageTarget(packageRoot, target, contract) {
 
 function readManifestContract(manifest, context) {
 	const { packageRoot, packResult, stage } = context;
-	if (manifest.name !== 'tracelattice') fail('PACKED_NAME_INVALID', 'expected tracelattice', stage);
+	if (manifest.name !== '@iworkforces/tracelattice')
+		fail('PACKED_NAME_INVALID', 'expected @iworkforces/tracelattice', stage);
 	if (typeof manifest.version !== 'string' || manifest.version !== packResult.version) {
 		fail('PACKED_VERSION_INVALID', 'pack and installed manifest versions differ', stage);
 	}

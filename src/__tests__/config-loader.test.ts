@@ -31,6 +31,7 @@ describe('ConfigLoader', () => {
 		delete process.env.LOG_LEVEL;
 		delete process.env.PRETTY_LOG;
 		delete process.env.SKILL_DIRS;
+		delete process.env.TOOL_DIRS;
 		delete process.env.DISCOVERY_CACHE_TTL;
 		delete process.env.DISCOVERY_CACHE_MAX_SIZE;
 	});
@@ -221,6 +222,52 @@ describe('ConfigLoader', () => {
 			expect(config!.skillDirs).toEqual(['/skills/a', '/skills/b', '/skills/c']);
 		});
 
+		it('should parse TOOL_DIRS from colon-separated env', () => {
+			process.env.TOOL_DIRS = '/tools/a:/tools/b:/tools/c';
+			loader = new ConfigLoader();
+			mockExistsSync.mockReturnValue(false);
+
+			const config = loader.load();
+			expect(config?.toolDirs).toEqual(['/tools/a', '/tools/b', '/tools/c']);
+		});
+
+		it('should let explicit empty root environments disable file roots', () => {
+			process.env.SKILL_DIRS = '';
+			process.env.TOOL_DIRS = '';
+			loader = new ConfigLoader();
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({ skillDirs: ['/file/skills'], toolDirs: ['/file/tools'] })
+			);
+
+			const config = loader.load();
+			expect(config?.skillDirs).toEqual([]);
+			expect(config?.toolDirs).toEqual([]);
+		});
+
+		it('should retain file roots when root environments are omitted', () => {
+			loader = new ConfigLoader();
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({ skillDirs: ['/file/skills'], toolDirs: ['/file/tools'] })
+			);
+
+			const config = loader.load();
+			expect(config?.skillDirs).toEqual(['/file/skills']);
+			expect(config?.toolDirs).toEqual(['/file/tools']);
+		});
+
+		it('should defensively copy configured discovery roots', () => {
+			loader = new ConfigLoader();
+			const skillDirs = ['/file/skills'];
+			const toolDirs = ['/file/tools'];
+
+			const config = loader.applyEnvironmentOverrides({ skillDirs, toolDirs });
+
+			expect(config.skillDirs).not.toBe(skillDirs);
+			expect(config.toolDirs).not.toBe(toolDirs);
+		});
+
 		it('should convert DISCOVERY_CACHE_TTL from seconds to ms', () => {
 			process.env.DISCOVERY_CACHE_TTL = '60';
 			loader = new ConfigLoader();
@@ -287,8 +334,8 @@ describe('ConfigLoader', () => {
 				maxHistorySize: 500,
 				maxBranches: 25,
 				maxBranchSize: 200,
-			logLevel: 'debug' as const,
-			prettyLog: true,
+				logLevel: 'debug' as const,
+				prettyLog: true,
 			};
 
 			const opts = loader.toServerConfigOptions(config);
@@ -312,6 +359,18 @@ describe('ConfigLoader', () => {
 			const opts = loader.toServerConfigOptions({ maxHistorySize: 300 });
 			expect(opts.maxHistorySize).toBe(300);
 			expect(opts.maxBranches).toBeUndefined();
+		});
+
+		it('should carry both discovery root types into server options', () => {
+			loader = new ConfigLoader();
+
+			const opts = loader.toServerConfigOptions({
+				skillDirs: ['/skills'],
+				toolDirs: ['/tools'],
+			});
+
+			expect(opts.skillDirs).toEqual(['/skills']);
+			expect(opts.toolDirs).toEqual(['/tools']);
 		});
 	});
 
@@ -344,7 +403,7 @@ describe('ConfigLoader', () => {
 			loader = new ConfigLoader();
 			const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 			mockExistsSync.mockReturnValue(true);
-			 
+
 			mockReadFileSync.mockImplementation(() => {
 				throw 'string error thrown';
 			});

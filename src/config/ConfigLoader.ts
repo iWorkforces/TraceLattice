@@ -30,6 +30,7 @@ const ConfigFileOptionsSchema = v.looseObject({
 	logLevel: v.optional(v.picklist(['debug', 'info', 'warn', 'error'])),
 	prettyLog: v.optional(v.boolean()),
 	skillDirs: v.optional(v.array(v.string())),
+	toolDirs: v.optional(v.array(v.string())),
 	discoveryCache: v.optional(
 		v.looseObject({
 			ttl: v.optional(v.number()),
@@ -61,6 +62,8 @@ type Mutable<T> = { -readonly [K in keyof T]: T[K] };
  * prettyLog: true
  * skillDirs:
  *   - ./custom-skills
+ * toolDirs:
+ *   - ./custom-tools
  * discoveryCache:
  *   ttl: 600000
  *   maxSize: 200
@@ -107,6 +110,12 @@ export interface ConfigFileOptions {
 	 * Can be overridden by `SKILL_DIRS` environment variable (colon-separated).
 	 */
 	readonly skillDirs?: string[];
+
+	/**
+	 * Directory paths to search for tools.
+	 * Can be overridden by `TOOL_DIRS` environment variable (colon-separated).
+	 */
+	readonly toolDirs?: string[];
 
 	/**
 	 * Discovery cache configuration.
@@ -181,6 +190,7 @@ export interface ConfigFileOptions {
  * | `LOG_LEVEL` | string | Logging level (debug/info/warn/error) |
  * | `PRETTY_LOG` | string | "false" to disable pretty logging |
  * | `SKILL_DIRS` | string | Colon-separated directory paths |
+ * | `TOOL_DIRS` | string | Colon-separated directory paths |
  * | `DISCOVERY_CACHE_TTL` | number | TTL in seconds (converted to ms) |
  * | `DISCOVERY_CACHE_MAX_SIZE` | number | Max cache entries |
  *
@@ -258,10 +268,7 @@ export class ConfigLoader {
 					config = this.parseConfig(configPath);
 					break;
 				} catch (error) {
-					console.error(
-						`Failed to load config from ${configPath}:`,
-						getErrorMessage(error)
-					);
+					console.error(`Failed to load config from ${configPath}:`, getErrorMessage(error));
 				}
 			}
 		}
@@ -278,6 +285,7 @@ export class ConfigLoader {
 	 * - `LOG_LEVEL` (debug/info/warn/error)
 	 * - `PRETTY_LOG` ("false" to disable)
 	 * - `SKILL_DIRS` (colon-separated paths)
+	 * - `TOOL_DIRS` (colon-separated paths)
 	 * - `DISCOVERY_CACHE_TTL` (in seconds, converted to ms)
 	 * - `DISCOVERY_CACHE_MAX_SIZE` (number)
 	 *
@@ -288,6 +296,7 @@ export class ConfigLoader {
 		const result: Mutable<ConfigFileOptions> = {
 			...config,
 			...(config.skillDirs === undefined ? {} : { skillDirs: [...config.skillDirs] }),
+			...(config.toolDirs === undefined ? {} : { toolDirs: [...config.toolDirs] }),
 			...(config.discoveryCache === undefined
 				? {}
 				: { discoveryCache: { ...config.discoveryCache } }),
@@ -328,8 +337,11 @@ export class ConfigLoader {
 		if (process.env.PRETTY_LOG === 'false') {
 			result.prettyLog = false;
 		}
-		if (process.env.SKILL_DIRS) {
-			result.skillDirs = process.env.SKILL_DIRS.split(':');
+		if (process.env.SKILL_DIRS !== undefined) {
+			result.skillDirs = process.env.SKILL_DIRS === '' ? [] : process.env.SKILL_DIRS.split(':');
+		}
+		if (process.env.TOOL_DIRS !== undefined) {
+			result.toolDirs = process.env.TOOL_DIRS === '' ? [] : process.env.TOOL_DIRS.split(':');
 		}
 		if (process.env.DISCOVERY_CACHE_TTL !== undefined) {
 			const seconds = this.parseEnvironmentInteger(
@@ -461,8 +473,7 @@ export class ConfigLoader {
 		const content = readFileSync(filePath, 'utf-8');
 		const ext = filePath.split('.').pop()?.toLowerCase();
 
-		const raw: unknown =
-			ext === 'yaml' || ext === 'yml' ? parseYaml(content) : JSON.parse(content);
+		const raw: unknown = ext === 'yaml' || ext === 'yml' ? parseYaml(content) : JSON.parse(content);
 
 		return v.parse(ConfigFileOptionsSchema, raw) as ConfigFileOptions;
 	}
@@ -492,6 +503,7 @@ export class ConfigLoader {
 			maxBranches: config.maxBranches,
 			maxBranchSize: config.maxBranchSize,
 			skillDirs: config.skillDirs,
+			toolDirs: config.toolDirs,
 			discoveryCache: config.discoveryCache,
 			persistence: config.persistence,
 			features: config.features,

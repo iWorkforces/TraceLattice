@@ -1,8 +1,12 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { BaseRegistry } from '../registry/BaseRegistry.js';
 import type { BaseRegistryOptions } from '../registry/BaseRegistry.js';
 import { InvalidToolError, DuplicateToolError, ToolNotFoundError } from '../errors.js';
 import { DiscoveryCache } from '../cache/DiscoveryCache.js';
+import { SkillRegistry } from '../registry/SkillRegistry.js';
+import { ToolRegistry } from '../registry/ToolRegistry.js';
 
 // ---------- Module-level mocks (hoisted by vitest) ----------
 vi.mock('node:fs/promises', () => ({
@@ -473,6 +477,37 @@ describe('BaseRegistry', () => {
 			expect(count).toBe(0);
 		});
 
+		it.each([
+			['SkillRegistry', () => new SkillRegistry({ skillDirs: [] })],
+			['ToolRegistry', () => new ToolRegistry({ toolDirs: [] })],
+		])('%s preserves explicit empty roots without filesystem access', async (_name, create) => {
+			const concreteRegistry = create();
+
+			const count = await concreteRegistry.discoverAsync();
+
+			expect(count).toBe(0);
+			expect(mockExistsSync).not.toHaveBeenCalled();
+			expect(mockReaddir).not.toHaveBeenCalled();
+			expect(mockReadFile).not.toHaveBeenCalled();
+		});
+
+		it('uses the four ordered default roots for SkillRegistry discovery', async () => {
+			// Given
+			const skillRegistry = new SkillRegistry();
+			mockExistsSync.mockReturnValue(false);
+
+			// When
+			await skillRegistry.discoverAsync();
+
+			// Then
+			expect(mockExistsSync.mock.calls.map(([directory]) => directory)).toEqual([
+				'.claude/skills',
+				join(homedir(), '.claude/skills'),
+				'.agents/skills',
+				join(homedir(), '.agents/skills'),
+			]);
+		});
+
 		it('handles non-existent directories', async () => {
 			registry = createRegistry({ searchDirs: ['/no/such/dir'] });
 			mockExistsSync.mockReturnValue(false);
@@ -559,6 +594,36 @@ describe('BaseRegistry', () => {
 			const count = await registry.discoverAsync();
 			expect(count).toBe(1);
 			expect(registry.size()).toBe(1);
+		});
+
+		it('uses ordered root precedence when discovered names overlap', async () => {
+			registry = createRegistry({ searchDirs: ['/first', '/second'] });
+			registry.setParseFrontmatter((content) => ({
+				name: 'shared',
+				value: content === 'first' ? 1 : 2,
+			}));
+			mockExistsSync.mockReturnValue(true);
+			mockReaddir.mockResolvedValue([{ name: 'shared.test.md', isFile: () => true }] as never);
+			mockReadFile.mockImplementation(
+				(path) => Promise.resolve(String(path).startsWith('/first') ? 'first' : 'second') as never
+			);
+
+			await registry.discoverAsync();
+
+			expect(registry.get('shared')).toEqual(makeItem('shared', 1));
+		});
+
+		it('keeps manually registered items ahead of discovered names', async () => {
+			registry = createRegistry({ searchDirs: ['/root'] });
+			registry.add(makeItem('shared', 7));
+			registry.setParseFrontmatter(() => ({ name: 'shared', value: 1 }));
+			mockExistsSync.mockReturnValue(true);
+			mockReaddir.mockResolvedValue([{ name: 'shared.test.md', isFile: () => true }] as never);
+			mockReadFile.mockResolvedValue('discovered' as never);
+
+			await registry.discoverAsync();
+
+			expect(registry.get('shared')).toEqual(makeItem('shared', 7));
 		});
 
 		it('skips directories (non-file entries)', async () => {

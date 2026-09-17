@@ -63,7 +63,7 @@ export class ToolRegistry extends BaseRegistry<Tool> {
 		super({
 			logger: options.logger,
 			cache: options.cache,
-			searchDirs: options.toolDirs || ['.claude/tools', join(homedir(), '.claude/tools')],
+			searchDirs: options.toolDirs ?? ['.claude/tools', join(homedir(), '.claude/tools')],
 			lazyDiscovery: options.lazyDiscovery,
 		});
 	}
