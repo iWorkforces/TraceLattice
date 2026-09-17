@@ -17,11 +17,20 @@ import { generateUlid } from '../../core/ids.js';
 import { createTestThought } from '../helpers/factories.js';
 import type { ThoughtData } from '../../core/thought.js';
 import type { Edge } from '../../core/graph/Edge.js';
-import { asSessionId, asThoughtId, type EdgeId, type SessionId, type ThoughtId } from '../../contracts/ids.js';
+import {
+	asSessionId,
+	asThoughtId,
+	type EdgeId,
+	type SessionId,
+	type ThoughtId,
+} from '../../contracts/ids.js';
 
 const GLOBAL: SessionId = asSessionId('__global__');
 
-function makeThought(num: number, overrides?: Partial<Omit<ThoughtData, 'session_id'>> & { session_id?: string }): ThoughtData {
+function makeThought(
+	num: number,
+	overrides?: Partial<Omit<ThoughtData, 'session_id'>> & { session_id?: string }
+): ThoughtData {
 	const { session_id, ...rest } = overrides ?? {};
 	return createTestThought({
 		id: generateUlid() as ThoughtId,
@@ -92,8 +101,23 @@ describe('HistoryManager edge persistence', () => {
 		await manager.shutdown();
 	});
 
+	it('does not register an empty edge snapshot for the first thought', async () => {
+		const persistence = new MemoryPersistence();
+		const saveEdgesSpy = vi.spyOn(persistence, 'saveEdges');
+		const { manager } = setup({ persistence });
+
+		manager.addThought(makeThought(1));
+		await manager._flushBuffer();
+
+		expect(saveEdgesSpy).not.toHaveBeenCalled();
+		await manager.shutdown();
+	});
+
 	it('loads edges into EdgeStore on loadFromPersistence', async () => {
 		const persistence = new MemoryPersistence();
+		await persistence.saveThought(makeThought(1, { id: asThoughtId('thought-a') }));
+		await persistence.saveThought(makeThought(2, { id: asThoughtId('thought-b') }));
+		await persistence.saveThought(makeThought(3, { id: asThoughtId('thought-c') }));
 		const seedEdges: Edge[] = [
 			{
 				id: generateUlid() as EdgeId,
@@ -130,7 +154,7 @@ describe('HistoryManager edge persistence', () => {
 		await manager.shutdown();
 	});
 
-	it('clear() purges edges from the EdgeStore', async () => {
+	it('resetAll() purges edges from the EdgeStore', async () => {
 		const { manager, edgeStore } = setup();
 
 		manager.addThought(makeThought(1));
@@ -139,7 +163,7 @@ describe('HistoryManager edge persistence', () => {
 
 		expect(edgeStore.size(GLOBAL)).toBeGreaterThan(0);
 
-		manager.clear();
+		await manager.resetAll();
 
 		expect(edgeStore.size(GLOBAL)).toBe(0);
 		await manager.shutdown();
@@ -203,13 +227,35 @@ describe('HistoryManager edge persistence', () => {
 
 	it('restores edges for ALL sessions, not just global', async () => {
 		const persistence = new MemoryPersistence();
+		const sessionA = asSessionId('test-A');
+		const sessionB = asSessionId('test-B');
+		await persistence.saveThoughtForSession(
+			sessionA,
+			makeThought(1, { id: asThoughtId('a1'), session_id: sessionA })
+		);
+		await persistence.saveThoughtForSession(
+			sessionA,
+			makeThought(2, { id: asThoughtId('a2'), session_id: sessionA })
+		);
+		await persistence.saveThoughtForSession(
+			sessionA,
+			makeThought(3, { id: asThoughtId('a3'), session_id: sessionA })
+		);
+		await persistence.saveThoughtForSession(
+			sessionB,
+			makeThought(1, { id: asThoughtId('b1'), session_id: sessionB })
+		);
+		await persistence.saveThoughtForSession(
+			sessionB,
+			makeThought(2, { id: asThoughtId('b2'), session_id: sessionB })
+		);
 		const seedA: Edge[] = [
 			{
 				id: generateUlid() as EdgeId,
 				from: asThoughtId('a1'),
 				to: asThoughtId('a2'),
 				kind: 'sequence',
-				sessionId: asSessionId('test-A'),
+				sessionId: sessionA,
 				createdAt: 100,
 			},
 			{
@@ -217,7 +263,7 @@ describe('HistoryManager edge persistence', () => {
 				from: asThoughtId('a2'),
 				to: asThoughtId('a3'),
 				kind: 'sequence',
-				sessionId: asSessionId('test-A'),
+				sessionId: sessionA,
 				createdAt: 101,
 			},
 		];
@@ -227,12 +273,12 @@ describe('HistoryManager edge persistence', () => {
 				from: asThoughtId('b1'),
 				to: asThoughtId('b2'),
 				kind: 'derives_from',
-				sessionId: asSessionId('test-B'),
+				sessionId: sessionB,
 				createdAt: 200,
 			},
 		];
-		await persistence.saveEdges(asSessionId('test-A'), seedA);
-		await persistence.saveEdges(asSessionId('test-B'), seedB);
+		await persistence.saveEdges(sessionA, seedA);
+		await persistence.saveEdges(sessionB, seedB);
 
 		const edgeStore = new EdgeStore();
 		const manager = new HistoryManager({
@@ -244,13 +290,13 @@ describe('HistoryManager edge persistence', () => {
 
 		await manager.loadFromPersistence();
 
-		expect(edgeStore.size(asSessionId('test-A'))).toBe(2);
-		expect(edgeStore.size(asSessionId('test-B'))).toBe(1);
-		expect(edgeStore.edgesForSession(asSessionId('test-A')).map((e) => e.kind)).toEqual([
+		expect(edgeStore.size(sessionA)).toBe(2);
+		expect(edgeStore.size(sessionB)).toBe(1);
+		expect(edgeStore.edgesForSession(sessionA).map((e) => e.kind)).toEqual([
 			'sequence',
 			'sequence',
 		]);
-		expect(edgeStore.edgesForSession(asSessionId('test-B')).map((e) => e.kind)).toEqual(['derives_from']);
+		expect(edgeStore.edgesForSession(sessionB).map((e) => e.kind)).toEqual(['derives_from']);
 		await manager.shutdown();
 	});
 

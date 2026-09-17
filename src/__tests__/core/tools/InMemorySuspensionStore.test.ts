@@ -1,9 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { InMemorySuspensionStore } from '../../../core/tools/InMemorySuspensionStore.js';
-import { asSessionId } from '../../../contracts/ids.js';
+import { asSessionId, asThoughtId } from '../../../contracts/ids.js';
+import type { SuspensionRecord } from '../../../contracts/suspension.js';
+import { SuspensionExpiredError, SuspensionNotFoundError } from '../../../errors.js';
 
 describe('InMemorySuspensionStore', () => {
 	let store: InMemorySuspensionStore;
+	type SuspensionInput = Omit<SuspensionRecord, 'token' | 'createdAt' | 'toolCallThoughtId'> & {
+		ttlMs?: number;
+	};
+	const suspend = (record: SuspensionInput): SuspensionRecord =>
+		store.suspend({
+			...record,
+			toolCallThoughtId: asThoughtId(`call-${record.toolCallThoughtNumber}`),
+		});
 
 	beforeEach(() => {
 		store = new InMemorySuspensionStore({ ttlMs: 60_000, sweepIntervalMs: 60_000 });
@@ -11,11 +21,12 @@ describe('InMemorySuspensionStore', () => {
 
 	afterEach(() => {
 		store.stop();
+		vi.useRealTimers();
 	});
 
 	it('suspend() returns a fully populated record with token, createdAt, and expiresAt', () => {
 		const before = Date.now();
-		const rec = store.suspend({
+		const rec = suspend({
 			sessionId: asSessionId('s1'),
 			toolCallThoughtNumber: 3,
 			toolName: 'search',
@@ -34,7 +45,7 @@ describe('InMemorySuspensionStore', () => {
 	});
 
 	it('suspend() with explicit ttlMs overrides the default', () => {
-		const rec = store.suspend({
+		const rec = suspend({
 			sessionId: asSessionId('s1'),
 			toolCallThoughtNumber: 1,
 			toolName: 't',
@@ -46,7 +57,7 @@ describe('InMemorySuspensionStore', () => {
 	});
 
 	it('resume() returns the record once and removes it (single-use)', () => {
-		const rec = store.suspend({
+		const rec = suspend({
 			sessionId: asSessionId('s1'),
 			toolCallThoughtNumber: 1,
 			toolName: 't',
@@ -61,7 +72,7 @@ describe('InMemorySuspensionStore', () => {
 	});
 
 	it('resume() returns null and deletes the record when expired', () => {
-		const rec = store.suspend({
+		const rec = suspend({
 			sessionId: asSessionId('s1'),
 			toolCallThoughtNumber: 1,
 			toolName: 't',
@@ -81,7 +92,7 @@ describe('InMemorySuspensionStore', () => {
 	});
 
 	it('peek() is non-destructive and returns expired records as-is', () => {
-		const rec = store.suspend({
+		const rec = suspend({
 			sessionId: asSessionId('s1'),
 			toolCallThoughtNumber: 1,
 			toolName: 't',
@@ -107,7 +118,7 @@ describe('InMemorySuspensionStore', () => {
 	});
 
 	it('expireOlderThan() removes expired records and returns the count', () => {
-		const r1 = store.suspend({
+		const r1 = suspend({
 			sessionId: asSessionId('s1'),
 			toolCallThoughtNumber: 1,
 			toolName: 't',
@@ -115,7 +126,7 @@ describe('InMemorySuspensionStore', () => {
 			ttlMs: 1,
 			expiresAt: 0,
 		});
-		const r2 = store.suspend({
+		const r2 = suspend({
 			sessionId: asSessionId('s1'),
 			toolCallThoughtNumber: 2,
 			toolName: 't',
@@ -131,21 +142,21 @@ describe('InMemorySuspensionStore', () => {
 	});
 
 	it('clearSession() removes only the targeted session', () => {
-		store.suspend({
+		suspend({
 			sessionId: asSessionId('sA'),
 			toolCallThoughtNumber: 1,
 			toolName: 't',
 			toolArguments: {},
 			expiresAt: 0,
 		});
-		store.suspend({
+		suspend({
 			sessionId: asSessionId('sA'),
 			toolCallThoughtNumber: 2,
 			toolName: 't',
 			toolArguments: {},
 			expiresAt: 0,
 		});
-		store.suspend({
+		suspend({
 			sessionId: asSessionId('sB'),
 			toolCallThoughtNumber: 1,
 			toolName: 't',
@@ -161,14 +172,14 @@ describe('InMemorySuspensionStore', () => {
 
 	it('size() returns global total when no session id is provided, and per-session count otherwise', () => {
 		expect(store.size()).toBe(0);
-		store.suspend({
+		suspend({
 			sessionId: asSessionId('sA'),
 			toolCallThoughtNumber: 1,
 			toolName: 't',
 			toolArguments: {},
 			expiresAt: 0,
 		});
-		store.suspend({
+		suspend({
 			sessionId: asSessionId('sB'),
 			toolCallThoughtNumber: 1,
 			toolName: 't',
@@ -188,5 +199,181 @@ describe('InMemorySuspensionStore', () => {
 			store.stop();
 			store.stop();
 		}).not.toThrow();
+	});
+
+	it('compareAndAdmit rejects a wrong canonical session without consuming the token', async () => {
+		const record = suspend({
+			sessionId: asSessionId('session-a'),
+			toolCallThoughtNumber: 1,
+			toolName: 'search',
+			toolArguments: {},
+			expiresAt: 0,
+		});
+		const admit = vi.fn();
+
+		await expect(
+			store.compareAndAdmit(record.token, asSessionId('session-b'), admit)
+		).rejects.toBeInstanceOf(SuspensionNotFoundError);
+
+		expect(admit).not.toHaveBeenCalled();
+		expect(store.peek(record.token)).toBe(record);
+	});
+
+	it('compareAndAdmit expires at equality and classifies the next attempt as missing', async () => {
+		vi.useFakeTimers({ now: new Date('2026-09-15T00:00:00.000Z') });
+		const record = suspend({
+			sessionId: asSessionId('session-a'),
+			toolCallThoughtNumber: 1,
+			toolName: 'search',
+			toolArguments: {},
+			ttlMs: 100,
+			expiresAt: 0,
+		});
+		const admit = vi.fn();
+		vi.setSystemTime(record.expiresAt);
+
+		await expect(
+			store.compareAndAdmit(record.token, record.sessionId, admit)
+		).rejects.toBeInstanceOf(SuspensionExpiredError);
+		await expect(
+			store.compareAndAdmit(record.token, record.sessionId, admit)
+		).rejects.toBeInstanceOf(SuspensionNotFoundError);
+
+		expect(admit).not.toHaveBeenCalled();
+		expect(store.size(record.sessionId)).toBe(0);
+	});
+
+	it('compareAndAdmit gives concurrent duplicate attempts exactly one winner', async () => {
+		const record = suspend({
+			sessionId: asSessionId('session-a'),
+			toolCallThoughtNumber: 1,
+			toolName: 'search',
+			toolArguments: {},
+			expiresAt: 0,
+		});
+		const admit = vi.fn();
+
+		const results = await Promise.allSettled([
+			store.compareAndAdmit(record.token, record.sessionId, admit),
+			store.compareAndAdmit(record.token, record.sessionId, admit),
+		]);
+
+		expect(admit).toHaveBeenCalledOnce();
+		expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+		const rejected = results.find((result) => result.status === 'rejected');
+		expect(rejected).toMatchObject({ reason: expect.any(SuspensionNotFoundError) });
+		expect(store.size()).toBe(0);
+	});
+
+	it('compareAndAdmit retains the token after callback failure and permits one retry', async () => {
+		const record = suspend({
+			sessionId: asSessionId('session-a'),
+			toolCallThoughtNumber: 1,
+			toolName: 'search',
+			toolArguments: {},
+			expiresAt: 0,
+		});
+		const sentinel = new TypeError('controlled admission failure');
+		const failedAdmit = vi.fn(() => {
+			throw sentinel;
+		});
+
+		await expect(store.compareAndAdmit(record.token, record.sessionId, failedAdmit)).rejects.toBe(
+			sentinel
+		);
+		expect(store.peek(record.token)).toBe(record);
+
+		const retryAdmit = vi.fn();
+		await expect(store.compareAndAdmit(record.token, record.sessionId, retryAdmit)).resolves.toBe(
+			record
+		);
+		expect(retryAdmit).toHaveBeenCalledOnce();
+		await expect(
+			store.compareAndAdmit(record.token, record.sessionId, retryAdmit)
+		).rejects.toBeInstanceOf(SuspensionNotFoundError);
+	});
+
+	it('compareAndAdmit does not await a callback promise or share its queue with another token', async () => {
+		const sessionId = asSessionId('session-a');
+		const recordA = suspend({
+			sessionId,
+			toolCallThoughtNumber: 1,
+			toolName: 'search',
+			toolArguments: {},
+			expiresAt: 0,
+		});
+		const recordB = suspend({
+			sessionId,
+			toolCallThoughtNumber: 2,
+			toolName: 'fetch',
+			toolArguments: {},
+			expiresAt: 0,
+		});
+		const callbackGate = Promise.withResolvers<void>();
+
+		const first = store.compareAndAdmit(recordA.token, sessionId, () => callbackGate.promise);
+		const second = store.compareAndAdmit(recordB.token, sessionId, () => undefined);
+
+		await expect(second).resolves.toBe(recordB);
+		await expect(first).resolves.toBe(recordA);
+		callbackGate.resolve();
+	});
+
+	it('clearSession removes a queued token before admission and active cleanup cannot resurrect it', async () => {
+		const sessionId = asSessionId('session-a');
+		const queued = suspend({
+			sessionId,
+			toolCallThoughtNumber: 1,
+			toolName: 'search',
+			toolArguments: {},
+			expiresAt: 0,
+		});
+		const queuedAdmit = vi.fn();
+		const queuedAdmission = store.compareAndAdmit(queued.token, sessionId, queuedAdmit);
+		store.clearSession(sessionId);
+
+		await expect(queuedAdmission).rejects.toBeInstanceOf(SuspensionNotFoundError);
+		expect(queuedAdmit).not.toHaveBeenCalled();
+
+		const active = suspend({
+			sessionId,
+			toolCallThoughtNumber: 2,
+			toolName: 'fetch',
+			toolArguments: {},
+			expiresAt: 0,
+		});
+		await store.compareAndAdmit(active.token, sessionId, () => store.clearSession(sessionId));
+		expect(store.size(sessionId)).toBe(0);
+	});
+
+	it('clearAll removes every queued token before any callback can admit', async () => {
+		const recordA = suspend({
+			sessionId: asSessionId('session-a'),
+			toolCallThoughtNumber: 1,
+			toolName: 'search',
+			toolArguments: {},
+			expiresAt: 0,
+		});
+		const recordB = suspend({
+			sessionId: asSessionId('session-b'),
+			toolCallThoughtNumber: 1,
+			toolName: 'fetch',
+			toolArguments: {},
+			expiresAt: 0,
+		});
+		const admit = vi.fn();
+		const admissions = [
+			store.compareAndAdmit(recordA.token, recordA.sessionId, admit),
+			store.compareAndAdmit(recordB.token, recordB.sessionId, admit),
+		];
+		store.clearAll();
+
+		const results = await Promise.allSettled(admissions);
+		expect(results).toEqual([
+			expect.objectContaining({ status: 'rejected' }),
+			expect.objectContaining({ status: 'rejected' }),
+		]);
+		expect(admit).not.toHaveBeenCalled();
+		expect(store.size()).toBe(0);
 	});
 });

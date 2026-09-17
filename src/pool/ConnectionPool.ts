@@ -17,7 +17,7 @@
  * ```
  */
 
-import type { ThoughtData } from '../core/thought.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
 	MaxSessionsReachedError,
 	PoolTerminatedError,
@@ -26,12 +26,15 @@ import {
 } from '../errors.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import { asSessionId, type SessionId } from '../contracts/ids.js';
+import { assertNever } from '../utils.js';
 import type {
 	ConnectionPoolStats,
 	IConnectionPool,
 	ProcessResult,
 	SessionInfo,
+	SessionRunResult,
 	SessionServer,
+	SessionThoughtInput,
 } from './IConnectionPool.js';
 
 export interface SessionOptions {
@@ -79,6 +82,9 @@ export class Session {
 	private _timeout: number;
 	private _cleanupTimer: NodeJS.Timeout | null = null;
 	private _logger: Logger;
+	private _closePromise: Promise<void> | null = null;
+	private _activeOperationCount = 0;
+	private _operationDrain: PromiseWithResolvers<void> | null = null;
 
 	constructor(id: SessionId, server: SessionServer, timeout: number, logger: Logger) {
 		this._server = server;
@@ -103,7 +109,7 @@ export class Session {
 	/**
 	 * Process a thought through this session's server instance.
 	 */
-	async process(input: ThoughtData): Promise<ProcessResult> {
+	async process(input: SessionThoughtInput): Promise<ProcessResult> {
 		if (!this.isActive) {
 			throw new SessionNotActiveError(this._id);
 		}
@@ -116,6 +122,25 @@ export class Session {
 
 		// Process the thought
 		return this._server.processThought(input);
+	}
+
+	processAdmitted(input: SessionThoughtInput): Promise<ProcessResult> {
+		this._lastActivityAt = Date.now();
+		if (this.isActive) this._resetTimeout();
+		return this._server.processThought(input);
+	}
+
+	runWhileActive<T>(operation: (session: Session) => Promise<T>): Promise<SessionRunResult<T>> {
+		if (!this.isActive) return Promise.resolve({ status: 'inactive' });
+		this._activeOperationCount++;
+		return (async () => {
+			try {
+				return { status: 'completed', value: await operation(this) };
+			} finally {
+				this._activeOperationCount--;
+				if (this._activeOperationCount === 0) this._operationDrain?.resolve();
+			}
+		})();
 	}
 
 	/**
@@ -141,7 +166,13 @@ export class Session {
 	/**
 	 * Close the session and stop the server.
 	 */
-	async close(): Promise<void> {
+	close(): Promise<void> {
+		if (this._closePromise) {
+			return this._closePromise;
+		}
+
+		const completion = Promise.withResolvers<void>();
+		this._closePromise = completion.promise;
 		this._isActiveValue = false;
 
 		// Stop timeout timer
@@ -150,8 +181,24 @@ export class Session {
 			this._cleanupTimer = null;
 		}
 
-		// Stop the server
-		this._server.stop();
+		if (this._activeOperationCount === 0) {
+			this._stopServer(completion);
+		} else {
+			this._operationDrain = Promise.withResolvers<void>();
+			void this._operationDrain.promise.then(() => this._stopServer(completion));
+		}
+
+		return completion.promise;
+	}
+
+	private _stopServer(completion: PromiseWithResolvers<void>): void {
+		try {
+			Promise.resolve(this._server.stop()).then(completion.resolve, completion.reject);
+		} catch (error) {
+			completion.reject(
+				error instanceof Error ? error : new AggregateError([error], 'Session stop failed')
+			);
+		}
 	}
 
 	/**
@@ -188,6 +235,7 @@ export class Session {
  */
 export class ConnectionPool implements IConnectionPool {
 	private _sessions: Map<SessionId, Session> = new Map();
+	private readonly _closingSessions = new Map<SessionId, Promise<void>>();
 	private _createSessionLock: Promise<void> | null = null;
 	private _maxSessions: number;
 	private _sessionTimeout: number;
@@ -197,6 +245,13 @@ export class ConnectionPool implements IConnectionPool {
 	private _terminated: boolean = false;
 	private _logger: Logger;
 	private _serverFactory: (() => Promise<SessionServer>) | null;
+	private _terminatePromise: Promise<void> | null = null;
+	private readonly _admissionContext = new AsyncLocalStorage<{
+		readonly sessionId: SessionId;
+		readonly session: Session;
+		open: boolean;
+	}>();
+	private readonly _pendingCreateStopFailures = new Set<unknown>();
 
 	constructor(options: SessionOptions = {}) {
 		this._maxSessions = options.maxSessions ?? 100;
@@ -255,10 +310,21 @@ export class ConnectionPool implements IConnectionPool {
 
 		try {
 			// Generate unique session ID
-			const sessionId = asSessionId(`session_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`);
+			const sessionId = asSessionId(
+				`session_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
+			);
 
 			// Create a new server instance for this session
 			const server = await this._serverFactory();
+			if (this._terminated) {
+				try {
+					await server.stop();
+				} catch (error) {
+					this._pendingCreateStopFailures.add(error);
+					throw error;
+				}
+				throw new PoolTerminatedError();
+			}
 
 			// Create session
 			const session = new Session(sessionId, server, this._sessionTimeout, this._logger);
@@ -282,14 +348,55 @@ export class ConnectionPool implements IConnectionPool {
 	 * @returns Promise with the processing result
 	 * @throws Error if session not found
 	 */
-	async process(sessionId: SessionId, input: ThoughtData): Promise<ProcessResult> {
-		const session = this._sessions.get(sessionId);
+	async process(sessionId: SessionId, input: SessionThoughtInput): Promise<ProcessResult> {
+		const result = await this._runWithSession(sessionId, (session) =>
+			session.processAdmitted(input)
+		);
+		switch (result.status) {
+			case 'completed':
+				return result.value;
+			case 'inactive':
+				throw new SessionNotActiveError(sessionId);
+			case 'missing':
+				throw new SessionNotFoundError(sessionId);
+			default:
+				return assertNever(result);
+		}
+	}
 
-		if (!session) {
-			throw new SessionNotFoundError(sessionId);
+	runWithSession<T>(
+		sessionId: SessionId,
+		operation: (session: SessionServer) => Promise<T>
+	): Promise<SessionRunResult<T>> {
+		return this._runWithSession(sessionId, (session) => operation(session.getInfo().server));
+	}
+
+	private _runWithSession<T>(
+		sessionId: SessionId,
+		operation: (session: Session) => Promise<T>
+	): Promise<SessionRunResult<T>> {
+		const activeFrame = this._admissionContext.getStore();
+		if (activeFrame?.open === true && activeFrame.sessionId === sessionId) {
+			return (async () => ({ status: 'completed', value: await operation(activeFrame.session) }))();
 		}
 
-		return session.process(input);
+		const session = this._sessions.get(sessionId);
+		if (!session) {
+			return Promise.resolve(
+				this._closingSessions.has(sessionId) ? { status: 'inactive' } : { status: 'missing' }
+			);
+		}
+
+		return session.runWhileActive((capturedSession) => {
+			const frame = { sessionId, session: capturedSession, open: true };
+			return this._admissionContext.run(frame, async () => {
+				try {
+					return await operation(capturedSession);
+				} finally {
+					frame.open = false;
+				}
+			});
+		});
 	}
 
 	/**
@@ -298,19 +405,33 @@ export class ConnectionPool implements IConnectionPool {
 	 * @param sessionId - The session ID to close
 	 * @throws Error if session not found
 	 */
-	async closeSession(sessionId: SessionId): Promise<void> {
+	closeSession(sessionId: SessionId): Promise<void> {
+		const closing = this._closingSessions.get(sessionId);
+		if (closing) {
+			return closing;
+		}
+
 		const session = this._sessions.get(sessionId);
 
 		if (!session) {
-			throw new SessionNotFoundError(sessionId);
+			return Promise.reject(new SessionNotFoundError(sessionId));
 		}
 
-		await session.close();
 		this._sessions.delete(sessionId);
-
-		this._logger.info(
-			`Closed session ${sessionId} (${this._sessions.size}/${this._maxSessions} active sessions)`
+		const closePromise = session.close();
+		this._closingSessions.set(sessionId, closePromise);
+		void closePromise.then(
+			() => {
+				this._closingSessions.delete(sessionId);
+				this._logger.info(
+					`Closed session ${sessionId} (${this._sessions.size}/${this._maxSessions} active sessions)`
+				);
+			},
+			() => {
+				this._closingSessions.delete(sessionId);
+			}
 		);
+		return closePromise;
 	}
 
 	/**
@@ -370,10 +491,9 @@ export class ConnectionPool implements IConnectionPool {
 
 		for (const [sessionId, session] of this._sessions.entries()) {
 			if (session.isTimedOut()) {
-				session.close().catch((err) => {
+				this.closeSession(sessionId).catch((err) => {
 					this._logger.error(`Error closing timed out session ${sessionId}:`, err);
 				});
-				this._sessions.delete(sessionId);
 				cleaned++;
 			}
 		}
@@ -388,11 +508,13 @@ export class ConnectionPool implements IConnectionPool {
 	/**
 	 * Close all sessions and stop the cleanup timer.
 	 */
-	async terminate(): Promise<void> {
-		if (this._terminated) {
-			return;
+	terminate(): Promise<void> {
+		if (this._terminatePromise) {
+			return this._terminatePromise;
 		}
 
+		const completion = Promise.withResolvers<void>();
+		this._terminatePromise = completion.promise;
 		this._terminated = true;
 
 		// Stop cleanup timer
@@ -401,17 +523,32 @@ export class ConnectionPool implements IConnectionPool {
 			this._cleanupTimerId = null;
 		}
 
-		// Close all sessions
-		const closePromises = Array.from(this._sessions.values()).map((session) =>
-			session.close().catch((err) => {
-				this._logger.error(`Error closing session ${session.getInfo().id}:`, err);
-			})
-		);
-
-		await Promise.all(closePromises);
+		const sessions = Array.from(this._sessions.values());
 		this._sessions.clear();
+		const closePromises = new Set<Promise<void>>(this._closingSessions.values());
+		if (this._createSessionLock) {
+			closePromises.add(this._createSessionLock);
+		}
+		for (const session of sessions) {
+			closePromises.add(session.close());
+		}
 
-		this._logger.info('ConnectionPool terminated');
+		void Promise.allSettled(closePromises).then((outcomes) => {
+			const failures = [
+				...this._pendingCreateStopFailures,
+				...outcomes
+					.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')
+					.map((outcome) => outcome.reason),
+			];
+			if (failures.length > 0) {
+				completion.reject(new AggregateError(failures, 'ConnectionPool termination failed'));
+				return;
+			}
+			this._logger.info('ConnectionPool terminated');
+			completion.resolve();
+		});
+
+		return completion.promise;
 	}
 
 	/**
@@ -419,8 +556,8 @@ export class ConnectionPool implements IConnectionPool {
 	 * Implements the IDisposable interface.
 	 * Delegates to terminate() for backward compatibility.
 	 */
-	async dispose(): Promise<void> {
-		await this.terminate();
+	dispose(): Promise<void> {
+		return this.terminate();
 	}
 
 	/**

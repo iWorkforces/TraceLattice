@@ -423,9 +423,15 @@ export class ServerConfig {
 	 * @private
 	 */
 	private validateFeatures(value?: Partial<FeatureFlags>): FeatureFlags {
+		const reasoningStrategy = value?.reasoningStrategy ?? 'sequential';
+		if (reasoningStrategy !== 'sequential' && reasoningStrategy !== 'tot') {
+			throw new ConfigurationError(
+				`features.reasoningStrategy must be one of sequential, tot, got ${reasoningStrategy}`
+			);
+		}
 		return {
 			dagEdges: value?.dagEdges ?? true,
-			reasoningStrategy: value?.reasoningStrategy ?? 'sequential',
+			reasoningStrategy,
 			calibration: value?.calibration ?? true,
 			compression: value?.compression ?? true,
 			toolInterleave: value?.toolInterleave ?? true,

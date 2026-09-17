@@ -6,12 +6,9 @@
 import { describe, expect, it } from 'vitest';
 import { Calibrator } from '../../core/evaluator/Calibrator.js';
 import { ALL_THOUGHT_TYPES } from '../../core/evaluator/internals.js';
-import type {
-	IOutcomeRecorder,
-	VerificationOutcome,
-} from '../../contracts/interfaces.js';
+import type { IOutcomeRecorder, VerificationOutcome } from '../../contracts/interfaces.js';
 import type { ThoughtType } from '../../core/reasoning.js';
-import { asSessionId, asThoughtId } from '../../contracts/ids.js';
+import { asSessionId, asThoughtId, GLOBAL_SESSION_ID } from '../../contracts/ids.js';
 
 class MockOutcomeRecorder implements IOutcomeRecorder {
 	public readonly enabled = true;
@@ -37,6 +34,10 @@ class MockOutcomeRecorder implements IOutcomeRecorder {
 	clearOutcomes(sessionId: string): void {
 		this._bySession.delete(sessionId);
 	}
+
+	clearAllOutcomes(): void {
+		this._bySession.clear();
+	}
 }
 
 function makeOutcome(
@@ -45,7 +46,7 @@ function makeOutcome(
 	type: ThoughtType = 'hypothesis',
 	sessionId: string = 's1',
 	thoughtId: string = 't',
-	thoughtNumber = 1,
+	thoughtNumber = 1
 ): Omit<VerificationOutcome, 'recordedAt'> {
 	return {
 		thoughtId: asThoughtId(thoughtId),
@@ -400,7 +401,7 @@ describe('Calibrator — temperature boundary (MIN_OUTCOMES_FOR_TEMPERATURE = 10
 		// fitTemperature returns 1.0 below threshold; calibrate path also gates on count.
 		expect(r.temperature).toBe(1.0);
 		// hypothesis: n=9, observedMean=0, priorWeight = 1/(1+9/10) = 1/1.9 ≈ 0.5263
-		const expected = (1 / (1 + 9 / 10)) * 0 + (1 - 1 / (1 + 9 / 10)) * 0.9;
+		const expected = (1 - 1 / (1 + 9 / 10)) * 0.9;
 		expect(r.calibrated).toBeCloseTo(expected, 10);
 	});
 
@@ -479,6 +480,110 @@ describe('Calibrator — global temperature fallback', () => {
 	});
 });
 
+describe('Calibrator — temperature lifecycle cleanup', () => {
+	it('clearSession() preserves global fallback for the global session id', () => {
+		// Given
+		const recorder = new MockOutcomeRecorder();
+		const calibrator = new Calibrator(recorder, true);
+		const freshSession = asSessionId('global-cleanup-fresh');
+		for (let i = 0; i < 15; i++) {
+			recorder.recordVerification(makeOutcome(0.99, 0, 'hypothesis', 'global-cleanup-source'));
+		}
+		calibrator.refit();
+		const globalTemperature = calibrator.calibrate(0.9, 'hypothesis', freshSession).temperature;
+
+		// When
+		calibrator.clearSession(GLOBAL_SESSION_ID);
+
+		// Then
+		expect(globalTemperature).toBeGreaterThan(1.0);
+		expect(calibrator.calibrate(0.9, 'hypothesis', freshSession).temperature).toBe(
+			globalTemperature
+		);
+	});
+
+	it('clearSession() removes only that session temperature and preserves the global fallback', () => {
+		const recorder = new MockOutcomeRecorder();
+		const calibrator = new Calibrator(recorder, true);
+		const sessionA = asSessionId('cleanup-A');
+		const sessionB = asSessionId('cleanup-B');
+
+		for (let i = 0; i < 15; i++) {
+			recorder.recordVerification(makeOutcome(0.99, 0, 'hypothesis', 'cleanup-A'));
+		}
+		for (let i = 0; i < 9; i++) {
+			recorder.recordVerification(makeOutcome(0.6, 1, 'hypothesis', 'cleanup-B'));
+		}
+		for (let i = 0; i < 6; i++) {
+			recorder.recordVerification(makeOutcome(0.6, 0, 'hypothesis', 'cleanup-B'));
+		}
+
+		calibrator.refit();
+		calibrator.refit(sessionA);
+		calibrator.refit(sessionB);
+		const globalTemperature = calibrator.calibrate(
+			0.9,
+			'hypothesis',
+			asSessionId('cleanup-new')
+		).temperature;
+		const sessionBTemperature = calibrator.calibrate(0.9, 'hypothesis', sessionB).temperature;
+
+		calibrator.clearSession(sessionA);
+
+		expect(calibrator.calibrate(0.9, 'hypothesis', sessionA).temperature).toBe(globalTemperature);
+		expect(calibrator.calibrate(0.9, 'hypothesis', sessionB).temperature).toBe(sessionBTemperature);
+		expect(calibrator.calibrate(0.9, 'hypothesis', asSessionId('cleanup-new')).temperature).toBe(
+			globalTemperature
+		);
+		expect(recorder.getOutcomes(sessionA)).toHaveLength(15);
+	});
+
+	it('clearSession() ignores unknown sessions', () => {
+		const recorder = new MockOutcomeRecorder();
+		const calibrator = new Calibrator(recorder, true);
+		for (let i = 0; i < 15; i++) {
+			recorder.recordVerification(makeOutcome(0.99, 0));
+		}
+		calibrator.refit();
+		const temperature = calibrator.calibrate(0.9, 'hypothesis', asSessionId('known')).temperature;
+
+		calibrator.clearSession(asSessionId('unknown'));
+
+		expect(calibrator.calibrate(0.9, 'hypothesis', asSessionId('known')).temperature).toBe(
+			temperature
+		);
+	});
+
+	it('clearAll() removes every session and global temperature', () => {
+		const recorder = new MockOutcomeRecorder();
+		const calibrator = new Calibrator(recorder, true);
+		const sessionA = asSessionId('clear-all-A');
+		const sessionB = asSessionId('clear-all-B');
+		for (let i = 0; i < 15; i++) {
+			recorder.recordVerification(makeOutcome(0.99, 0, 'hypothesis', 'clear-all-A'));
+			recorder.recordVerification(makeOutcome(0.99, 0, 'hypothesis', 'clear-all-B'));
+		}
+		calibrator.refit();
+		calibrator.refit(sessionA);
+		calibrator.refit(sessionB);
+
+		calibrator.clearAll();
+
+		expect(calibrator.calibrate(0.9, 'hypothesis', sessionA).temperature).toBe(1.0);
+		expect(calibrator.calibrate(0.9, 'hypothesis', sessionB).temperature).toBe(1.0);
+		expect(calibrator.calibrate(0.9, 'hypothesis', asSessionId('clear-all-new')).temperature).toBe(
+			1.0
+		);
+	});
+
+	it('cleanup is safe when calibration is disabled', () => {
+		const calibrator = new Calibrator(new MockOutcomeRecorder(), false);
+
+		expect(() => calibrator.clearSession(asSessionId('disabled'))).not.toThrow();
+		expect(() => calibrator.clearAll()).not.toThrow();
+	});
+});
+
 describe('Calibrator — determinism', () => {
 	it('calibrate() returns identical results across repeated calls (same args, same state)', () => {
 		const recorder = new MockOutcomeRecorder();
@@ -508,7 +613,14 @@ describe('Calibrator — determinism', () => {
 
 	it('Brier score is deterministic for the same outcome set', () => {
 		const seed: Array<[number, 0 | 1]> = [
-			[0.9, 1], [0.8, 0], [0.7, 1], [0.6, 1], [0.55, 0], [0.5, 1], [0.4, 0], [0.3, 0],
+			[0.9, 1],
+			[0.8, 0],
+			[0.7, 1],
+			[0.6, 1],
+			[0.55, 0],
+			[0.5, 1],
+			[0.4, 0],
+			[0.3, 0],
 		];
 		const rA = new MockOutcomeRecorder();
 		const rB = new MockOutcomeRecorder();

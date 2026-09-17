@@ -8,10 +8,20 @@
  * @module processor
  */
 
+import * as v from 'valibot';
+
 import { NullLogger } from '../logger/NullLogger.js';
 import type { Logger } from '../logger/StructuredLogger.js';
-import { asSessionId, GLOBAL_SESSION_ID, type BranchId, type SessionId, type ThoughtId } from '../contracts/ids.js';
-import type { IEdgeStore } from '../contracts/interfaces.js';
+import {
+	asBranchId,
+	asSessionId,
+	GLOBAL_SESSION_ID,
+	type BranchId,
+	type SessionId,
+	type ThoughtId,
+} from '../contracts/ids.js';
+import type { IEdgeStore, IOutcomeRecorder } from '../contracts/interfaces.js';
+import type { ICalibrator } from '../contracts/calibrator.js';
 import type { ISuspensionStore, SuspensionRecord } from '../contracts/suspension.js';
 import type { IReasoningStrategy, StrategyDecision } from '../contracts/strategy.js';
 import { DEFAULT_FLAGS, type FeatureFlags } from '../contracts/features.js';
@@ -20,30 +30,34 @@ import {
 	InvalidBacktrackError,
 	InvalidToolCallError,
 	SequentialThinkingError,
-	SuspensionExpiredError,
-	SuspensionNotFoundError,
 	UnknownToolError,
 	ValidationError,
 } from '../errors.js';
 import { getErrorMessage, WARNING_CODES } from '../errors.js';
 import { enforceJsonShape, JsonShapeError } from '../sanitize.js';
+import { SequentialThinkingSchema } from '../schema.js';
 import { GraphView } from './graph/GraphView.js';
 import { assertNever } from '../utils.js';
-import type { IHistoryManager } from './IHistoryManager.js';
+import type {
+	HistorySessionSnapshot,
+	IHistoryManager,
+	ThoughtAdmissionContext,
+} from './IHistoryManager.js';
 import { normalizeInput } from './InputNormalizer.js';
-import type { ThoughtData, ToolCallThought, ToolObservationThought, ValidatedThought } from './thought.js';
+import type {
+	ThoughtData,
+	ToolCallThought,
+	ToolObservationThought,
+	ValidatedThought,
+} from './thought.js';
 import type { ThoughtEvaluator } from './ThoughtEvaluator.js';
 import type { ThoughtFormatter } from './ThoughtFormatter.js';
 import type { PatternName, PatternSignal } from './reasoning.js';
 import { SequentialStrategy } from './reasoning/strategies/SequentialStrategy.js';
 import type { CompressionService } from './compression/CompressionService.js';
+import { validateThoughtCrossReferences } from './CrossReferenceValidator.js';
+import { SessionLifecycleCoordinator } from './SessionLifecycleCoordinator.js';
 
-/**
- * Internal extension to ThoughtData carrying resume metadata.
- * Attached by `_handleToolObservation` so downstream consumers (e.g. edge
- * emission) can correlate the observation with the suspended `tool_call`.
- */
-type ResumableThought = ThoughtData & { _resumedFrom?: number };
 type ConfidenceSignalsResult = ReturnType<ThoughtEvaluator['computeConfidenceSignals']>;
 type ReasoningStatsResult = ReturnType<ThoughtEvaluator['computeReasoningStats']>;
 
@@ -56,7 +70,8 @@ type ReasoningSignalBundle = {
 
 type ProcessedThoughtResponseState = {
 	readonly thought: ThoughtData;
-	readonly sessionId: SessionId | undefined;
+	readonly sessionId: SessionId;
+	readonly exposeSessionId: boolean;
 	readonly reasoning: {
 		readonly confidenceSignals: ConfidenceSignalsResult;
 		readonly reasoningStats: ReasoningStatsResult;
@@ -66,6 +81,16 @@ type ProcessedThoughtResponseState = {
 	readonly warnings: readonly string[];
 };
 
+type ThoughtProcessInput = ThoughtData & { readonly register_branch_id?: string };
+
+type PreparedThought = {
+	readonly thought: ThoughtData;
+	readonly sessionId: SessionId;
+	readonly exposeSessionId: boolean;
+	readonly resetState: boolean;
+	readonly registerBranchId: BranchId | undefined;
+	readonly validationWarnings: readonly string[];
+};
 
 /**
  * The return type expected by MCP tool invocations.
@@ -137,6 +162,7 @@ export class ThoughtProcessor {
 	 * @param toolRegistry - Optional tool registry for tool_name allowlist validation (required when toolInterleave is enabled)
 	 * @param features - Optional feature flags (defaults to DEFAULT_FLAGS — all opt-in flags off)
 	 * @param sessionLock - Optional per-session async lock; when provided, `process()` runs under it
+	 * @param outcomeRecorder - Optional per-session calibration outcome store
 	 */
 	constructor(
 		private historyManager: IHistoryManager,
@@ -149,6 +175,9 @@ export class ThoughtProcessor {
 		private readonly _toolRegistry?: IToolRegistry,
 		private readonly _features: FeatureFlags = DEFAULT_FLAGS,
 		private readonly _sessionLock?: ISessionLock,
+		private readonly _outcomeRecorder?: IOutcomeRecorder,
+		private readonly _lifecycle: SessionLifecycleCoordinator = new SessionLifecycleCoordinator(),
+		private readonly _calibrator?: ICalibrator
 	) {
 		this._thoughtEvaluator = thoughtEvaluator;
 		this._logger = logger ?? new NullLogger();
@@ -247,9 +276,9 @@ export class ThoughtProcessor {
 	 *   - `quality_score` — Self-assessed quality score 0-1 (optional)
 	 *   - `confidence` — Self-assessed confidence 0-1 (optional)
 	 *   - `hypothesis_id` — Hypothesis link for verification chains (optional)
- *   - `confidence_signals` — Computed reasoning quality signals (includes structural_quality and quality_components)
- *   - `reasoning_stats` — Aggregated reasoning analytics
- *   - `reasoning_hints` — (Conditional) Actionable hints from pattern analysis, max 3, warning-severity only (optional)
+	 *   - `confidence_signals` — Computed reasoning quality signals (includes structural_quality and quality_components)
+	 *   - `reasoning_stats` — Aggregated reasoning analytics
+	 *   - `reasoning_hints` — (Conditional) Actionable hints from pattern analysis, max 3, warning-severity only (optional)
 	 *
 	 * @example
 	 * ```typescript
@@ -265,105 +294,234 @@ export class ThoughtProcessor {
 	 * // branches, thought_history_length, and any recommendations
 	 * ```
 	 */
-	public async process(input: ThoughtData): Promise<CallToolResult> {
-		const lock = this._sessionLock;
-		if (lock) {
-			return lock.withLock(input.session_id, () => this._processInner(input));
+	public async process(input: ThoughtProcessInput): Promise<CallToolResult> {
+		try {
+			const prepared = this._prepareInput(input);
+			const operation = async (): Promise<CallToolResult> => {
+				if (this._sessionLock !== undefined) {
+					return await this._sessionLock.withLock(prepared.sessionId, () =>
+						this._processInner(prepared)
+					);
+				}
+				return await this._processInner(prepared);
+			};
+			if (prepared.resetState) {
+				this.historyManager.inspectSession(prepared.sessionId);
+				return await this._lifecycle.withSessionReset(prepared.sessionId, operation);
+			}
+			return await this._lifecycle.runOperation(prepared.sessionId, operation);
+		} catch (error) {
+			return this._buildErrorResponse(error);
 		}
-		return this._processInner(input);
 	}
 
-	private async _processInner(input: ThoughtData): Promise<CallToolResult> {
-		try {
-			// Normalize input to handle common LLM field name mistakes
-			const normalizedInput = normalizeInput(input);
-			const sessionId: SessionId | undefined = normalizedInput.session_id
-				? asSessionId(normalizedInput.session_id)
-				: undefined;
-
-			// Handle reset_state: clear session before processing
-			if (normalizedInput.reset_state) {
-				this.historyManager.clear(sessionId);
-				this.log('State reset for session', { sessionId: sessionId ?? GLOBAL_SESSION_ID });
-			}
-
-			// Persist available_mcp_tools/available_skills across calls within a session.
-			// If the caller omits these, reuse the last-seen values from the session.
-			if (!normalizedInput.available_mcp_tools) {
-				normalizedInput.available_mcp_tools = this.historyManager.getAvailableMcpTools(sessionId);
-			}
-			if (!normalizedInput.available_skills) {
-				normalizedInput.available_skills = this.historyManager.getAvailableSkills(sessionId);
-			}
-
-			const { result: validatedInput, warnings: validateWarnings } =
-				this.validateInput(normalizedInput);
-			const { result: checkedInput, warnings: refWarnings } =
-				this._validateCrossReferences(validatedInput, sessionId);
-			const allWarnings = [...validateWarnings, ...refWarnings];
-
-			// Validate new thought types and tool-interleave invariants.
-			const validated = this._validateNewTypes(checkedInput, sessionId);
-
-			// Tool-interleave suspend path: persist the tool_call thought, then return
-			// a `suspended` envelope without running strategy/evaluator.
-			if (validated.thought_type === 'tool_call' && this._suspensionStore) {
-				return this._handleToolCall(validated, sessionId);
-			}
-
-			// Tool-interleave resume path: consume the suspension and continue the
-			// normal pipeline (addThought → format → evaluate → strategy).
-			if (validated.thought_type === 'tool_observation' && this._suspensionStore) {
-				this._handleToolObservation(validated, sessionId);
-			}
-
-			this.historyManager.addThought(checkedInput);
-
-			const formattedThought = this.thoughtFormatter.formatThought(checkedInput);
-			this.log(formattedThought, { sessionId: sessionId ?? GLOBAL_SESSION_ID });
-
-			const signals = this._collectReasoningSignals(checkedInput, sessionId);
-
-			// Strategy decision — pluggable reasoning policy hook.
-			// Built after history/stats so strategies see the latest state.
-			const decision = this._runStrategy(
-				checkedInput,
-				signals.history,
-				signals.reasoningStats,
-				sessionId
+	/** Resets one canonical session and its processor-owned auxiliary state. */
+	public async resetSession(sessionId: string): Promise<void> {
+		const canonicalSessionId = asSessionId(sessionId);
+		this.historyManager.inspectSession(canonicalSessionId);
+		const operation = async (): Promise<void> => {
+			await this.historyManager.resetSessionWithinExclusive(canonicalSessionId, () =>
+				this.clearSessionAuxiliaryState(canonicalSessionId)
 			);
+		};
+		await this._lifecycle.withSessionReset(canonicalSessionId, async () => {
+			if (this._sessionLock !== undefined) {
+				await this._sessionLock.withLock(canonicalSessionId, operation);
+				return;
+			}
+			await operation();
+		});
+	}
 
-			return this._buildSuccessResponse({
-				thought: checkedInput,
-				sessionId,
-				reasoning: {
-					confidenceSignals: signals.confidenceSignals,
-					reasoningStats: signals.reasoningStats,
-					reasoningHints: signals.reasoningHints,
-				},
-				decision,
-				warnings: allWarnings,
-			});
-		} catch (error) {
-			return {
-				content: [
-					{
-						type: 'text' as const,
-						text: JSON.stringify(
-							{
-								...(error instanceof SequentialThinkingError && { code: error.code }),
-								error: getErrorMessage(error),
-								message: getErrorMessage(error),
-								status: 'failed',
-							},
-							null,
-							2
-						),
-					},
-				],
-				isError: true,
-			};
+	/** Resets all history and processor-owned auxiliary state from a trusted context. */
+	public async resetAll(): Promise<void> {
+		await this._lifecycle.withGlobalReset(
+			async () =>
+				await this.historyManager.resetAllWithinExclusive(() => this.clearAllAuxiliaryState())
+		);
+	}
+
+	private _prepareInput(input: ThoughtProcessInput): PreparedThought {
+		const normalized = normalizeInput(input);
+		if (typeof normalized === 'object' && normalized !== null) {
+			this._validateToolArgumentsShape(normalized.tool_arguments);
 		}
+		const parsed = v.safeParse(SequentialThinkingSchema, normalized);
+		if (!parsed.success) {
+			const firstIssue = parsed.issues[0];
+			const field = firstIssue?.path?.map((item) => String(item.key)).join('.') || 'input';
+			throw new ValidationError(field, firstIssue?.message ?? 'Invalid input');
+		}
+
+		const internal = normalizeInput(parsed.output) as ThoughtData & {
+			register_branch_id?: string;
+		};
+		const exposeSessionId = internal.session_id !== undefined;
+		const sessionId = internal.session_id ?? GLOBAL_SESSION_ID;
+		const registerBranchId =
+			internal.register_branch_id === undefined
+				? undefined
+				: asBranchId(internal.register_branch_id);
+		const thought = { ...internal };
+		delete thought.register_branch_id;
+		const { result, warnings } = this.validateInput(thought);
+		this._validateStatelessNewTypes(result);
+		return {
+			thought: result,
+			sessionId,
+			exposeSessionId,
+			resetState: result.reset_state === true,
+			registerBranchId,
+			validationWarnings: warnings,
+		};
+	}
+
+	private _buildErrorResponse(error: unknown): CallToolResult {
+		return {
+			content: [
+				{
+					type: 'text',
+					text: JSON.stringify(
+						{
+							...(error instanceof SequentialThinkingError && { code: error.code }),
+							error: getErrorMessage(error),
+							message: getErrorMessage(error),
+							status: 'failed',
+						},
+						null,
+						2
+					),
+				},
+			],
+			isError: true,
+		};
+	}
+
+	private static _emptySessionSnapshot(): HistorySessionSnapshot {
+		return {
+			history: [],
+			branches: {},
+			branchIds: [],
+			availableMcpTools: undefined,
+			availableSkills: undefined,
+		};
+	}
+
+	/** Clears all processor-owned state for one removed session. */
+	public clearSessionAuxiliaryState(sessionId: SessionId): void {
+		this._hintCooldowns.delete(sessionId);
+		this._suspensionStore?.clearSession(sessionId);
+		this._outcomeRecorder?.clearOutcomes(sessionId);
+		this._calibrator?.clearSession(sessionId);
+	}
+
+	/** Clears all processor-owned state after global reset or successful shutdown. */
+	public clearAllAuxiliaryState(): void {
+		this._suspensionStore?.clearAll();
+		this._outcomeRecorder?.clearAllOutcomes();
+		this._calibrator?.clearAll();
+		this._hintCooldowns.clear();
+	}
+
+	private _validateToolArgumentsShape(toolArguments: unknown): void {
+		try {
+			enforceJsonShape(toolArguments ?? {});
+		} catch (error) {
+			if (error instanceof JsonShapeError) {
+				throw new ValidationError('tool_arguments', error.reason);
+			}
+			throw error;
+		}
+	}
+
+	private async _processInner(prepared: PreparedThought): Promise<CallToolResult> {
+		const { thought, sessionId, exposeSessionId, resetState, registerBranchId } = prepared;
+		const existingSnapshot = this.historyManager.inspectSession(sessionId);
+		const validationSnapshot = resetState
+			? ThoughtProcessor._emptySessionSnapshot()
+			: existingSnapshot;
+		if (!resetState) {
+			if (!thought.available_mcp_tools && validationSnapshot.availableMcpTools) {
+				thought.available_mcp_tools = [...validationSnapshot.availableMcpTools];
+			}
+			if (!thought.available_skills && validationSnapshot.availableSkills) {
+				thought.available_skills = [...validationSnapshot.availableSkills];
+			}
+		}
+		const resolveThoughtReference = resetState
+			? () => ({ kind: 'missing' as const })
+			: (thoughtNumber: number) =>
+					this.historyManager.resolveThoughtReference(sessionId, thoughtNumber);
+		const {
+			result: checkedInput,
+			warnings: refWarnings,
+			resolvedReferences,
+		} = validateThoughtCrossReferences(thought, {
+			snapshot: validationSnapshot,
+			resolveThoughtReference,
+			strictBranchReferences: resetState || registerBranchId !== undefined,
+			logger: this._logger,
+		});
+		const allWarnings = [...prepared.validationWarnings, ...refWarnings];
+		const validated = this._validateNewTypes(checkedInput);
+		const admissionContext: ThoughtAdmissionContext = { resolvedReferences };
+		if (resetState && validated.thought_type === 'tool_observation') {
+			throw new ValidationError(
+				'thought_type',
+				'tool_observation cannot resume a suspension in reset replacement state'
+			);
+		}
+
+		if (resetState) {
+			await this.historyManager.resetSessionWithinExclusive(sessionId, () =>
+				this.clearSessionAuxiliaryState(sessionId)
+			);
+			this.log('State reset for session', { sessionId });
+		}
+		if (registerBranchId !== undefined) {
+			this.historyManager.registerBranch(sessionId, registerBranchId);
+		}
+
+		// Tool-interleave suspend path: persist the tool_call thought, then return
+		// a `suspended` envelope without running strategy/evaluator.
+		if (validated.thought_type === 'tool_call' && this._suspensionStore) {
+			return this._handleToolCall(validated, sessionId, exposeSessionId, admissionContext);
+		}
+
+		// Tool-interleave resume path: consume the suspension and continue the
+		// normal pipeline (addThought → format → evaluate → strategy).
+		if (validated.thought_type === 'tool_observation' && this._suspensionStore) {
+			await this._handleToolObservation(validated, sessionId, admissionContext);
+		} else {
+			this.historyManager.addThought(checkedInput, admissionContext);
+		}
+
+		const formattedThought = this.thoughtFormatter.formatThought(checkedInput);
+		this.log(formattedThought, { sessionId });
+
+		const signals = this._collectReasoningSignals(checkedInput, sessionId);
+
+		// Strategy decision — pluggable reasoning policy hook.
+		// Built after history/stats so strategies see the latest state.
+		const decision = this._runStrategy(
+			checkedInput,
+			signals.history,
+			signals.reasoningStats,
+			sessionId
+		);
+
+		return this._buildSuccessResponse({
+			thought: checkedInput,
+			sessionId,
+			exposeSessionId,
+			reasoning: {
+				confidenceSignals: signals.confidenceSignals,
+				reasoningStats: signals.reasoningStats,
+				reasoningHints: signals.reasoningHints,
+			},
+			decision,
+			warnings: allWarnings,
+		});
 	}
 
 	private _collectReasoningSignals(
@@ -372,17 +530,10 @@ export class ThoughtProcessor {
 	): ReasoningSignalBundle {
 		const history = this.historyManager.getHistory(sessionId);
 		const branches = this.historyManager.getBranches(sessionId);
-		const confidenceSignals = this._thoughtEvaluator.computeConfidenceSignals(
-			history,
-			branches
-		);
+		const confidenceSignals = this._thoughtEvaluator.computeConfidenceSignals(history, branches);
 		const reasoningStats = this._thoughtEvaluator.computeReasoningStats(history, branches);
 		const patternSignals = this._thoughtEvaluator.computePatternSignals(history, branches);
-		const reasoningHints = this._generateHints(
-			patternSignals,
-			input.thought_number,
-			sessionId
-		);
+		const reasoningHints = this._generateHints(patternSignals, input.thought_number, sessionId);
 
 		return {
 			history,
@@ -420,7 +571,7 @@ export class ThoughtProcessor {
 							}),
 							...(state.decision.action !== 'continue' && { strategy_hint: state.decision }),
 							...(state.warnings.length > 0 && { warnings: state.warnings.slice(0, 3) }),
-							...(state.sessionId ? { session_id: state.sessionId } : {}),
+							...(state.exposeSessionId ? { session_id: state.sessionId } : {}),
 						},
 						null,
 						2
@@ -463,16 +614,16 @@ export class ThoughtProcessor {
 		// Auto-compression trigger: when strategy terminates a branch and
 		// compression is enabled, summarize the branch subtree. Compression
 		// failures must NEVER break the thought pipeline.
-		if (
-			decision.action === 'terminate' &&
-			this._compressionService &&
-			currentThought.branch_id
-		) {
+		if (decision.action === 'terminate' && this._compressionService && currentThought.branch_id) {
 			try {
 				const sid = sessionId ?? GLOBAL_SESSION_ID;
 				const branchRoot = this._findBranchRoot(sid, currentThought.branch_id);
 				if (branchRoot) {
-					this._compressionService.compressBranch(sid, currentThought.branch_id, branchRoot as ThoughtId);
+					this._compressionService.compressBranch(
+						sid,
+						currentThought.branch_id,
+						branchRoot as ThoughtId
+					);
 				}
 			} catch (err) {
 				this._logger.debug('Compression auto-trigger failed', {
@@ -548,128 +699,10 @@ export class ThoughtProcessor {
 	}
 
 	/**
-	 * Validates cross-field references against actual thought history.
-	 * Drops invalid references with a warning log — never rejects.
-	 * LLMs frequently send optimistic references to thoughts that don't exist yet.
-	 *
-	 * @param input - The thought data to validate
-	 * @returns Object with cleaned input and any warnings generated
-	 * @private
-	 *
-	 * @example
-	 * ```typescript
-	 * // verification_target=999 with only 3 thoughts in history
-	 * const { result, warnings } = this._validateCrossReferences(input);
-	 * // result.verification_target === undefined
-	 * // warnings === ['Dropped dangling verification_target: 999 (history has 3 thoughts)']
-	 * ```
-	 */
-	private _validateCrossReferences(input: ThoughtData, sessionId?: SessionId): {
-		result: ThoughtData;
-		warnings: string[];
-	} {
-		const warnings: string[] = [];
-		const historyLength = this.historyManager.getHistoryLength(sessionId);
-
-		// verification_target: must reference existing thought
-		if (input.verification_target !== undefined && input.verification_target > historyLength) {
-			warnings.push(
-				`Dropped dangling verification_target: ${input.verification_target} (history has ${historyLength} thoughts)`
-			);
-			this._logger.warn('Dropped dangling verification_target', {
-				verification_target: input.verification_target,
-				historyLength,
-			});
-			input.verification_target = undefined;
-		}
-
-		// revises_thought: must reference existing thought
-		if (input.revises_thought !== undefined && input.revises_thought > historyLength) {
-			warnings.push(
-				`Dropped dangling revises_thought: ${input.revises_thought} (history has ${historyLength} thoughts)`
-			);
-			this._logger.warn('Dropped dangling revises_thought', {
-				revises_thought: input.revises_thought,
-				historyLength,
-			});
-			input.revises_thought = undefined;
-		}
-
-		// branch_from_thought: must reference existing thought
-		if (input.branch_from_thought !== undefined && input.branch_from_thought > historyLength) {
-			warnings.push(
-				`Dropped dangling branch_from_thought: ${input.branch_from_thought} (history has ${historyLength} thoughts)`
-			);
-			this._logger.warn('Dropped dangling branch_from_thought', {
-				branch_from_thought: input.branch_from_thought,
-				historyLength,
-			});
-			input.branch_from_thought = undefined;
-		}
-
-		// synthesis_sources: filter to existing thoughts only
-		if (input.synthesis_sources?.length) {
-			const valid = input.synthesis_sources.filter((n: number) => n <= historyLength);
-			if (valid.length < input.synthesis_sources.length) {
-				const dropped = input.synthesis_sources.filter((n: number) => n > historyLength);
-				warnings.push(
-					`Filtered dangling synthesis_sources: [${dropped.join(', ')}] (history has ${historyLength} thoughts)`
-				);
-				this._logger.warn('Filtered dangling synthesis_sources', {
-					original: input.synthesis_sources,
-					filtered: valid,
-					historyLength,
-				});
-			}
-			input.synthesis_sources = valid.length > 0 ? valid : undefined;
-		}
-
-		// merge_from_thoughts: filter to existing thoughts only
-		if (input.merge_from_thoughts?.length) {
-			const valid = input.merge_from_thoughts.filter((n: number) => n <= historyLength);
-			if (valid.length < input.merge_from_thoughts.length) {
-				const dropped = input.merge_from_thoughts.filter(
-					(n: number) => n > historyLength
-				);
-				warnings.push(
-					`Filtered dangling merge_from_thoughts: [${dropped.join(', ')}] (history has ${historyLength} thoughts)`
-				);
-				this._logger.warn('Filtered dangling merge_from_thoughts', {
-					original: input.merge_from_thoughts,
-					filtered: valid,
-					historyLength,
-				});
-			}
-			input.merge_from_thoughts = valid.length > 0 ? valid : undefined;
-		}
-
-		// merge_branch_ids: filter to existing branches only (includes pre-registered)
-		if (input.merge_branch_ids?.length) {
-			const valid = input.merge_branch_ids.filter((id: BranchId) =>
-				this.historyManager.branchExists(sessionId, id)
-			);
-			if (valid.length < input.merge_branch_ids.length) {
-				const dropped = input.merge_branch_ids.filter(
-					(id: BranchId) => !this.historyManager.branchExists(sessionId, id)
-				);
-				warnings.push(`Filtered dangling merge_branch_ids: [${dropped.join(', ')}]`);
-				this._logger.warn('Filtered dangling merge_branch_ids', {
-					original: input.merge_branch_ids,
-					filtered: valid,
-					existingBranches: this.historyManager.getBranchIds(sessionId),
-				});
-			}
-			input.merge_branch_ids = valid.length > 0 ? valid : undefined;
-		}
-
-		return { result: input, warnings };
-	}
-
-	/**
 	 * Validate new thought-type invariants behind feature flags.
 	 * @private
 	 */
-	private _validateNewTypes(input: ThoughtData, sessionId?: SessionId): ValidatedThought {
+	private _validateStatelessNewTypes(input: ThoughtData): void {
 		const t = input.thought_type;
 		if ((t === 'tool_call' || t === 'tool_observation') && !this._features.toolInterleave) {
 			throw new ValidationError(
@@ -709,15 +742,19 @@ export class ThoughtProcessor {
 			}
 			if (input.backtrack_target > input.thought_number) {
 				throw new InvalidBacktrackError(
-					'backtrack_target ' + input.backtrack_target + ' must be <= thought_number ' + input.thought_number
-				);
-			}
-			if (!this._thoughtNumberExists(input.backtrack_target, sessionId)) {
-				throw new InvalidBacktrackError(
-					'backtrack_target ' + input.backtrack_target + ' does not exist in session history'
+					'backtrack_target ' +
+						input.backtrack_target +
+						' must be <= thought_number ' +
+						input.thought_number
 				);
 			}
 		}
+		if (t === 'tool_call') {
+			this._validateToolArgumentsShape(input.tool_arguments);
+		}
+	}
+
+	private _validateNewTypes(input: ThoughtData): ValidatedThought {
 		return input as ValidatedThought;
 	}
 
@@ -744,24 +781,6 @@ export class ThoughtProcessor {
 	}
 
 	/**
-	 * Checks whether a given thought_number exists in the session history or any branch.
-	 * @private
-	 */
-	private _thoughtNumberExists(thoughtNumber: number, sessionId?: SessionId): boolean {
-		const history = this.historyManager.getHistory(sessionId);
-		for (const t of history) {
-			if (t.thought_number === thoughtNumber) return true;
-		}
-		const branches = this.historyManager.getBranches(sessionId);
-		for (const branchThoughts of Object.values(branches)) {
-			for (const t of branchThoughts) {
-				if (t.thought_number === thoughtNumber) return true;
-			}
-		}
-		return false;
-	}
-
-	/**
 	 * Returns a workaround thought type for a feature-flagged type.
 	 * @private
 	 */
@@ -783,26 +802,25 @@ export class ThoughtProcessor {
 	 * Strategy/evaluator are intentionally skipped.
 	 * @private
 	 */
-	private _handleToolCall(input: ToolCallThought, sessionId?: SessionId): CallToolResult {
-		const args = input.tool_arguments ?? {};
-		try {
-			enforceJsonShape(args);
-		} catch (err) {
-			if (err instanceof JsonShapeError) {
-				throw new ValidationError('tool_arguments', err.reason);
-			}
-			throw err;
+	private _handleToolCall(
+		input: ToolCallThought,
+		sessionId: SessionId,
+		exposeSessionId: boolean,
+		admissionContext: ThoughtAdmissionContext
+	): CallToolResult {
+		if (input.id === undefined) {
+			throw new ValidationError('id', 'tool_call requires an admitted thought id');
 		}
-		this.historyManager.addThought(input);
+		this.historyManager.addThought(input, admissionContext);
 		if (!this._suspensionStore) {
 			throw new ValidationError('thought_type', 'tool_call requires suspensionStore');
 		}
 		const record: SuspensionRecord = this._suspensionStore.suspend({
-			sessionId: sessionId ? sessionId : GLOBAL_SESSION_ID,
+			sessionId,
 			toolCallThoughtNumber: input.thought_number,
+			toolCallThoughtId: input.id,
 			toolName: input.tool_name,
 			toolArguments: input.tool_arguments ?? {},
-			ttlMs: 5 * 60_000,
 			expiresAt: 0,
 		});
 		return {
@@ -818,7 +836,7 @@ export class ThoughtProcessor {
 							expires_at: record.expiresAt,
 							thought_number: input.thought_number,
 							total_thoughts: input.total_thoughts,
-							...(sessionId ? { session_id: sessionId } : {}),
+							...(exposeSessionId ? { session_id: sessionId } : {}),
 						},
 						null,
 						2
@@ -829,23 +847,22 @@ export class ThoughtProcessor {
 	}
 
 	/**
-	 * Resume from a tool_observation, consuming the suspension record.
-	 * Distinguishes missing vs expired via peek().
+	 * Resume from a tool_observation and atomically admit it before consuming the record.
 	 * @private
 	 */
-	private _handleToolObservation(input: ToolObservationThought, _sessionId?: SessionId): void {
+	private async _handleToolObservation(
+		input: ToolObservationThought,
+		sessionId: SessionId,
+		admissionContext: ThoughtAdmissionContext
+	): Promise<void> {
 		if (!this._suspensionStore) {
 			throw new ValidationError('thought_type', 'tool_observation requires suspensionStore');
 		}
-		const token = input.continuation_token;
-		const peeked = this._suspensionStore.peek(token);
-		if (peeked && peeked.expiresAt <= Date.now()) {
-			throw new SuspensionExpiredError('Suspension token expired: ' + token);
-		}
-		const record = this._suspensionStore.resume(token);
-		if (!record) {
-			throw new SuspensionNotFoundError('Suspension token not found: ' + token);
-		}
-		(input as ResumableThought)._resumedFrom = record.toolCallThoughtNumber;
+		await this._suspensionStore.compareAndAdmit(input.continuation_token, sessionId, (record) => {
+			this.historyManager.addThought(input, {
+				...admissionContext,
+				toolInvocationSourceThoughtId: record.toolCallThoughtId,
+			});
+		});
 	}
 }

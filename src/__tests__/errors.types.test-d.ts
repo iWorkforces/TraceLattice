@@ -13,14 +13,14 @@
  * without being treated as a runnable test module.
  */
 
-import type { ErrorCode } from '../errors.js';
+import type { ERROR_CODES, ErrorCode } from '../errors.js';
 
 /**
  * Union of every error code literal currently emitted by an error subclass
  * in `src/errors.ts`, plus codes thrown directly via `SequentialThinkingError`
  * elsewhere in the codebase.
  *
- * Subclass → code mapping (24 subclasses):
+ * Subclass → code mapping:
  *  - ConfigurationError        → CONFIGURATION_ERROR
  *  - ToolNotFoundError         → TOOL_NOT_FOUND
  *  - SkillNotFoundError        → SKILL_NOT_FOUND
@@ -45,6 +45,15 @@ import type { ErrorCode } from '../errors.js';
  *  - UnknownToolError          → UNKNOWN_TOOL
  *  - LockTimeoutError          → LOCK_TIMEOUT
  *  - SessionAccessDeniedError  → SESSION_ACCESS_DENIED
+ *  - PersistenceOwnershipError → PERSISTENCE_OWNERSHIP
+ *  - PersistenceCorruptionError → PERSISTENCE_CORRUPTION
+ *  - PersistencePublicationError → PERSISTENCE_PUBLICATION
+ *  - PersistenceClosedError    → PERSISTENCE_CLOSED
+ *  - PersistenceDrainError     → PERSISTENCE_DRAIN
+ *  - PersistenceSessionAdmissionClosedError → PERSISTENCE_SESSION_ADMISSION_CLOSED
+ *  - PersistenceSessionBarrierReentrancyError → PERSISTENCE_SESSION_BARRIER_REENTRANCY
+ *  - AsyncResetRequiredError → ASYNC_RESET_REQUIRED
+ *  - PersistenceUnavailableError → PERSISTENCE_UNAVAILABLE
  *
  * Direct `SequentialThinkingError` usages (no dedicated subclass):
  *  - DUPLICATE_SUMMARY (thrown by `core/compression/InMemorySummaryStore.ts`)
@@ -73,26 +82,28 @@ type _AllSubclassCodes =
 	| 'INVALID_BACKTRACK'
 	| 'UNKNOWN_TOOL'
 	| 'LOCK_TIMEOUT'
+	| 'CLI_SHUTDOWN_TIMEOUT'
 	| 'SESSION_ACCESS_DENIED'
+	| 'SESSION_LIFECYCLE_CLOSED'
+	| 'PERSISTENCE_OWNERSHIP'
+	| 'PERSISTENCE_CORRUPTION'
+	| 'PERSISTENCE_PUBLICATION'
+	| 'PERSISTENCE_CLOSED'
+	| 'PERSISTENCE_DRAIN'
+	| 'PERSISTENCE_SESSION_ADMISSION_CLOSED'
+	| 'PERSISTENCE_SESSION_BARRIER_REENTRANCY'
+	| 'ASYNC_RESET_REQUIRED'
+	| 'PERSISTENCE_CAPABILITY_UNSUPPORTED'
+	| 'PERSISTENCE_SCOPE_MISMATCH'
+	| 'PERSISTENCE_UNAVAILABLE'
+	| 'PERSISTENCE_COMPATIBILITY'
+	| 'PERSISTENCE_IMPORT_REQUIRED'
+	| 'PERSISTENCE_LEGACY_AMBIGUITY'
 	| 'DUPLICATE_SUMMARY';
 
-/**
- * If any `ErrorCode` literal is missing from `_AllSubclassCodes`, this
- * resolves to that literal (a non-`never` type), and the assignment below
- * fails to compile.
- */
-type _Exhaustive = Exclude<ErrorCode, _AllSubclassCodes>;
+type _ErrorCodeValues = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
+type _Equal<Left, Right> = [Left] extends [Right] ? ([Right] extends [Left] ? true : false) : false;
+type _Assert<Condition extends true> = Condition;
 
-/**
- * If any `_AllSubclassCodes` literal has been removed from `ErrorCode`,
- * this resolves to the orphan literal, and the assignment below fails.
- */
-type _NoOrphans = Exclude<_AllSubclassCodes, ErrorCode>;
-
-// Compile-time assertions: both must collapse to `never`.
-const _exhaustive: _Exhaustive = undefined as never;
-const _noOrphans: _NoOrphans = undefined as never;
-
-// Reference the bindings so unused-locals lint rules stay quiet under tsc.
-void _exhaustive;
-void _noOrphans;
+export type ErrorCodeMatchesConstants = _Assert<_Equal<ErrorCode, _ErrorCodeValues>>;
+export type ErrorCodeSetIsExhaustive = _Assert<_Equal<_AllSubclassCodes, _ErrorCodeValues>>;

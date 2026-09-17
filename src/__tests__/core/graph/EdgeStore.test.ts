@@ -2,7 +2,7 @@
  * Tests for the EdgeStore implementation.
  */
 
-import { asSessionId } from '../../../contracts/ids.js';
+import { asSessionId, asThoughtId, type ThoughtId } from '../../../contracts/ids.js';
 import { describe, it, expect } from 'vitest';
 import { EdgeStore } from '../../../core/graph/EdgeStore.js';
 import { generateUlid } from '../../../core/ids.js';
@@ -10,7 +10,9 @@ import { InvalidEdgeError } from '../../../errors.js';
 import type { Edge } from '../../../core/graph/Edge.js';
 
 function createTestEdge(
-	overrides: { from: string; to: string; sessionId: string } & Partial<Omit<Edge, 'from' | 'to' | 'sessionId'>>
+	overrides: { from: string; to: string; sessionId: string } & Partial<
+		Omit<Edge, 'from' | 'to' | 'sessionId'>
+	>
 ): Edge {
 	return {
 		id: generateUlid() as Edge['id'],
@@ -21,6 +23,10 @@ function createTestEdge(
 		to: overrides.to as Edge['to'],
 		sessionId: overrides.sessionId as Edge['sessionId'],
 	};
+}
+
+function retained(...ids: string[]): ReadonlySet<ThoughtId> {
+	return new Set(ids.map(asThoughtId));
 }
 
 describe('EdgeStore', () => {
@@ -156,7 +162,7 @@ describe('EdgeStore', () => {
 	});
 
 	describe('clearSession', () => {
-		it('clearSession removes only that session\'s edges', () => {
+		it("clearSession removes only that session's edges", () => {
 			const store = new EdgeStore();
 			store.addEdge(createTestEdge({ from: 'a', to: 'b', sessionId: 's1' }));
 			store.addEdge(createTestEdge({ from: 'c', to: 'd', sessionId: 's1' }));
@@ -183,6 +189,188 @@ describe('EdgeStore', () => {
 			store.addEdge(createTestEdge({ from: 'a', to: 'b', sessionId: 's1' }));
 			expect(() => store.clearSession(asSessionId('unknown'))).not.toThrow();
 			expect(store.size(asSessionId('s1'))).toBe(1);
+		});
+	});
+
+	describe('pruneSession', () => {
+		it('removes an edge when its source is absent from the retained set', () => {
+			// Given
+			const store = new EdgeStore();
+			const edge = createTestEdge({ from: 'removed-source', to: 'kept-target', sessionId: 's1' });
+			store.addEdge(edge);
+
+			// When
+			const removed = store.pruneSession(asSessionId('s1'), retained('kept-target'));
+
+			// Then
+			expect(removed).toBe(1);
+			expect(store.getEdge(edge.id)).toBeUndefined();
+		});
+
+		it('removes an edge when its target is absent from the retained set', () => {
+			// Given
+			const store = new EdgeStore();
+			const edge = createTestEdge({ from: 'kept-source', to: 'removed-target', sessionId: 's1' });
+			store.addEdge(edge);
+
+			// When
+			const removed = store.pruneSession(asSessionId('s1'), retained('kept-source'));
+
+			// Then
+			expect(removed).toBe(1);
+			expect(store.getEdge(edge.id)).toBeUndefined();
+		});
+
+		it('removes an edge when both endpoints are absent from the retained set', () => {
+			// Given
+			const store = new EdgeStore();
+			store.addEdge(
+				createTestEdge({ from: 'removed-source', to: 'removed-target', sessionId: 's1' })
+			);
+
+			// When
+			const removed = store.pruneSession(asSessionId('s1'), retained());
+
+			// Then
+			expect(removed).toBe(1);
+			expect(store.size(asSessionId('s1'))).toBe(0);
+		});
+
+		it('preserves an edge only when both endpoints are retained', () => {
+			// Given
+			const store = new EdgeStore();
+			const edge = createTestEdge({ from: 'kept-source', to: 'kept-target', sessionId: 's1' });
+			store.addEdge(edge);
+
+			// When
+			const removed = store.pruneSession(asSessionId('s1'), retained('kept-source', 'kept-target'));
+
+			// Then
+			expect(removed).toBe(0);
+			expect(store.getEdge(edge.id)).toEqual(edge);
+		});
+
+		it('treats main-history and branch-provided thought ids as one retained union', () => {
+			// Given
+			const store = new EdgeStore();
+			const edge = createTestEdge({ from: 'main-thought', to: 'branch-thought', sessionId: 's1' });
+			const mainThoughtIds = retained('main-thought');
+			const branchThoughtIds = retained('branch-thought');
+			const retainedUnion = new Set<ThoughtId>([...mainThoughtIds, ...branchThoughtIds]);
+			store.addEdge(edge);
+
+			// When
+			const removed = store.pruneSession(asSessionId('s1'), retainedUnion);
+
+			// Then
+			expect(removed).toBe(0);
+			expect(store.edgesForSession(asSessionId('s1'))).toEqual([edge]);
+		});
+
+		it('returns the exact removal count and rebuilds every index from retained edges', () => {
+			// Given
+			const store = new EdgeStore();
+			const keep = createTestEdge({ from: 'a', to: 'b', sessionId: 's1', createdAt: 200 });
+			const removeByTarget = createTestEdge({
+				from: 'a',
+				to: 'c',
+				sessionId: 's1',
+				createdAt: 100,
+			});
+			const removeBySource = createTestEdge({
+				from: 'd',
+				to: 'b',
+				sessionId: 's1',
+				createdAt: 300,
+			});
+			store.addEdge(keep);
+			store.addEdge(removeByTarget);
+			store.addEdge(removeBySource);
+
+			// When
+			const removed = store.pruneSession(asSessionId('s1'), retained('a', 'b'));
+
+			// Then
+			expect(removed).toBe(2);
+			expect(store.edgesForSession(asSessionId('s1'))).toEqual([keep]);
+			expect(store.outgoing(asSessionId('s1'), asThoughtId('a'))).toEqual([keep]);
+			expect(store.incoming(asSessionId('s1'), asThoughtId('b'))).toEqual([keep]);
+			expect(store.getEdge(removeByTarget.id)).toBeUndefined();
+			expect(store.getEdge(removeBySource.id)).toBeUndefined();
+			expect(store.size(asSessionId('s1'))).toBe(1);
+		});
+
+		it('pruning to empty removes all session indexes without affecting later inserts', () => {
+			// Given
+			const store = new EdgeStore();
+			const removedEdge = createTestEdge({ from: 'old-a', to: 'old-b', sessionId: 's1' });
+			const laterEdge = createTestEdge({ from: 'new-a', to: 'new-b', sessionId: 's1' });
+			store.addEdge(removedEdge);
+
+			// When
+			const removed = store.pruneSession(asSessionId('s1'), retained());
+			store.addEdge(laterEdge);
+
+			// Then
+			expect(removed).toBe(1);
+			expect(store.getEdge(removedEdge.id)).toBeUndefined();
+			expect(store.edgesForSession(asSessionId('s1'))).toEqual([laterEdge]);
+			expect(store.outgoing(asSessionId('s1'), asThoughtId('old-a'))).toEqual([]);
+			expect(store.incoming(asSessionId('s1'), asThoughtId('old-b'))).toEqual([]);
+		});
+
+		it('does not affect edges in another session', () => {
+			// Given
+			const store = new EdgeStore();
+			const remove = createTestEdge({ from: 'a', to: 'b', sessionId: 's1' });
+			const keep = createTestEdge({ from: 'x', to: 'y', sessionId: 's2' });
+			store.addEdge(remove);
+			store.addEdge(keep);
+
+			// When
+			const removed = store.pruneSession(asSessionId('s1'), retained());
+
+			// Then
+			expect(removed).toBe(1);
+			expect(store.edgesForSession(asSessionId('s2'))).toEqual([keep]);
+			expect(store.getEdge(keep.id)).toEqual(keep);
+			expect(store.size()).toBe(1);
+		});
+
+		it('preserves createdAt ordering after rebuilding retained indexes', () => {
+			// Given
+			const store = new EdgeStore();
+			const latest = createTestEdge({ from: 'a', to: 'b', sessionId: 's1', createdAt: 300 });
+			const earliest = createTestEdge({ from: 'a', to: 'c', sessionId: 's1', createdAt: 100 });
+			const middle = createTestEdge({ from: 'a', to: 'd', sessionId: 's1', createdAt: 200 });
+			const remove = createTestEdge({ from: 'a', to: 'removed', sessionId: 's1', createdAt: 50 });
+			store.addEdge(latest);
+			store.addEdge(earliest);
+			store.addEdge(middle);
+			store.addEdge(remove);
+
+			// When
+			store.pruneSession(asSessionId('s1'), retained('a', 'b', 'c', 'd'));
+
+			// Then
+			expect(
+				store.outgoing(asSessionId('s1'), asThoughtId('a')).map((edge) => edge.createdAt)
+			).toEqual([100, 200, 300]);
+			expect(store.edgesForSession(asSessionId('s1')).map((edge) => edge.createdAt)).toEqual([
+				100, 200, 300,
+			]);
+		});
+
+		it('returns zero when the session is unknown', () => {
+			// Given
+			const store = new EdgeStore();
+
+			// When
+			const removed = store.pruneSession(asSessionId('unknown'), retained('a'));
+
+			// Then
+			expect(removed).toBe(0);
+			expect(store.size()).toBe(0);
 		});
 	});
 

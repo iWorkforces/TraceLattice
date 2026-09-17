@@ -1,44 +1,52 @@
 /**
- * SessionManager — owns periodic session cleanup timer and TTL/LRU eviction logic.
- *
- * Extracted from HistoryManager. The session Map remains owned by HistoryManager
- * (passed by reference) so that public access patterns are preserved.
+ * Deterministic session cleanup candidate policy and periodic timer.
  *
  * @module SessionManager
  */
 
-import type { Logger } from '../logger/StructuredLogger.js';
-import { NullLogger } from '../logger/NullLogger.js';
 import type { SessionId } from '../contracts/ids.js';
+import { NullLogger } from '../logger/NullLogger.js';
+import type { Logger } from '../logger/StructuredLogger.js';
 
-/** Minimal session contract — anything with a `lastAccessedAt` timestamp and optional owner. */
+/** Minimal session facts needed by capacity and TTL policy. */
 export interface SessionLike {
-	lastAccessedAt: number;
-	/** Owner identifier for per-owner LRU quota. Undefined for stdio/global sessions. */
-	owner?: string;
+	readonly lastAccessedAt: number;
+	readonly owner?: string;
+	readonly provenance?: 'restored';
 }
 
-/** Configuration options for SessionManager. */
+/** Determines whether a candidate can be removed at this instant. */
+export type SessionEligibility<S extends SessionLike> = (
+	sessionId: SessionId,
+	session: S
+) => boolean;
+
+/** Configuration options for {@link SessionManager}. */
 export interface SessionManagerConfig {
-	/** Default session key that must never be evicted. */
-	defaultSessionId: string;
-	/** TTL for inactive sessions in milliseconds. */
-	sessionTtlMs: number;
-	/** Periodic cleanup interval in milliseconds. */
-	cleanupIntervalMs: number;
-	/** Returns the current MAX_SESSIONS limit (callable so tests can mutate). */
-	getMaxSessions: () => number;
-	/** Maximum sessions per owner (per-owner LRU bucket). @default 50 */
-	maxSessionsPerOwner?: number;
-	logger?: Logger;
+	readonly defaultSessionId: SessionId;
+	readonly sessionTtlMs: number;
+	readonly cleanupIntervalMs: number;
+	readonly getMaxSessions: () => number;
+	readonly maxSessionsPerOwner?: number;
+	readonly logger?: Logger;
 }
+
+type Candidate<S extends SessionLike> = {
+	readonly sessionId: SessionId;
+	readonly session: S;
+	readonly insertionOrder: number;
+};
 
 /**
- * Manages session lifecycle: periodic stale-session cleanup and LRU eviction
- * when the session count exceeds the configured maximum.
+ * Produces complete candidate sets but never mutates the caller-owned session map.
+ *
+ * @example
+ * ```ts
+ * const victims = manager.planProspectiveAdmission(sessions, owner, lifecycle.isIdle);
+ * ```
  */
 export class SessionManager<S extends SessionLike> {
-	private readonly _defaultSessionId: string;
+	private readonly _defaultSessionId: SessionId;
 	private readonly _sessionTtlMs: number;
 	private readonly _cleanupIntervalMs: number;
 	private readonly _getMaxSessions: () => number;
@@ -46,7 +54,7 @@ export class SessionManager<S extends SessionLike> {
 	private readonly _logger: Logger;
 	private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
-	constructor(config: SessionManagerConfig) {
+	public constructor(config: SessionManagerConfig) {
 		this._defaultSessionId = config.defaultSessionId;
 		this._sessionTtlMs = config.sessionTtlMs;
 		this._cleanupIntervalMs = config.cleanupIntervalMs;
@@ -55,117 +63,114 @@ export class SessionManager<S extends SessionLike> {
 		this._logger = config.logger ?? new NullLogger();
 	}
 
-	/** Returns the underlying cleanup timer (for test introspection). */
+	/** @returns The periodic cleanup timer, when active. */
 	public get timer(): ReturnType<typeof setInterval> | null {
 		return this._cleanupTimer;
 	}
 
 	/**
-	 * Starts the periodic session cleanup timer. No-op if already started.
-	 * The timer is unref'd so it does not block process exit.
+	 * Starts periodic TTL candidate cleanup and observes every asynchronous rejection.
 	 */
-	public startCleanupTimer(sessions: Map<SessionId, S>): void {
+	public startCleanupTimer(
+		sessions: Map<SessionId, S>,
+		isEligible: SessionEligibility<S>,
+		cleanup: (sessionIds: readonly SessionId[]) => Promise<void>
+	): void {
 		if (this._cleanupTimer !== null) return;
 		this._cleanupTimer = setInterval(() => {
-			this.cleanupStaleSessions(sessions);
+			const candidates = this.staleSessionCandidates(sessions, isEligible);
+			if (candidates.length === 0) return;
+			void Promise.resolve()
+				.then(() => cleanup(candidates))
+				.catch((error: unknown) => {
+					this._logger.error('Session cleanup failed', { error });
+				});
 		}, this._cleanupIntervalMs);
-		if (
-			this._cleanupTimer &&
-			typeof this._cleanupTimer === 'object' &&
-			'unref' in this._cleanupTimer
-		) {
+		if (typeof this._cleanupTimer === 'object' && 'unref' in this._cleanupTimer) {
 			this._cleanupTimer.unref();
 		}
 	}
 
-	/** Stops the periodic session cleanup timer. */
+	/** Stops the periodic cleanup timer. */
 	public stopCleanupTimer(): void {
-		if (this._cleanupTimer !== null) {
-			clearInterval(this._cleanupTimer);
-			this._cleanupTimer = null;
-		}
+		if (this._cleanupTimer === null) return;
+		clearInterval(this._cleanupTimer);
+		this._cleanupTimer = null;
 	}
 
 	/**
-	 * Evicts sessions that have been inactive longer than `sessionTtlMs`.
-	 * The default session is never evicted.
-	 */
-	public cleanupStaleSessions(sessions: Map<SessionId, S>): void {
-		const now = Date.now();
-		for (const [key, session] of sessions) {
-			if (key === this._defaultSessionId) continue;
-			if (now - session.lastAccessedAt > this._sessionTtlMs) {
-				sessions.delete(key);
-				this._logger.info('Evicted stale session', { sessionId: key });
-			}
-		}
-	}
-
-	/**
-	 * Evicts oldest sessions when the configured maximums are exceeded.
+	 * Plans the complete victim union required before admitting one prospective session.
 	 *
-	 * Two-stage policy:
-	 * 1. Per-owner LRU: each owner is capped at `maxSessionsPerOwner`. Sessions
-	 *    without an owner (stdio path) are exempt from per-owner quota.
-	 * 2. Global LRU cap: enforces overall `getMaxSessions()` limit.
-	 *
-	 * The default session is never evicted at either stage.
+	 * Owner quota need is selected first. Those victims also satisfy global need, then
+	 * oldest globally eligible alternatives fill any remainder. `undefined` means no
+	 * complete eligible set exists; the input map is never modified.
 	 */
-	public evictExcessSessions(sessions: Map<SessionId, S>): void {
-		this._evictPerOwnerOverflow(sessions);
-		this._evictGlobalOverflow(sessions);
+	public planProspectiveAdmission(
+		sessions: ReadonlyMap<SessionId, S>,
+		owner: string | undefined,
+		isEligible: SessionEligibility<S>
+	): readonly SessionId[] | undefined {
+		const live = this._orderedLiveCandidates(sessions);
+		const selected: Candidate<S>[] = [];
+		if (owner !== undefined) {
+			const ownerCount = live.filter((candidate) => candidate.session.owner === owner).length;
+			const ownerNeed = Math.max(0, ownerCount + 1 - this._maxSessionsPerOwner);
+			selected.push(
+				...live
+					.filter(
+						(candidate) =>
+							candidate.session.owner === owner &&
+							candidate.sessionId !== this._defaultSessionId &&
+							isEligible(candidate.sessionId, candidate.session)
+					)
+					.slice(0, ownerNeed)
+			);
+			if (selected.length < ownerNeed) return undefined;
+		}
+
+		const globalNeed = Math.max(0, live.length + 1 - this._getMaxSessions());
+		const remainingNeed = Math.max(0, globalNeed - selected.length);
+		const selectedIds = new Set(selected.map((candidate) => candidate.sessionId));
+		const alternatives = live.filter(
+			(candidate) =>
+				candidate.sessionId !== this._defaultSessionId &&
+				!selectedIds.has(candidate.sessionId) &&
+				isEligible(candidate.sessionId, candidate.session)
+		);
+		if (alternatives.length < remainingNeed) return undefined;
+		selected.push(...alternatives.slice(0, remainingNeed));
+		return selected.map((candidate) => candidate.sessionId);
 	}
 
-	/** Per-owner quota enforcement: oldest sessions per owner bucket are evicted. */
-	private _evictPerOwnerOverflow(sessions: Map<SessionId, S>): void {
-		const ownerCounts = new Map<string, number>();
-		for (const [key, session] of sessions) {
-			if (key === this._defaultSessionId) continue;
-			if (session.owner === undefined) continue;
-			ownerCounts.set(session.owner, (ownerCounts.get(session.owner) ?? 0) + 1);
-		}
-
-		const maxPerOwner = this._maxSessionsPerOwner;
-		for (const [owner, count] of ownerCounts) {
-			if (count <= maxPerOwner) continue;
-			const ownerSessions: Array<[SessionId, S]> = [];
-			for (const [key, session] of sessions) {
-				if (key === this._defaultSessionId) continue;
-				if (session.owner !== owner) continue;
-				ownerSessions.push([key, session]);
-			}
-			ownerSessions.sort(([, a], [, b]) => a.lastAccessedAt - b.lastAccessedAt);
-			const toEvict = count - maxPerOwner;
-			for (let i = 0; i < toEvict && i < ownerSessions.length; i++) {
-				const [evictKey] = ownerSessions[i]!;
-				sessions.delete(evictKey);
-				this._logger.info('Evicted oldest session (per-owner LRU)', {
-					sessionId: evictKey,
-					owner,
-				});
-			}
-		}
+	/** Returns stable oldest-first TTL candidates under the same eligibility rules. */
+	public staleSessionCandidates(
+		sessions: ReadonlyMap<SessionId, S>,
+		isEligible: SessionEligibility<S>,
+		now: number = Date.now()
+	): readonly SessionId[] {
+		return this._orderedLiveCandidates(sessions)
+			.filter(
+				(candidate) =>
+					candidate.sessionId !== this._defaultSessionId &&
+					now - candidate.session.lastAccessedAt > this._sessionTtlMs &&
+					isEligible(candidate.sessionId, candidate.session)
+			)
+			.map((candidate) => candidate.sessionId);
 	}
 
-	/** Global LRU cap enforcement: evicts oldest until under `getMaxSessions()`. */
-	private _evictGlobalOverflow(sessions: Map<SessionId, S>): void {
-		const max = this._getMaxSessions();
-		while (sessions.size > max) {
-			let oldestKey: SessionId | null = null;
-			let oldestTime = Infinity;
-			for (const [key, session] of sessions) {
-				if (key === this._defaultSessionId) continue;
-				if (session.lastAccessedAt < oldestTime) {
-					oldestTime = session.lastAccessedAt;
-					oldestKey = key;
-				}
+	private _orderedLiveCandidates(sessions: ReadonlyMap<SessionId, S>): Candidate<S>[] {
+		const candidates: Candidate<S>[] = [];
+		let insertionOrder = 0;
+		for (const [sessionId, session] of sessions) {
+			if (session.provenance !== 'restored') {
+				candidates.push({ sessionId, session, insertionOrder });
 			}
-			if (oldestKey !== null) {
-				sessions.delete(oldestKey);
-				this._logger.info('Evicted oldest session (global LRU)', { sessionId: oldestKey });
-			} else {
-				break;
-			}
+			insertionOrder += 1;
 		}
+		return candidates.sort(
+			(left, right) =>
+				left.session.lastAccessedAt - right.session.lastAccessedAt ||
+				left.insertionOrder - right.insertionOrder
+		);
 	}
 }

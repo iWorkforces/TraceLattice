@@ -8,7 +8,7 @@
  * @module contracts/suspension
  */
 
-import type { SessionId, SuspensionToken } from './ids.js';
+import type { SessionId, SuspensionToken, ThoughtId } from './ids.js';
 
 /**
  * A single pending tool-call suspension record.
@@ -24,6 +24,8 @@ export interface SuspensionRecord {
 	readonly sessionId: SessionId;
 	/** Thought number of the originating `tool_call` thought. */
 	readonly toolCallThoughtNumber: number;
+	/** Stable identity of the originating `tool_call` thought. */
+	readonly toolCallThoughtId: ThoughtId;
 	/** Name of the tool to invoke. */
 	readonly toolName: string;
 	/** Arguments supplied to the tool. */
@@ -47,6 +49,7 @@ export interface SuspensionRecord {
  * const rec = store.suspend({
  *   sessionId: 's1',
  *   toolCallThoughtNumber: 3,
+ *   toolCallThoughtId: 'thought-3',
  *   toolName: 'search',
  *   toolArguments: { q: 'foo' },
  *   expiresAt: Date.now() + 60_000,
@@ -73,6 +76,7 @@ export interface ISuspensionStore {
 	 * const rec = store.suspend({
 	 *   sessionId: 's1',
 	 *   toolCallThoughtNumber: 2,
+	 *   toolCallThoughtId: 'thought-2',
 	 *   toolName: 'search',
 	 *   toolArguments: {},
 	 *   ttlMs: 30_000,
@@ -81,7 +85,7 @@ export interface ISuspensionStore {
 	 * ```
 	 */
 	suspend(
-		record: Omit<SuspensionRecord, 'token' | 'createdAt'> & { ttlMs?: number },
+		record: Omit<SuspensionRecord, 'token' | 'createdAt'> & { ttlMs?: number }
 	): SuspensionRecord;
 
 	/**
@@ -104,6 +108,35 @@ export interface ISuspensionStore {
 	 * ```
 	 */
 	resume(token: string): SuspensionRecord | null;
+
+	/**
+	 * Atomically validate and admit one suspended continuation.
+	 *
+	 * Operations sharing a token are serialized. The record must exist, remain
+	 * unexpired, and belong to `expectedSessionId`. Session mismatches are
+	 * reported as not found without consuming the record. `admit` runs
+	 * synchronously inside the token critical section; the record is consumed
+	 * only after the callback returns successfully.
+	 *
+	 * @param token - Opaque continuation token returned from {@link suspend}.
+	 * @param expectedSessionId - Canonical session presenting the continuation.
+	 * @param admit - Synchronous history-admission callback.
+	 * @returns The admitted and consumed suspension record.
+	 * @throws {SuspensionNotFoundError} If the token is missing or belongs to another session.
+	 * @throws {SuspensionExpiredError} If the token expires at or before admission.
+	 *
+	 * @example
+	 * ```typescript
+	 * const record = await store.compareAndAdmit(token, sessionId, (candidate) => {
+	 *   history.addThought(observation, { toolInvocationSourceThoughtId: candidate.toolCallThoughtId });
+	 * });
+	 * ```
+	 */
+	compareAndAdmit(
+		token: SuspensionToken,
+		expectedSessionId: SessionId,
+		admit: (record: SuspensionRecord) => void
+	): Promise<SuspensionRecord>;
 
 	/**
 	 * Non-destructive lookup of a suspension by token.
@@ -148,6 +181,12 @@ export interface ISuspensionStore {
 	 * ```
 	 */
 	clearSession(sessionId: SessionId): void;
+
+	/**
+	 * Discard records from every session namespace.
+	 * Use only for a trusted process-wide reset; scoped callers must use `clearSession`.
+	 */
+	clearAll(): void;
 
 	/**
 	 * Count stored records.

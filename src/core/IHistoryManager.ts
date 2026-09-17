@@ -8,8 +8,32 @@
  */
 
 import type { IEdgeStore } from '../contracts/interfaces.js';
-import type { BranchId } from '../contracts/ids.js';
+import type { BranchId, SessionId, ThoughtId } from '../contracts/ids.js';
+import type { ThoughtReferenceResolution } from './ThoughtReferenceIndex.js';
 import type { ThoughtData } from './thought.js';
+
+/** Non-mutating view used to validate one operation before state admission. */
+export interface HistorySessionSnapshot {
+	readonly history: readonly ThoughtData[];
+	readonly branches: Readonly<Record<BranchId, readonly ThoughtData[]>>;
+	readonly branchIds: readonly BranchId[];
+	readonly availableMcpTools: readonly string[] | undefined;
+	readonly availableSkills: readonly string[] | undefined;
+}
+
+export interface ResolvedThoughtReferences {
+	readonly verificationTargetThoughtId?: ThoughtId;
+	readonly revisesThoughtId?: ThoughtId;
+	readonly branchFromThoughtId?: ThoughtId;
+	readonly synthesisSourceThoughtIds?: readonly ThoughtId[];
+	readonly mergeFromThoughtIds?: readonly ThoughtId[];
+	readonly backtrackTargetThoughtId?: ThoughtId;
+}
+
+export interface ThoughtAdmissionContext {
+	readonly resolvedReferences?: ResolvedThoughtReferences;
+	readonly toolInvocationSourceThoughtId?: ThoughtId;
+}
 
 /**
  * Interface for history and branch management.
@@ -49,7 +73,10 @@ export interface IHistoryManager {
 	 *
 	 * @param thought - The thought data to add
 	 */
-	addThought(thought: ThoughtData): void;
+	addThought(thought: ThoughtData, context?: ThoughtAdmissionContext): void;
+
+	/** Resolves a retained same-session numeric reference to stable thought identity. */
+	resolveThoughtReference(sessionId: SessionId, thoughtNumber: number): ThoughtReferenceResolution;
 
 	/**
 	 * Gets the complete thought history.
@@ -91,6 +118,27 @@ export interface IHistoryManager {
 	 * @param sessionId - Optional session ID to clear
 	 */
 	clear(sessionId?: string): void;
+
+	/** Awaitably clears one authorized live and durable session. */
+	resetSession(sessionId: string, clearAuxiliaryState?: () => void): Promise<void>;
+
+	/** Clears one session while the caller already owns its lifecycle exclusive. */
+	resetSessionWithinExclusive(
+		sessionId: SessionId,
+		clearAuxiliaryState?: () => void
+	): Promise<void>;
+
+	/** Awaitably clears every live and durable session from an ownerless context. */
+	resetAll(clearAuxiliaryState?: () => void): Promise<void>;
+
+	/** Clears every session while the caller already owns the global lifecycle exclusive. */
+	resetAllWithinExclusive(clearAuxiliaryState?: () => void): Promise<void>;
+
+	/** Returns a non-mutating session snapshot without creating or binding state. */
+	inspectSession(sessionId: string): HistorySessionSnapshot;
+
+	/** Returns the currently materialized session identifiers without binding ownership. */
+	getSessionIds(): string[];
 
 	/**
 	 * Gets the most recently available MCP tools from the session.

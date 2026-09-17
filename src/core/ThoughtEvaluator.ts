@@ -30,7 +30,11 @@ import { SignalComputer } from './evaluator/SignalComputer.js';
 class NoOpCalibrator implements ICalibrator {
 	public readonly enabled = false;
 
-	public calibrate(rawConfidence: number, _type: ThoughtType, _sessionId: SessionId): CalibrationResult {
+	public calibrate(
+		rawConfidence: number,
+		_type: ThoughtType,
+		_sessionId: SessionId
+	): CalibrationResult {
 		const raw = Math.min(1, Math.max(0, rawConfidence));
 		return { raw, calibrated: raw, temperature: 1.0, priorWeight: 0 };
 	}
@@ -59,6 +63,10 @@ class NoOpCalibrator implements ICalibrator {
 	public refit(_sessionId?: SessionId): void {
 		// no-op
 	}
+
+	public clearSession(_sessionId: SessionId): void {}
+
+	public clearAll(): void {}
 }
 
 /**

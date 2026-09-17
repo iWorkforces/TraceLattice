@@ -43,6 +43,7 @@ export interface CompressionDeps {
 	readonly historyManager: IHistoryManager;
 	readonly edgeStore: IEdgeStore;
 	readonly summaryStore: ISummaryStore;
+	readonly onSummaryCreated?: (summary: Summary) => void;
 	readonly logger?: Logger;
 }
 
@@ -90,6 +91,7 @@ export class CompressionService {
 		};
 
 		this._deps.summaryStore.add(summary);
+		this._deps.onSummaryCreated?.(summary);
 		this._deps.logger?.debug('compression.branch.compressed', {
 			sessionId,
 			branchId,

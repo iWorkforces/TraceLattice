@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ThoughtProcessor } from '../../core/ThoughtProcessor.js';
 import { ThoughtFormatter } from '../../core/ThoughtFormatter.js';
 import { ThoughtEvaluator } from '../../core/ThoughtEvaluator.js';
@@ -6,8 +6,7 @@ import { InMemorySuspensionStore } from '../../core/tools/InMemorySuspensionStor
 import { SequentialStrategy } from '../../core/reasoning/strategies/SequentialStrategy.js';
 import { MockHistoryManager, createMockToolRegistry } from '../helpers/factories.js';
 import type { FeatureFlags } from '../../contracts/features.js';
-import type { ThoughtData } from '../../core/thought.js';
-import { asSessionId, type SuspensionToken } from '../../contracts/ids.js';
+import { asSessionId, asThoughtId, type SuspensionToken } from '../../contracts/ids.js';
 
 function makeFeatures(overrides: Partial<FeatureFlags> = {}): FeatureFlags {
 	return {
@@ -24,7 +23,7 @@ function makeFeatures(overrides: Partial<FeatureFlags> = {}): FeatureFlags {
 
 function makeProcessor(
 	store: InMemorySuspensionStore,
-	features: FeatureFlags = makeFeatures(),
+	features: FeatureFlags = makeFeatures()
 ): { processor: ThoughtProcessor; history: MockHistoryManager } {
 	const history = new MockHistoryManager();
 	const processor = new ThoughtProcessor(
@@ -35,8 +34,8 @@ function makeProcessor(
 		new SequentialStrategy(),
 		undefined,
 		store,
-			createMockToolRegistry(['echo', 'test-tool', 'sleep', 'sum', 'add', 'search', 'fetch']),
-		features,
+		createMockToolRegistry(['echo', 'test-tool', 'sleep', 'sum', 'add', 'search', 'fetch']),
+		features
 	);
 	return { processor, history };
 }
@@ -46,6 +45,11 @@ describe('ThoughtProcessor — tool interleave', () => {
 
 	beforeEach(() => {
 		store = new InMemorySuspensionStore();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
 	});
 
 	it('tool_call returns a suspended envelope with continuation_token and tool metadata', async () => {
@@ -136,7 +140,7 @@ describe('ThoughtProcessor — tool interleave', () => {
 		expect(items[1]!.thought_type).toBe('tool_observation');
 	});
 
-	it('tool_observation attaches _resumedFrom referencing the tool_call thought_number', async () => {
+	it('tool_observation does not expose transient numeric resume metadata', async () => {
 		const { processor, history } = makeProcessor(store);
 		const callResult = await processor.process({
 			thought: 'invoke',
@@ -158,8 +162,8 @@ describe('ThoughtProcessor — tool interleave', () => {
 			continuation_token: token,
 		});
 
-		const obs = history.getHistory()[1] as ThoughtData & { _resumedFrom?: number };
-		expect(obs._resumedFrom).toBe(7);
+		const obs = history.getHistory()[1];
+		expect('_resumedFrom' in (obs ?? {})).toBe(false);
 	});
 
 	it('tool_observation with an unknown token returns SuspensionNotFoundError', async () => {
@@ -178,20 +182,19 @@ describe('ThoughtProcessor — tool interleave', () => {
 		expect(payload.error).toMatch(/Suspension token not found/);
 	});
 
-	it('tool_observation with an expired token returns SuspensionExpiredError', async () => {
-		// Manually seed an expired record in the store.
+	it('tool_observation expires at equality, removes the token, and then reports it missing', async () => {
+		vi.useFakeTimers({ now: new Date('2026-09-15T00:00:00.000Z') });
 		const expired = store.suspend({
 			sessionId: asSessionId('__global__'),
 			toolCallThoughtNumber: 1,
+			toolCallThoughtId: asThoughtId('expired-call'),
 			toolName: 'search',
 			toolArguments: {},
-			ttlMs: 1,
+			ttlMs: 100,
 			expiresAt: 0,
 		});
-		// Wait at least 2ms so peek sees expiresAt <= Date.now().
-		await new Promise((r) => setTimeout(r, 5));
-
-		const { processor } = makeProcessor(store);
+		vi.setSystemTime(expired.expiresAt);
+		const { processor, history } = makeProcessor(store);
 		const result = await processor.process({
 			thought: 'observed',
 			thought_number: 2,
@@ -203,6 +206,142 @@ describe('ThoughtProcessor — tool interleave', () => {
 		expect(result.isError).toBe(true);
 		const payload = JSON.parse(result.content[0]!.text);
 		expect(payload.error).toMatch(/Suspension token expired/);
+		expect(history.getHistory()).toHaveLength(0);
+		expect(store.size()).toBe(0);
+
+		const next = await processor.process({
+			thought: 'observed again',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			thought_type: 'tool_observation',
+			continuation_token: expired.token,
+		});
+		expect(JSON.parse(next.content[0]!.text).error).toMatch(/Suspension token not found/);
+	});
+
+	it('retains a valid token when history admission fails and admits exactly once on retry', async () => {
+		const { processor, history } = makeProcessor(store);
+		const callResult = await processor.process({
+			thought: 'invoke',
+			thought_number: 1,
+			total_thoughts: 2,
+			next_thought_needed: true,
+			thought_type: 'tool_call',
+			tool_name: 'search',
+			tool_arguments: {},
+		});
+		const token = JSON.parse(callResult.content[0]!.text).continuation_token as SuspensionToken;
+		const originalAddThought = history.addThought.bind(history);
+		const sentinel = new TypeError('controlled history admission failure');
+		vi.spyOn(history, 'addThought').mockImplementationOnce(() => {
+			throw sentinel;
+		});
+
+		const failed = await processor.process({
+			thought: 'first observation',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			thought_type: 'tool_observation',
+			continuation_token: token,
+		});
+
+		expect(failed.isError).toBe(true);
+		expect(JSON.parse(failed.content[0]!.text).error).toBe(sentinel.message);
+		expect(store.peek(token)).not.toBeNull();
+		expect(history.getHistory()).toHaveLength(1);
+
+		vi.mocked(history.addThought).mockImplementation(originalAddThought);
+		const retried = await processor.process({
+			thought: 'retry observation',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			thought_type: 'tool_observation',
+			continuation_token: token,
+		});
+		expect(retried.isError).toBeUndefined();
+		expect(
+			history.getHistory().filter((thought) => thought.thought_type === 'tool_observation')
+		).toHaveLength(1);
+		expect(store.size()).toBe(0);
+	});
+
+	it('admits one observation when two rightful attempts present the same token concurrently', async () => {
+		const { processor, history } = makeProcessor(store);
+		const callResult = await processor.process({
+			thought: 'invoke',
+			thought_number: 1,
+			total_thoughts: 2,
+			next_thought_needed: true,
+			thought_type: 'tool_call',
+			tool_name: 'search',
+			tool_arguments: {},
+		});
+		const token = JSON.parse(callResult.content[0]!.text).continuation_token as SuspensionToken;
+		const observation = (thought: string) =>
+			processor.process({
+				thought,
+				thought_number: 2,
+				total_thoughts: 2,
+				next_thought_needed: false,
+				thought_type: 'tool_observation',
+				continuation_token: token,
+			});
+
+		const results = await Promise.all([observation('first'), observation('second')]);
+		const payloads = results.map((result) => JSON.parse(result.content[0]!.text));
+
+		expect(results.filter((result) => result.isError !== true)).toHaveLength(1);
+		expect(payloads.filter((payload) => payload.code === 'SUSPENSION_NOT_FOUND')).toHaveLength(1);
+		expect(
+			history.getHistory().filter((thought) => thought.thought_type === 'tool_observation')
+		).toHaveLength(1);
+		expect(store.size()).toBe(0);
+	});
+
+	it('does not restore a consumed token when formatting fails after successful admission', async () => {
+		const { processor, history } = makeProcessor(store);
+		const callResult = await processor.process({
+			thought: 'invoke',
+			thought_number: 1,
+			total_thoughts: 2,
+			next_thought_needed: true,
+			thought_type: 'tool_call',
+			tool_name: 'search',
+			tool_arguments: {},
+		});
+		const token = JSON.parse(callResult.content[0]!.text).continuation_token as SuspensionToken;
+		const sentinel = new TypeError('controlled formatting failure');
+		vi.spyOn(ThoughtFormatter.prototype, 'formatThought').mockImplementationOnce(() => {
+			throw sentinel;
+		});
+
+		const failed = await processor.process({
+			thought: 'admitted before formatting',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			thought_type: 'tool_observation',
+			continuation_token: token,
+		});
+
+		expect(failed.isError).toBe(true);
+		expect(JSON.parse(failed.content[0]!.text).error).toBe(sentinel.message);
+		expect(history.getHistory()).toHaveLength(2);
+		expect(store.size()).toBe(0);
+
+		const replay = await processor.process({
+			thought: 'must not replay',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			thought_type: 'tool_observation',
+			continuation_token: token,
+		});
+		expect(JSON.parse(replay.content[0]!.text).code).toBe('SUSPENSION_NOT_FOUND');
+		expect(history.getHistory()).toHaveLength(2);
 	});
 
 	it('tool_call suspend single-uses the token (resume after consume returns NotFound)', async () => {
@@ -303,9 +442,8 @@ describe('ThoughtProcessor — tool interleave', () => {
 				'tool_call',
 				'tool_observation',
 			]);
-			// Both observations recorded their resume targets
-			expect((items[1] as ThoughtData & { _resumedFrom?: number })._resumedFrom).toBe(1);
-			expect((items[3] as ThoughtData & { _resumedFrom?: number })._resumedFrom).toBe(3);
+			expect('_resumedFrom' in (items[1] ?? {})).toBe(false);
+			expect('_resumedFrom' in (items[3] ?? {})).toBe(false);
 			// Both suspensions were consumed (single-use)
 			expect(store.size()).toBe(0);
 		});

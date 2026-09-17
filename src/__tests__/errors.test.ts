@@ -15,6 +15,9 @@ import {
 	SessionNotFoundError,
 	MaxSessionsReachedError,
 	PoolTerminatedError,
+	PersistenceCompatibilityError,
+	PersistenceUnavailableError,
+	SessionLifecycleClosedError,
 	ValidationError,
 } from '../errors.js';
 import { asSessionId } from '../contracts/ids.js';
@@ -189,11 +192,47 @@ describe('MaxSessionsReachedError', () => {
 	});
 });
 
+describe('SessionLifecycleClosedError', () => {
+	it('carries the closed session and lifecycle phase', () => {
+		// Given
+		const sessionId = asSessionId('closed-session');
+
+		// When
+		const error = new SessionLifecycleClosedError(sessionId, 'eviction_failed');
+
+		// Then
+		expect(error).toMatchObject({
+			name: 'SessionLifecycleClosedError',
+			code: 'SESSION_LIFECYCLE_CLOSED',
+			sessionId,
+			phase: 'eviction_failed',
+			message: "Session 'closed-session' lifecycle admission is closed in phase 'eviction_failed'",
+		});
+	});
+});
+
 describe('PoolTerminatedError', () => {
 	it('should create pool terminated error', () => {
 		const error = new PoolTerminatedError();
 		expect(error.message).toBe('ConnectionPool has been terminated');
 		expect(error.code).toBe('POOL_TERMINATED');
 		expect(error.name).toBe('PoolTerminatedError');
+	});
+});
+
+describe('Persistence startup errors', () => {
+	it('uses distinct stable codes when unavailable and incompatible failures differ', () => {
+		// Given
+		const sourcePath = '/data/snapshot.json';
+		const detail = 'unsupported schema';
+
+		// When
+		const unavailable = new PersistenceUnavailableError();
+		const compatibility = new PersistenceCompatibilityError(sourcePath, detail);
+
+		// Then
+		expect(unavailable.code).toBe('PERSISTENCE_UNAVAILABLE');
+		expect(compatibility.code).toBe('PERSISTENCE_COMPATIBILITY');
+		expect(unavailable.code).not.toBe(compatibility.code);
 	});
 });

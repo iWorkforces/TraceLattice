@@ -12,6 +12,7 @@ import { FilePersistence } from '../persistence/FilePersistence.js';
 import { HttpTransport } from '../transport/HttpTransport.js';
 import { SseTransport } from '../transport/SseTransport.js';
 import type { ThoughtData } from '../core/thought.js';
+import { asThoughtId } from '../contracts/ids.js';
 
 function createMetrics(): Metrics {
 	return new Metrics({ prefix: 'sequentialthinking' });
@@ -226,6 +227,7 @@ describe('Metrics Integration', () => {
 		const dataDir = await mkdtemp(join(tmpdir(), 'trace-lattice-metrics-'));
 		const persistence = new FilePersistence({ dataDir, metrics });
 		const thought: ThoughtData = {
+			id: asThoughtId('metrics-persisted-thought'),
 			thought: 'Persist me',
 			thought_number: 1,
 			total_thoughts: 1,
@@ -240,7 +242,7 @@ describe('Metrics Integration', () => {
 			'sequentialthinking_persistence_op_duration_seconds_count{operation="save_thought"} 1'
 		);
 		expect(snapshot).toContain(
-			'sequentialthinking_persistence_op_duration_seconds_count{operation="load_history"} 2'
+			'sequentialthinking_persistence_op_duration_seconds_count{operation="load_history"} 1'
 		);
 
 		await rm(dataDir, { recursive: true, force: true });
@@ -430,7 +432,9 @@ describe('Metrics Integration', () => {
 			metrics.counter('no_help', 1, {});
 
 			const snapshot = metrics.export();
-			expect(snapshot).toContain('# HELP sequentialthinking_no_help sequentialthinking_no_help metric');
+			expect(snapshot).toContain(
+				'# HELP sequentialthinking_no_help sequentialthinking_no_help metric'
+			);
 		});
 
 		it('should cover ?? fallback in gauge when help is undefined and no existing metric', () => {

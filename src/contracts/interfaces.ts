@@ -60,7 +60,6 @@ export interface DiscoveryCacheOptions {
 	metrics?: IMetrics;
 }
 
-
 /**
  * Outcome recording interface for calibration data collection.
  *
@@ -115,6 +114,12 @@ export interface IOutcomeRecorder {
 	 * Clear outcomes for a specific session.
 	 */
 	clearOutcomes(sessionId: SessionId): void;
+
+	/**
+	 * Discard outcomes from every session namespace.
+	 * Use only for a trusted process-wide reset; scoped callers must use `clearOutcomes`.
+	 */
+	clearAllOutcomes(): void;
 
 	/**
 	 * Whether outcome recording is currently enabled.
@@ -185,12 +190,30 @@ export interface IEdgeStore {
 	edgesForSession(sessionId: SessionId): readonly Edge[];
 
 	/**
+	 * Remove unless both endpoints are retained; leave other sessions untouched and delete empty containers.
+	 * @param sessionId - Session whose edges should be pruned
+	 * @param retainedThoughtIds - Union of all retained thought ids in the session
+	 * @returns The exact number of removed edges
+	 */
+	pruneSession(
+		sessionId: SessionId,
+		retainedThoughtIds: ReadonlySet<ThoughtId>,
+		retainedBranchThoughtIds?: ReadonlySet<ThoughtId>
+	): number;
+
+	/**
 	 * Clear all edges for a specific session.
 	 * Other sessions are unaffected.
 	 *
 	 * @param sessionId - Session to clear
 	 */
 	clearSession(sessionId: SessionId): void;
+
+	/**
+	 * Discard edges from every session namespace.
+	 * Use only for a trusted process-wide reset; scoped callers must use `clearSession`.
+	 */
+	clearAll(): void;
 
 	/**
 	 * Count edges.
@@ -244,8 +267,11 @@ export interface ISessionLock {
 	withLock<T>(
 		sessionId: SessionId | undefined,
 		fn: () => Promise<T>,
-		timeoutMs?: number,
+		timeoutMs?: number
 	): Promise<T>;
+
+	/** Whether the session currently has a holder or queued operation. */
+	isActive(sessionId: SessionId | undefined): boolean;
 
 	/** Number of currently held lock chains (diagnostics). */
 	readonly size: number;

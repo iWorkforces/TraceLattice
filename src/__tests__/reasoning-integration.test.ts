@@ -1,4 +1,4 @@
-import { asBranchId, type BranchId } from '../contracts/ids.js';
+import { asBranchId, GLOBAL_SESSION_ID, type BranchId, type SessionId } from '../contracts/ids.js';
 /**
  * Integration tests for the full reasoning pipeline.
  *
@@ -15,7 +15,8 @@ import { ThoughtFormatter } from '../core/ThoughtFormatter.js';
 import { ThoughtEvaluator } from '../core/ThoughtEvaluator.js';
 import { StructuredLogger } from '../logger/StructuredLogger.js';
 import type { ThoughtData } from '../core/thought.js';
-import type { IHistoryManager } from '../core/IHistoryManager.js';
+import type { HistorySessionSnapshot, IHistoryManager } from '../core/IHistoryManager.js';
+import { ThoughtReferenceIndex } from '../core/ThoughtReferenceIndex.js';
 import { createTestThought } from './helpers/factories.js';
 
 /**
@@ -27,9 +28,11 @@ class BranchAwareMockHistoryManager implements IHistoryManager {
 	private _branches: Record<string, ThoughtData[]> = {};
 	private _availableMcpTools: string[] | undefined;
 	private _availableSkills: string[] | undefined;
+	private readonly _referenceIndex = new ThoughtReferenceIndex();
 
 	addThought(thought: ThoughtData): void {
 		this._history.push(thought);
+		this._referenceIndex.add(thought.session_id ?? GLOBAL_SESSION_ID, thought);
 		if (thought.branch_id) {
 			if (!this._branches[thought.branch_id]) {
 				this._branches[thought.branch_id] = [];
@@ -42,6 +45,10 @@ class BranchAwareMockHistoryManager implements IHistoryManager {
 		if (thought.available_skills) {
 			this._availableSkills = thought.available_skills;
 		}
+	}
+
+	resolveThoughtReference(sessionId: SessionId, thoughtNumber: number) {
+		return this._referenceIndex.resolve(sessionId, thoughtNumber);
 	}
 
 	getHistory(): ThoughtData[] {
@@ -71,6 +78,35 @@ class BranchAwareMockHistoryManager implements IHistoryManager {
 		this._branches = {};
 		this._availableMcpTools = undefined;
 		this._availableSkills = undefined;
+		this._referenceIndex.clearAll();
+	}
+
+	async resetSession(): Promise<void> {
+		this.clear();
+	}
+	async resetSessionWithinExclusive(): Promise<void> {
+		this.clear();
+	}
+
+	async resetAll(): Promise<void> {
+		this.clear();
+	}
+	async resetAllWithinExclusive(): Promise<void> {
+		this.clear();
+	}
+
+	inspectSession(): HistorySessionSnapshot {
+		return {
+			history: [...this._history],
+			branches: { ...this._branches } as Record<BranchId, ThoughtData[]>,
+			branchIds: Object.keys(this._branches) as BranchId[],
+			availableMcpTools: this._availableMcpTools,
+			availableSkills: this._availableSkills,
+		};
+	}
+
+	getSessionIds(): string[] {
+		return ['__global__'];
 	}
 
 	getAvailableMcpTools(): string[] | undefined {

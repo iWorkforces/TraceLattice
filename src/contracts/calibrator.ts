@@ -89,4 +89,12 @@ export interface ICalibrator {
 	 * @param sessionId - Optional session id; omit to refit global state.
 	 */
 	refit(sessionId?: SessionId): void;
+	/**
+	 * Remove the fitted temperature for one session while preserving global state.
+	 *
+	 * @param sessionId - Session identifier whose fitted temperature is removed.
+	 */
+	clearSession(sessionId: SessionId): void;
+	/** Remove all fitted session and global temperatures. */
+	clearAll(): void;
 }

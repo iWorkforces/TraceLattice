@@ -10,6 +10,7 @@ vi.mock('node:os', () => ({
 
 import { readFileSync, existsSync } from 'node:fs';
 import { ConfigLoader } from '../config/ConfigLoader.js';
+import { ConfigurationError } from '../errors.js';
 
 const mockReadFileSync = readFileSync as unknown as ReturnType<typeof vi.fn>;
 const mockExistsSync = existsSync as unknown as ReturnType<typeof vi.fn>;
@@ -261,23 +262,21 @@ describe('ConfigLoader', () => {
 			expect(config!.maxHistorySize).toBe(999);
 		});
 
-		it('should ignore NaN values in numeric env vars', () => {
+		it('should reject non-numeric values in numeric env vars', () => {
 			process.env.MAX_HISTORY_SIZE = 'not-a-number';
 			loader = new ConfigLoader();
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue(JSON.stringify({ maxHistorySize: 100 }));
 
-			const config = loader.load();
-			expect(config!.maxHistorySize).toBe(100);
+			expect(() => loader.load()).toThrow(ConfigurationError);
 		});
 
-		it('should ignore Infinity values in numeric env vars', () => {
+		it('should reject Infinity values in numeric env vars', () => {
 			process.env.MAX_HISTORY_SIZE = 'Infinity';
 			loader = new ConfigLoader();
 			mockExistsSync.mockReturnValue(false);
 
-			const config = loader.load();
-			expect(config!.maxHistorySize).toBeUndefined();
+			expect(() => loader.load()).toThrow(ConfigurationError);
 		});
 	});
 
@@ -317,31 +316,28 @@ describe('ConfigLoader', () => {
 	});
 
 	describe('uncovered branch coverage', () => {
-		it('should ignore NaN MAX_BRANCH_SIZE from env', () => {
+		it('should reject NaN MAX_BRANCH_SIZE from env', () => {
 			process.env.MAX_BRANCH_SIZE = 'not-a-number';
 			loader = new ConfigLoader();
 			mockExistsSync.mockReturnValue(false);
 
-			const config = loader.load();
-			expect(config!.maxBranchSize).toBeUndefined();
+			expect(() => loader.load()).toThrow(ConfigurationError);
 		});
 
-		it('should ignore NaN DISCOVERY_CACHE_TTL from env', () => {
+		it('should reject NaN DISCOVERY_CACHE_TTL from env', () => {
 			process.env.DISCOVERY_CACHE_TTL = 'invalid';
 			loader = new ConfigLoader();
 			mockExistsSync.mockReturnValue(false);
 
-			const config = loader.load();
-			expect(config!.discoveryCache).toBeUndefined();
+			expect(() => loader.load()).toThrow(ConfigurationError);
 		});
 
-		it('should ignore NaN DISCOVERY_CACHE_MAX_SIZE from env', () => {
+		it('should reject NaN DISCOVERY_CACHE_MAX_SIZE from env', () => {
 			process.env.DISCOVERY_CACHE_MAX_SIZE = 'invalid';
 			loader = new ConfigLoader();
 			mockExistsSync.mockReturnValue(false);
 
-			const config = loader.load();
-			expect(config!.discoveryCache).toBeUndefined();
+			expect(() => loader.load()).toThrow(ConfigurationError);
 		});
 
 		it('should handle non-Error thrown during config parse', () => {
@@ -362,40 +358,36 @@ describe('ConfigLoader', () => {
 			consoleSpy.mockRestore();
 		});
 
-		it('should ignore Infinity MAX_BRANCHES from env', () => {
+		it('should reject Infinity MAX_BRANCHES from env', () => {
 			process.env.MAX_BRANCHES = 'Infinity';
 			loader = new ConfigLoader();
 			mockExistsSync.mockReturnValue(false);
 
-			const config = loader.load();
-			expect(config!.maxBranches).toBeUndefined();
+			expect(() => loader.load()).toThrow(ConfigurationError);
 		});
 
-		it('should ignore Infinity MAX_BRANCH_SIZE from env', () => {
+		it('should reject Infinity MAX_BRANCH_SIZE from env', () => {
 			process.env.MAX_BRANCH_SIZE = 'Infinity';
 			loader = new ConfigLoader();
 			mockExistsSync.mockReturnValue(false);
 
-			const config = loader.load();
-			expect(config!.maxBranchSize).toBeUndefined();
+			expect(() => loader.load()).toThrow(ConfigurationError);
 		});
 
-		it('should ignore Infinity DISCOVERY_CACHE_TTL from env', () => {
+		it('should reject Infinity DISCOVERY_CACHE_TTL from env', () => {
 			process.env.DISCOVERY_CACHE_TTL = 'Infinity';
 			loader = new ConfigLoader();
 			mockExistsSync.mockReturnValue(false);
 
-			const config = loader.load();
-			expect(config!.discoveryCache).toBeUndefined();
+			expect(() => loader.load()).toThrow(ConfigurationError);
 		});
 
-		it('should ignore Infinity DISCOVERY_CACHE_MAX_SIZE from env', () => {
+		it('should reject Infinity DISCOVERY_CACHE_MAX_SIZE from env', () => {
 			process.env.DISCOVERY_CACHE_MAX_SIZE = 'Infinity';
 			loader = new ConfigLoader();
 			mockExistsSync.mockReturnValue(false);
 
-			const config = loader.load();
-			expect(config!.discoveryCache).toBeUndefined();
+			expect(() => loader.load()).toThrow(ConfigurationError);
 		});
 	});
 });

@@ -24,6 +24,30 @@ describe('DiscoveryCache', () => {
 			expect(cache.get('tools')).toEqual(['Read', 'Write']);
 		});
 
+		it('should snapshot input arrays when storing data', () => {
+			// Given
+			const tools = ['Read'];
+			cache.set('tools', tools);
+
+			// When
+			tools.push('Write');
+
+			// Then
+			expect(cache.get('tools')).toEqual(['Read']);
+		});
+
+		it('should return caller-owned arrays when retrieving data', () => {
+			// Given
+			cache.set('tools', ['Read']);
+			const firstRead = cache.get('tools');
+
+			// When
+			firstRead?.push('Write');
+
+			// Then
+			expect(cache.get('tools')).toEqual(['Read']);
+		});
+
 		it('should return false for missing keys with has()', () => {
 			expect(cache.has('missing')).toBe(false);
 		});
@@ -376,7 +400,6 @@ describe('DiscoveryCache', () => {
 			expect(stats.size).toBe(1);
 			expect(stats.keys).toEqual(['a']);
 		});
-
 	});
 
 	describe('uncovered branch coverage', () => {

@@ -15,6 +15,17 @@ describe('ServerConfig', () => {
 			expect(config.discoveryCache).toEqual({ ttl: 300000, maxSize: 100 });
 			expect(config.persistence).toEqual({ enabled: false, backend: 'memory' });
 			expect(config.skillDirs).toHaveLength(2);
+			expect(config.features).toEqual({
+				dagEdges: true,
+				reasoningStrategy: 'sequential',
+				calibration: true,
+				compression: true,
+				toolInterleave: true,
+				newThoughtTypes: true,
+				outcomeRecording: true,
+			});
+			expect(config.toolInterleaveTtlMs).toBe(60000);
+			expect(config.toolInterleaveSweepMs).toBe(60000);
 		});
 	});
 
