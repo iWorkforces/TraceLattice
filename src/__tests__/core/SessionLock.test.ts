@@ -6,7 +6,7 @@
 import { asSessionId, GLOBAL_SESSION_ID } from '../../contracts/ids.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SessionLock } from '../../core/SessionLock.js';
-import { LockTimeoutError } from '../../errors.js';
+import { LockTimeoutError } from '../../core/SessionErrors.js';
 
 describe('SessionLock', () => {
 	let lock: SessionLock;
