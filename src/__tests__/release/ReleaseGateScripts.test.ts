@@ -20,7 +20,7 @@ const packageManifestSchema = v.object({
 const expectedReleaseScripts = {
 	'test:native':
 		'vitest run --config vitest.config.ts src/__tests__/integration/NativeSqliteConformance.test.ts',
-	'verify:library': 'npm run type-check && npm run lint && npm run test:coverage && npm run build',
+	'verify:library': 'npm run type-check && npm run lint && npm run build && npm run test:coverage',
 	'verify:native': 'npm ls better-sqlite3@13.0.3 --depth=0 && npm run test:native',
 	'verify:packed': 'node scripts/verify-packed-cli.mjs',
 	'verify:release': 'npm run verify:library && npm run verify:native && npm run verify:packed',
