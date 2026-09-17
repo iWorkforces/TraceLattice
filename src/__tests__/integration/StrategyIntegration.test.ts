@@ -50,7 +50,7 @@ describe('Strategy Integration (ThoughtProcessor + SequentialStrategy)', () => {
 		logger = new NullLogger();
 	});
 
-	it('omits strategy_hint for ongoing thoughts (next_thought_needed=true)', async () => {
+	it('emits strategy_hint with action=continue for ongoing thoughts', async () => {
 		const processor = new ThoughtProcessor(
 			history,
 			formatter,
@@ -69,7 +69,7 @@ describe('Strategy Integration (ThoughtProcessor + SequentialStrategy)', () => {
 		);
 
 		const parsed = parseResponse(result.content[0]!.text);
-		expect(parsed).not.toHaveProperty('strategy_hint');
+		expect(parsed.strategy_hint).toEqual({ action: 'continue' });
 		expect(parsed.next_thought_needed).toBe(true);
 	});
 
@@ -149,11 +149,11 @@ describe('Strategy Integration (ThoughtProcessor + SequentialStrategy)', () => {
 		const ongoingParsed = parseResponse(ongoing.content[0]!.text);
 		const terminalParsed = parseResponse(terminal.content[0]!.text);
 
-		expect(ongoingParsed).not.toHaveProperty('strategy_hint');
+		expect(ongoingParsed.strategy_hint).toEqual({ action: 'continue' });
 		expect(terminalParsed.strategy_hint?.action).toBe('terminate');
 	});
 
-	it('does NOT emit a branch hint for branch thoughts (SequentialStrategy delegates)', async () => {
+	it('emits a continue hint for branch thoughts when SequentialStrategy delegates', async () => {
 		const processor = new ThoughtProcessor(
 			history,
 			formatter,
@@ -185,10 +185,10 @@ describe('Strategy Integration (ThoughtProcessor + SequentialStrategy)', () => {
 
 		const parsed = parseResponse(branchResult.content[0]!.text);
 		// SequentialStrategy.decide() returns 'continue' regardless of branch_id.
-		expect(parsed).not.toHaveProperty('strategy_hint');
+		expect(parsed.strategy_hint).toEqual({ action: 'continue' });
 	});
 
-	it('emits strategy_hint only on the terminal thought in a multi-thought sequence', async () => {
+	it('emits strategy_hint for each successful decision in a multi-thought sequence', async () => {
 		const processor = new ThoughtProcessor(
 			history,
 			formatter,
@@ -226,8 +226,8 @@ describe('Strategy Integration (ThoughtProcessor + SequentialStrategy)', () => {
 		const p2 = parseResponse(r2.content[0]!.text);
 		const p3 = parseResponse(r3.content[0]!.text);
 
-		expect(p1).not.toHaveProperty('strategy_hint');
-		expect(p2).not.toHaveProperty('strategy_hint');
+		expect(p1.strategy_hint).toEqual({ action: 'continue' });
+		expect(p2.strategy_hint).toEqual({ action: 'continue' });
 		expect(p3.strategy_hint?.action).toBe('terminate');
 	});
 
@@ -259,8 +259,7 @@ describe('Strategy Integration (ThoughtProcessor + SequentialStrategy)', () => {
 		expect(parsed).toHaveProperty('confidence_signals');
 		expect(parsed).toHaveProperty('reasoning_stats');
 
-		// Strategy/warning enrichment keys must NOT appear for a clean ongoing thought.
-		expect(parsed).not.toHaveProperty('strategy_hint');
+		expect(parsed.strategy_hint).toEqual({ action: 'continue' });
 		expect(parsed).not.toHaveProperty('warnings');
 	});
 
@@ -286,8 +285,6 @@ describe('Strategy Integration (ThoughtProcessor + SequentialStrategy)', () => {
 			new ThrowingStrategy()
 		);
 
-		// Even on terminal thought, throwing strategy must degrade to 'continue'
-		// — i.e. NO strategy_hint emitted, response still produced normally.
 		const result = await processor.process(
 			createTestThought({
 				thought: 'terminal but strategy throws',

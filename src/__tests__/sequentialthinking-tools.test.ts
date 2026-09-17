@@ -1,13 +1,14 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { StepRecommendation } from '../core/step.js';
 import type { ThoughtData } from '../core/thought.js';
-import type { ToolAwareSequentialThinkingServer} from '../lib.js';
+import type { ToolAwareSequentialThinkingServer } from '../lib.js';
 import { createServer } from '../lib.js';
 import type { SkillRecommendation } from '../types/skill.js';
 import type { ToolRecommendation } from '../types/tool.js';
 import { asSessionId } from '../contracts/ids.js';
 
 import { asBranchId } from '../contracts/ids.js';
+import type { StrategyDecision } from '../contracts/strategy.js';
 /**
  * Helper function for creating test thoughts with minimal required fields
  */
@@ -73,6 +74,7 @@ function parseProcessThoughtResult(result: unknown): {
 	current_step?: StepRecommendation;
 	previous_steps?: StepRecommendation[];
 	remaining_steps?: string[];
+	strategy_hint?: StrategyDecision;
 	error?: string;
 	status?: string;
 } {
@@ -103,7 +105,28 @@ describe('tracelattice MCP Tool', () => {
 			expect(response.thought_history_length).toBe(1);
 		});
 
-		it('1.2 Full Field Thought Processing - should validate all fields are properly processed and returned', async () => {
+		it('1.2 Ongoing Thought Processing - should expose the continue strategy decision without generating another thought', async () => {
+			// Given
+			const thought = createTestThought({
+				thought_number: 2,
+				total_thoughts: 4,
+				next_thought_needed: true,
+			});
+
+			// When
+			const result = await server.processThought(thought);
+			const response = parseProcessThoughtResult(result);
+
+			// Then
+			expect(response.thought_number).toBe(2);
+			expect(response.total_thoughts).toBe(4);
+			expect(response.next_thought_needed).toBe(true);
+			expect(response.thought_history_length).toBe(1);
+			expect(response.strategy_hint?.action).toBe('continue');
+			expect(server.history.getHistoryLength()).toBe(1);
+		});
+
+		it('1.3 Full Field Thought Processing - should validate all fields are properly processed and returned', async () => {
 			const thought = createTestThought({
 				available_mcp_tools: ['tool1', 'tool2'],
 				available_skills: ['skill1', 'skill2'],
@@ -138,7 +161,7 @@ describe('tracelattice MCP Tool', () => {
 			expect(response.remaining_steps).toEqual(['Step 1', 'Step 2']);
 		});
 
-		it('1.3 Optional Fields Omission - should ensure optional fields can be omitted without errors', async () => {
+		it('1.4 Optional Fields Omission - should ensure optional fields can be omitted without errors', async () => {
 			// Test with various combinations of omitted optional fields
 			const thought1 = createTestThought({ next_thought_needed: undefined });
 			const result1 = await server.processThought(thought1);

@@ -8,10 +8,10 @@ import { asBranchId } from '../../contracts/ids.js';
  * processed thoughts.
  *
  * Scenarios covered:
- *   a. Single thought  → no strategy_hint (frontier empty → continue)
+ *   a. Single thought  → continue hint (frontier empty)
  *   b. High-confidence frontier → terminate with reason 'confidence threshold'
  *   c. Wide frontier (branches) → branch hint emitted when current is outside beam
- *   d. Flag-off (SequentialStrategy) → no strategy_hint for ongoing thoughts
+ *   d. Flag-off (SequentialStrategy) → continue hint for ongoing thoughts
  *   e. Plateau across low-score thoughts → terminate with reason 'plateau'
  *   f. Strategy throws → graceful degradation: response intact, no strategy_hint
  */
@@ -89,7 +89,7 @@ describe('TreeOfThoughtStrategy Integration (ThoughtProcessor + ToT + DAG)', () 
 	});
 
 	// ---- Scenario (a) -----------------------------------------------------
-	it('omits strategy_hint for a single thought (empty frontier → continue)', async () => {
+	it('emits a continue strategy_hint for a single thought with an empty frontier', async () => {
 		const processor = new ThoughtProcessor(
 			manager,
 			formatter,
@@ -110,7 +110,7 @@ describe('TreeOfThoughtStrategy Integration (ThoughtProcessor + ToT + DAG)', () 
 
 		const parsed = parseResponse(result.content[0]!.text);
 		// Single thought → no edges yet → graph.leaves() === [] → action=continue.
-		expect(parsed).not.toHaveProperty('strategy_hint');
+		expect(parsed.strategy_hint).toEqual({ action: 'continue', nextHint: 'explore frontier' });
 		expect(parsed.thought_number).toBe(1);
 		expect(parsed.next_thought_needed).toBe(true);
 	});
@@ -228,7 +228,7 @@ describe('TreeOfThoughtStrategy Integration (ThoughtProcessor + ToT + DAG)', () 
 	});
 
 	// ---- Scenario (d) -----------------------------------------------------
-	it('with SequentialStrategy (flag-off equivalent) emits no strategy_hint for ongoing thoughts', async () => {
+	it('with SequentialStrategy (flag-off equivalent) emits continue hints for ongoing thoughts', async () => {
 		const processor = new ThoughtProcessor(
 			manager,
 			formatter,
@@ -262,8 +262,8 @@ describe('TreeOfThoughtStrategy Integration (ThoughtProcessor + ToT + DAG)', () 
 
 		// SequentialStrategy never terminates while next_thought_needed=true,
 		// regardless of frontier scores that would have tripped ToT termination.
-		expect(parseResponse(r1.content[0]!.text)).not.toHaveProperty('strategy_hint');
-		expect(parseResponse(r2.content[0]!.text)).not.toHaveProperty('strategy_hint');
+		expect(parseResponse(r1.content[0]!.text).strategy_hint).toEqual({ action: 'continue' });
+		expect(parseResponse(r2.content[0]!.text).strategy_hint).toEqual({ action: 'continue' });
 	});
 
 	// ---- Scenario (e) -----------------------------------------------------
@@ -362,8 +362,6 @@ describe('TreeOfThoughtStrategy Integration (ThoughtProcessor + ToT + DAG)', () 
 
 		expect(result.isError).toBeUndefined();
 		const parsed = parseResponse(result.content[0]!.text);
-		// Strategy threw → ThoughtProcessor swallows + returns { action: 'continue' }.
-		// 'continue' is NOT spread into the response, so no strategy_hint key.
 		expect(parsed).not.toHaveProperty('strategy_hint');
 		expect(parsed.thought_number).toBe(1);
 		expect(parsed.next_thought_needed).toBe(false);

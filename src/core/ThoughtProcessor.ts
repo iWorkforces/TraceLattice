@@ -78,7 +78,7 @@ type ProcessedThoughtResponseState = {
 		readonly reasoningStats: ReasoningStatsResult;
 		readonly reasoningHints: readonly string[];
 	};
-	readonly decision: StrategyDecision;
+	readonly decision: StrategyDecision | undefined;
 	readonly warnings: readonly string[];
 };
 
@@ -592,7 +592,7 @@ export class ThoughtProcessor {
 							...(state.reasoning.reasoningHints.length > 0 && {
 								reasoning_hints: state.reasoning.reasoningHints,
 							}),
-							...(state.decision.action !== 'continue' && { strategy_hint: state.decision }),
+							...(state.decision !== undefined && { strategy_hint: state.decision }),
 							...(state.warnings.length > 0 && { warnings: state.warnings.slice(0, 3) }),
 							...(state.exposeSessionId ? { session_id: state.sessionId } : {}),
 						},
@@ -606,7 +606,7 @@ export class ThoughtProcessor {
 
 	/**
 	 * Run the configured reasoning strategy and return its decision.
-	 * Strategy errors degrade to `{ action: 'continue' }`.
+	 * Strategy errors omit the decision from the public response.
 	 * @private
 	 */
 	private _runStrategy(
@@ -614,8 +614,8 @@ export class ThoughtProcessor {
 		history: ThoughtData[],
 		stats: ReturnType<ThoughtEvaluator['computeReasoningStats']>,
 		sessionId?: SessionId
-	): StrategyDecision {
-		let decision: StrategyDecision;
+	): StrategyDecision | undefined {
+		let decision: StrategyDecision | undefined;
 		try {
 			const edgeStore = this._getEdgeStore();
 			const graph = edgeStore ? new GraphView(edgeStore) : undefined;
@@ -627,17 +627,16 @@ export class ThoughtProcessor {
 				currentThought,
 			});
 		} catch (error) {
-			this._logger.warn('Reasoning strategy threw — defaulting to continue', {
+			this._logger.warn('Reasoning strategy threw — omitting strategy hint', {
 				strategy: this.strategy.name,
 				error: getErrorMessage(error),
 			});
-			decision = { action: 'continue' };
 		}
 
 		// Auto-compression trigger: when strategy terminates a branch and
 		// compression is enabled, summarize the branch subtree. Compression
 		// failures must NEVER break the thought pipeline.
-		if (decision.action === 'terminate' && this._compressionService && currentThought.branch_id) {
+		if (decision?.action === 'terminate' && this._compressionService && currentThought.branch_id) {
 			try {
 				const sid = sessionId ?? GLOBAL_SESSION_ID;
 				const branchRoot = this._findBranchRoot(sid, currentThought.branch_id);
