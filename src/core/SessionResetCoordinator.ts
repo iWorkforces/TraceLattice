@@ -2,9 +2,9 @@ import type { PersistenceBackend } from '../contracts/PersistenceBackend.js';
 import type { IEdgeStore } from '../contracts/interfaces.js';
 import type { SessionId } from '../contracts/ids.js';
 import type { ISummaryStore } from '../contracts/summary.js';
-import { AsyncResetRequiredError } from '../errors.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import { requireSessionScopedPersistence } from '../persistence/SessionScopedPersistence.js';
+import { AsyncResetRequiredError } from './SessionErrors.js';
 
 interface ResetBarrier {
 	withSessionResetBarrier(sessionId: SessionId, operation: () => Promise<void>): Promise<void>;
