@@ -11,17 +11,16 @@ import {
 	InvalidThoughtError,
 	SkillDiscoveryError,
 	HistoryLimitExceededError,
-	SessionNotActiveError,
-	SessionNotFoundError,
 	MaxSessionsReachedError,
 	PoolTerminatedError,
 	PersistenceCompatibilityError,
 	PersistenceUnavailableError,
-	SessionLifecycleClosedError,
 	ValidationError,
 } from '../errors.js';
 import { asSessionId } from '../contracts/ids.js';
 import type { ErrorCode } from '../errors.js';
+import { SessionLifecycleClosedError } from '../core/SessionErrors.js';
+import { SessionNotActiveError, SessionNotFoundError } from '../pool/PoolErrors.js';
 
 describe('Custom Error Types', () => {
 	describe('SequentialThinkingError', () => {
