@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { ServerConfig } from '../ServerConfig.js';
 import { ConfigurationError } from '../errors.js';
@@ -14,7 +16,8 @@ describe('ServerConfig', () => {
 			expect(config.persistenceMaxRetries).toBe(3);
 			expect(config.discoveryCache).toEqual({ ttl: 300000, maxSize: 100 });
 			expect(config.persistence).toEqual({ enabled: false, backend: 'memory' });
-			expect(config.skillDirs).toHaveLength(2);
+			expect(config.skillDirs).toHaveLength(4);
+			expect(config.toolDirs).toHaveLength(2);
 			expect(config.features).toEqual({
 				dagEdges: true,
 				reasoningStrategy: 'sequential',
@@ -227,8 +230,35 @@ describe('ServerConfig', () => {
 
 		it('should use default skillDirs when undefined', () => {
 			const config = new ServerConfig();
-			expect(config.skillDirs).toHaveLength(2);
-			expect(config.skillDirs[0]).toBe('.claude/skills');
+			expect(config.skillDirs).toEqual([
+				'.claude/skills',
+				join(homedir(), '.claude/skills'),
+				'.agents/skills',
+				join(homedir(), '.agents/skills'),
+			]);
+		});
+
+		it('should preserve explicit empty skillDirs', () => {
+			const config = new ServerConfig({ skillDirs: [] });
+			expect(config.skillDirs).toEqual([]);
+		});
+	});
+
+	describe('toolDirs', () => {
+		it('should use provided toolDirs', () => {
+			const config = new ServerConfig({ toolDirs: ['/a', '/b'] });
+			expect(config.toolDirs).toEqual(['/a', '/b']);
+		});
+
+		it('should use default toolDirs when undefined', () => {
+			const config = new ServerConfig();
+			expect(config.toolDirs).toHaveLength(2);
+			expect(config.toolDirs[0]).toBe('.claude/tools');
+		});
+
+		it('should preserve explicit empty toolDirs', () => {
+			const config = new ServerConfig({ toolDirs: [] });
+			expect(config.toolDirs).toEqual([]);
 		});
 	});
 
@@ -278,11 +308,17 @@ describe('ServerConfig', () => {
 		});
 
 		it('should throw for invalid backend type', () => {
-			expect(() =>
-				new ServerConfig({ persistence: { enabled: true, backend: 'redis' as 'file' | 'sqlite' | 'memory' } })
+			expect(
+				() =>
+					new ServerConfig({
+						persistence: { enabled: true, backend: 'redis' as 'file' | 'sqlite' | 'memory' },
+					})
 			).toThrow(ConfigurationError);
-			expect(() =>
-				new ServerConfig({ persistence: { enabled: true, backend: 'redis' as 'file' | 'sqlite' | 'memory' } })
+			expect(
+				() =>
+					new ServerConfig({
+						persistence: { enabled: true, backend: 'redis' as 'file' | 'sqlite' | 'memory' },
+					})
 			).toThrow('file, sqlite, memory');
 		});
 
@@ -303,12 +339,15 @@ describe('ServerConfig', () => {
 				maxHistorySize: 500,
 				maxBranches: 25,
 				maxBranchSize: 200,
+				skillDirs: [],
+				toolDirs: [],
 			});
 			const json = config.toJSON();
 			expect(json.maxHistorySize).toBe(500);
 			expect(json.maxBranches).toBe(25);
 			expect(json.maxBranchSize).toBe(200);
-			expect(json.skillDirs).toBeDefined();
+			expect(json.skillDirs).toEqual([]);
+			expect(json.toolDirs).toEqual([]);
 			expect(json.discoveryCache).toBeDefined();
 			expect(json.persistence).toBeDefined();
 			expect(json.persistenceBufferSize).toBeDefined();
@@ -324,6 +363,7 @@ describe('ServerConfig', () => {
 				maxBranches: 25,
 				maxBranchSize: 200,
 				skillDirs: ['/a'],
+				toolDirs: ['/b'],
 				discoveryCache: { ttl: 1000, maxSize: 50 },
 				persistence: { enabled: true, backend: 'file', options: { dataDir: './data' } },
 				persistenceBufferSize: 50,
@@ -335,6 +375,7 @@ describe('ServerConfig', () => {
 			expect(config.maxBranches).toBe(25);
 			expect(config.maxBranchSize).toBe(200);
 			expect(config.skillDirs).toEqual(['/a']);
+			expect(config.toolDirs).toEqual(['/b']);
 			expect(config.discoveryCache).toEqual({ ttl: 1000, maxSize: 50 });
 			expect(config.persistence.enabled).toBe(true);
 			expect(config.persistence.backend).toBe('file');
