@@ -1,51 +1,48 @@
-# TOOLS MODULE
+# TOOLS
 
 **Parent:** ../AGENTS.md
 
 ## OVERVIEW
 
-Tool interleave subsystem. Single file. Implements the suspend/resume flow that lets `ThoughtProcessor` pause a thinking chain on a `tool_call` thought and resume it after the LLM receives the tool result. Gated by the `toolInterleave` feature flag.
+`tool_call` suspend / `tool_observation` resume. One impl: `InMemorySuspensionStore`.
+
+`toolInterleave` gates the **write path**. Store is registered in DI **only if the flag is on** — exception to “stores always registered”.
 
 ## STRUCTURE
 
 ```
 tools/
-└── InMemorySuspensionStore.ts  # ISuspensionStore impl: TTL expiry + background sweep timer (150L)
+└── InMemorySuspensionStore.ts
 ```
 
-`ISuspensionStore` contract lives in `src/contracts/suspension.ts` (8 methods).
+Contract: `src/contracts/suspension.ts`.
 
-## SUSPEND / RESUME FLOW
+## ISUSPENSIONSTORE
 
-1. `ThoughtProcessor` receives a `tool_call` thought → calls `store.suspend(token, record)`
-2. Returns suspension token to LLM
-3. LLM executes the tool, then submits a `tool_observation` thought with the token
-4. `ThoughtProcessor` calls `store.resume(token)` → retrieves `SuspensionRecord` → continues
+| Method | Behavior |
+|--------|----------|
+| `suspend` | mint token + `createdAt`; TTL → `expiresAt` |
+| `resume(token)` | consume; **returns `null`** (unknown or expired). Caller throws. |
+| `peek(token)` | non-destructive; **returns `null`** if missing. Does not reap. Caller throws. |
+| `compareAndAdmit` | throws `SuspensionNotFoundError` / `SuspensionExpiredError`. Session mismatch = **not-found, no consume**. |
+| `expireOlderThan(now)` | bulk reap. **Not** `expire(token)`. |
+| `clearSession` / `clearAll` / `size` | session or global |
+| `start` / `stop` | sweep timer |
 
-## INTERFACE
+## DEFAULTS
 
-`ISuspensionStore` (8 methods: `suspend`, `resume`, `peek`, `expire`, `clearSession`, `size`, `start`, `stop`):
+- TTL **300_000** ms.
+- Sweep **60_000** ms.
+- Per-record TTL, not per-session.
 
-- `suspend(token, record)` — stores a `SuspensionRecord` keyed by `SuspensionToken`
-- `resume(token)` — retrieves and removes; throws `SuspensionNotFoundError` or `SuspensionExpiredError`
-- `peek(token)` — read-only check without removing
-- `expire(token)` — manually expire before TTL
-- `start()` / `stop()` — lifecycle for the background sweep timer
+## FLOW
 
-## KEY TYPES
+1. Processor `tool_call` → `suspend` → token envelope (no evaluate/strategy).
+2. `tool_observation` + token → `compareAndAdmit` (serialized per token).
+3. `admit` runs inside the critical section; consume only after success.
 
-| Type | Location | Notes |
-|------|----------|-------|
-| `ISuspensionStore` | `src/contracts/suspension.ts` | Interface — 8 methods |
-| `SuspensionRecord` | `src/contracts/suspension.ts` | token, sessionId, toolCallThoughtNumber, toolName, toolArguments, timestamps |
-| `SuspensionToken` | `src/contracts/ids.ts` | Branded string; construct via `generateSuspensionToken()` |
-| `SuspensionNotFoundError` | `src/errors.ts` | Code: `SUSPENSION_NOT_FOUND` |
-| `SuspensionExpiredError` | `src/errors.ts` | Code: `SUSPENSION_EXPIRED` |
-| `InvalidToolCallError` | `src/errors.ts` | Code: `INVALID_TOOL_CALL` — thrown for malformed tool_call thoughts |
+## ANTI-PATTERNS
 
-## NOTES
-
-- Default TTL: `300_000` ms (5 min). Default sweep interval: `60_000` ms (1 min).
-- TTL is per-record, not per-session. Expired records are reaped by the background sweep.
-- `toolInterleave` feature flag gates the write path only. `ISuspensionStore` is always registered in DI so reads stay safe when the flag is off.
-- Never catch `SuspensionExpiredError` silently upstream — let it surface so the LLM knows the chain is stale.
+- Do **not** treat `resume`/`peek` null as an exception from the store.
+- **Never silently catch `SuspensionExpiredError`** — surface it.
+- Do not register this store when `toolInterleave` is off.
