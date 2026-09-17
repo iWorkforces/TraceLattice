@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -12,6 +12,10 @@ type FixtureCase = {
 	readonly mutate: (root: string, manifest: FixtureManifest) => Promise<void>;
 };
 type ProcessResult = { readonly code: number | null; readonly stderr: string };
+type VerifierOptions = {
+	readonly loader?: string;
+	readonly env?: NodeJS.ProcessEnv;
+};
 
 const verifier = fileURLToPath(new URL('../../../scripts/verify-packed-cli.mjs', import.meta.url));
 const cleanupModuleUrl = new URL('../../../scripts/packed-cli-cleanup.mjs', import.meta.url).href;
@@ -163,12 +167,16 @@ async function createFixture(fixtureCase: FixtureCase): Promise<string> {
 	return root;
 }
 
-async function runVerifier(packageDirectory: string, loader?: string): Promise<ProcessResult> {
+async function runVerifier(
+	packageDirectory: string,
+	{ loader, env }: VerifierOptions = {}
+): Promise<ProcessResult> {
 	const nodeArguments = loader
 		? ['--experimental-loader', loader, verifier, '--package-dir', packageDirectory]
 		: [verifier, '--package-dir', packageDirectory];
 	const child = spawn(process.execPath, nodeArguments, {
 		stdio: ['ignore', 'ignore', 'pipe'],
+		env,
 	});
 	let stderr = '';
 	child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
@@ -218,8 +226,13 @@ describe('packed CLI artifact contract', () => {
 					cliBody.replace("serverInfo: { name: 'tracelattice'", "serverInfo: { name: 'wrong-name'")
 				),
 		});
+		const runtimeRoot = await mkdtemp(join(tmpdir(), 'tracelattice-bun-runtime-'));
+		temporaryRoots.push(runtimeRoot);
+		await symlink(process.execPath, join(runtimeRoot, 'bun'));
 		// When
-		const result = await runVerifier(packageDirectory);
+		const result = await runVerifier(packageDirectory, {
+			env: { ...process.env, PATH: `${runtimeRoot}${delimiter}${process.env.PATH ?? ''}` },
+		});
 		// Then
 		expect(result.code).not.toBe(0);
 		expect(result.stderr).toContain('PACKED_PROTOCOL_INVALID');
@@ -268,7 +281,7 @@ export async function rm(path, options) {
 			(await readdir(tmpdir())).filter((entry) => /^tracelattice-(?:pack|consumer)-/.test(entry))
 		);
 		// When
-		const result = await runVerifier(packageDirectory, loader);
+		const result = await runVerifier(packageDirectory, { loader });
 		// Then
 		expect(result.code).not.toBe(0);
 		expect(result.stderr).toContain('PACKED_EXPORT_MISSING: . import');
