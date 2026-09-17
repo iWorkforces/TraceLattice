@@ -1,0 +1,63 @@
+import type { SessionId } from '../contracts/ids.js';
+import type { IOutcomeRecorder, VerificationOutcome } from '../contracts/interfaces.js';
+import { ValidationError } from '../errors.js';
+import type { HistorySessionSnapshot, ResolvedThoughtReferences } from './IHistoryManager.js';
+import type { ThoughtData } from './thought.js';
+
+interface VerificationOutcomeAdmissionContext {
+	readonly input: ThoughtData;
+	readonly snapshot: HistorySessionSnapshot;
+	readonly resolvedReferences: ResolvedThoughtReferences;
+	readonly sessionId: SessionId;
+	readonly recorder?: IOutcomeRecorder;
+}
+
+/** Builds one immutable calibration sample from the retained pre-admission target. */
+export function prepareVerificationOutcome(
+	context: VerificationOutcomeAdmissionContext
+): Omit<VerificationOutcome, 'recordedAt'> | undefined {
+	const { input, resolvedReferences, sessionId, snapshot, recorder } = context;
+	if (input.thought_type !== 'verification' || input.verification_result === undefined) {
+		return undefined;
+	}
+	const thoughtId = resolvedReferences.verificationTargetThoughtId;
+	const thoughtNumber = input.verification_target;
+	if (thoughtId === undefined || thoughtNumber === undefined) {
+		throw new ValidationError('verification_result', 'requires a retained verification_target');
+	}
+	const target = findTarget(snapshot, thoughtId, thoughtNumber);
+	if (target === undefined) {
+		throw new ValidationError('verification_result', 'verification_target is no longer retained');
+	}
+	if (target.retracted === true) {
+		throw new ValidationError('verification_result', 'verification_target must not be retracted');
+	}
+	if (target.confidence === undefined) {
+		throw new ValidationError('verification_result', 'verification_target must have confidence');
+	}
+	recorder?.assertCanRecord(sessionId, thoughtId);
+	return Object.freeze({
+		thoughtId,
+		thoughtNumber: target.thought_number,
+		sessionId,
+		predicted: target.confidence,
+		actual: input.verification_result,
+		type: target.thought_type ?? 'regular',
+	});
+}
+
+function findTarget(
+	snapshot: HistorySessionSnapshot,
+	thoughtId: VerificationOutcome['thoughtId'],
+	thoughtNumber: number
+): ThoughtData | undefined {
+	for (const thought of snapshot.history) {
+		if (thought.id === thoughtId && thought.thought_number === thoughtNumber) return thought;
+	}
+	for (const branch of Object.values(snapshot.branches)) {
+		for (const thought of branch) {
+			if (thought.id === thoughtId && thought.thought_number === thoughtNumber) return thought;
+		}
+	}
+	return undefined;
+}
