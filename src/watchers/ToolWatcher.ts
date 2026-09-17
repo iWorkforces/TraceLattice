@@ -36,9 +36,11 @@ export class ToolWatcher {
 	}
 
 	private _setupWatcher(watchDirs: readonly string[]): Promise<void> {
+		if (watchDirs.length === 0) return Promise.resolve();
 		const watcher = watch([...watchDirs], {
 			ignored: [/node_modules/, /\.DS_Store$/],
 			persistent: true,
+			ignoreInitial: true,
 		});
 		this._watcher = watcher;
 		watcher.on('add', (path) => this._handleEvent(path));

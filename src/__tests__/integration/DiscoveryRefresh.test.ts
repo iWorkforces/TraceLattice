@@ -4,9 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { watch, type FSWatcher } from 'chokidar';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createServer, type ToolAwareSequentialThinkingServer } from '../../lib.js';
 import type { Logger, LogLevel } from '../../logger/StructuredLogger.js';
 import { SkillRegistry } from '../../registry/SkillRegistry.js';
 import { ToolRegistry } from '../../registry/ToolRegistry.js';
+import { ServerConfig } from '../../ServerConfig.js';
 import { SkillWatcher } from '../../watchers/SkillWatcher.js';
 import { ToolWatcher } from '../../watchers/ToolWatcher.js';
 
@@ -79,12 +81,14 @@ function observeRefreshes(registry: RefreshableRegistry): () => Promise<number> 
 describe('Discovery refresh integration', () => {
 	let rootDir: string;
 	const activeWatchers: Array<{ stop(): Promise<void> }> = [];
+	const activeServers: ToolAwareSequentialThinkingServer[] = [];
 
 	beforeEach(async () => {
 		rootDir = await mkdtemp(join(tmpdir(), 'tracelattice-discovery-refresh-'));
 	});
 
 	afterEach(async () => {
+		await Promise.all(activeServers.splice(0).map((server) => server.dispose()));
 		await Promise.all(activeWatchers.splice(0).map((watcher) => watcher.stop()));
 		await rm(rootDir, { recursive: true, force: true });
 	});
@@ -232,6 +236,112 @@ describe('Discovery refresh integration', () => {
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(refreshSpy).toHaveBeenCalledTimes(1);
 		await observer.close();
+	});
+
+	it('refreshes both configured registries through a real server watcher lifecycle', async () => {
+		const skillDir = join(rootDir, 'factory-skills');
+		const toolDir = join(rootDir, 'factory-tools');
+		await Promise.all([mkdir(skillDir), mkdir(toolDir)]);
+		const skillReady = vi.spyOn(SkillWatcher.prototype, 'ready');
+		const toolReady = vi.spyOn(ToolWatcher.prototype, 'ready');
+		const skillRefreshDuringStartup = vi.spyOn(SkillRegistry.prototype, 'refreshAsync');
+		const toolRefreshDuringStartup = vi.spyOn(ToolRegistry.prototype, 'refreshAsync');
+		const server = await createServer({
+			config: new ServerConfig({
+				skillDirs: [skillDir],
+				toolDirs: [toolDir],
+				features: { toolInterleave: false },
+			}),
+			enableWatcher: true,
+			autoDiscover: true,
+			loadFromPersistence: false,
+		});
+		activeServers.push(server);
+
+		expect(skillReady).toHaveBeenCalledOnce();
+		expect(toolReady).toHaveBeenCalledOnce();
+		expect(skillRefreshDuringStartup).not.toHaveBeenCalled();
+		expect(toolRefreshDuringStartup).not.toHaveBeenCalled();
+		skillRefreshDuringStartup.mockRestore();
+		toolRefreshDuringStartup.mockRestore();
+
+		const nextSkillRefresh = observeRefreshes(server.skills);
+		const nextToolRefresh = observeRefreshes(server.tools);
+		const skillPath = join(skillDir, 'factory.md');
+		const toolPath = join(toolDir, 'factory.tool.md');
+
+		let skillRefreshed = nextSkillRefresh();
+		let toolRefreshed = nextToolRefresh();
+		await Promise.all([
+			writeFile(skillPath, skillDocument('factory-skill', 'first'), 'utf8'),
+			writeFile(toolPath, toolDocument('factory-tool', 'first'), 'utf8'),
+		]);
+		await Promise.all([
+			withDeadline(skillRefreshed, 'factory skill add refresh'),
+			withDeadline(toolRefreshed, 'factory tool add refresh'),
+		]);
+		expect(server.skills.getSkill('factory-skill')?.description).toBe('first');
+		expect(server.tools.getTool('factory-tool')?.description).toBe('first');
+
+		skillRefreshed = nextSkillRefresh();
+		toolRefreshed = nextToolRefresh();
+		await Promise.all([
+			writeFile(skillPath, skillDocument('factory-skill', 'updated'), 'utf8'),
+			writeFile(toolPath, toolDocument('factory-tool', 'updated'), 'utf8'),
+		]);
+		await Promise.all([
+			withDeadline(skillRefreshed, 'factory skill change refresh'),
+			withDeadline(toolRefreshed, 'factory tool change refresh'),
+		]);
+		expect(server.skills.getSkill('factory-skill')?.description).toBe('updated');
+		expect(server.tools.getTool('factory-tool')?.description).toBe('updated');
+
+		skillRefreshed = nextSkillRefresh();
+		toolRefreshed = nextToolRefresh();
+		await Promise.all([unlink(skillPath), unlink(toolPath)]);
+		await Promise.all([
+			withDeadline(skillRefreshed, 'factory skill unlink refresh'),
+			withDeadline(toolRefreshed, 'factory tool unlink refresh'),
+		]);
+		expect(server.skills.hasSkill('factory-skill')).toBe(false);
+		expect(server.tools.hasTool('factory-tool')).toBe(false);
+	});
+
+	it('retains both last-known-good items after malformed configured watcher changes', async () => {
+		const skillDir = join(rootDir, 'stable-skills');
+		const toolDir = join(rootDir, 'stable-tools');
+		await Promise.all([mkdir(skillDir), mkdir(toolDir)]);
+		const skillPath = join(skillDir, 'stable.md');
+		const toolPath = join(toolDir, 'stable.tool.md');
+		await Promise.all([
+			writeFile(skillPath, skillDocument('stable-skill', 'stable'), 'utf8'),
+			writeFile(toolPath, toolDocument('stable-tool', 'stable'), 'utf8'),
+		]);
+		const server = await createServer({
+			config: new ServerConfig({
+				skillDirs: [skillDir],
+				toolDirs: [toolDir],
+				features: { toolInterleave: false },
+			}),
+			enableWatcher: true,
+			autoDiscover: true,
+			loadFromPersistence: false,
+		});
+		activeServers.push(server);
+		const skillRefreshed = observeRefreshes(server.skills)();
+		const toolRefreshed = observeRefreshes(server.tools)();
+
+		await Promise.all([
+			writeFile(skillPath, '---\n: invalid: [yaml\n---\n# Body', 'utf8'),
+			writeFile(toolPath, '---\n: invalid: [yaml\n---\n# Body', 'utf8'),
+		]);
+		await Promise.all([
+			withDeadline(skillRefreshed, 'malformed configured skill change'),
+			withDeadline(toolRefreshed, 'malformed configured tool change'),
+		]);
+
+		expect(server.skills.getSkill('stable-skill')?.description).toBe('stable');
+		expect(server.tools.getTool('stable-tool')?.description).toBe('stable');
 	});
 });
 
