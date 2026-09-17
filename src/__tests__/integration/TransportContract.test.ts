@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as v from 'valibot';
 import { HttpTransport } from '../../transport/HttpTransport.js';
-import { SseTransport } from '../../transport/SseTransport.js';
 import { StreamableHttpTransport } from '../../transport/StreamableHttpTransport.js';
 import {
 	ECHO_INPUT,
@@ -35,13 +34,6 @@ const ADAPTER_CASES = [
 		notificationStatus: 204,
 		stateful: false,
 		create: () => new HttpTransport({ port: 0, host: '127.0.0.1', enableRateLimit: false }),
-	},
-	{
-		name: 'nonpooled SSE',
-		path: '/sse/message',
-		notificationStatus: 200,
-		stateful: false,
-		create: () => new SseTransport({ port: 0, host: '127.0.0.1', enableRateLimit: false }),
 	},
 	{
 		name: 'stateful Streamable HTTP',
