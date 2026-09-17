@@ -26,10 +26,6 @@
  * @module errors
  */
 
-import type { SessionScopedPersistenceOperation } from './contracts/PersistenceBackend.js';
-import type { BranchId, SessionId } from './contracts/ids.js';
-import type { PersistenceWorkFailure } from './contracts/persistence-work.js';
-
 /**
  * All known error codes as a const object for exhaustive switching.
  */
@@ -78,16 +74,6 @@ export const ERROR_CODES = {
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
-
-/** Lifecycle phase that can close ordinary session admission. */
-export type SessionLifecycleClosedPhase =
-	| 'resetting'
-	| 'reset_failed'
-	| 'evicting'
-	| 'eviction_failed'
-	| 'shutting_down'
-	| 'stopped'
-	| 'shutdown_failed';
 
 /**
  * All known warning codes as a const object.
@@ -487,107 +473,6 @@ export class InvalidToolError extends SequentialThinkingError {
 }
 
 /**
- * Error thrown when attempting to process a session that is not active.
- *
- * This error is thrown when trying to use a session that has been closed
- * or deactivated.
- *
- * @example
- * ```typescript
- * if (!session.isActive) {
- *   throw new SessionNotActiveError(sessionId);
- * }
- * ```
- */
-export class SessionNotActiveError extends SequentialThinkingError {
-	/**
-	 * Creates a new SessionNotActiveError.
-	 *
-	 * @param sessionId - The ID of the inactive session
-	 *
-	 * @example
-	 * ```typescript
-	 * throw new SessionNotActiveError('session-123');
-	 * // Error: Session 'session-123' is not active
-	 * // Code: SESSION_NOT_ACTIVE
-	 * ```
-	 */
-	constructor(sessionId: SessionId) {
-		super(`Session '${sessionId}' is not active`, ERROR_CODES.SESSION_NOT_ACTIVE);
-		this.name = 'SessionNotActiveError';
-	}
-}
-
-/**
- * Error thrown when a requested session is not found in the pool.
- *
- * This error is thrown when attempting to retrieve, process, or close
- * a session that doesn't exist in the session pool.
- *
- * @example
- * ```typescript
- * const session = pool.getSession('non-existent-session');
- * if (!session) {
- *   throw new SessionNotFoundError('non-existent-session');
- * }
- * ```
- */
-export class SessionNotFoundError extends SequentialThinkingError {
-	/**
-	 * Creates a new SessionNotFoundError.
-	 *
-	 * @param sessionId - The ID of the session that was not found
-	 *
-	 * @example
-	 * ```typescript
-	 * throw new SessionNotFoundError('session-123');
-	 * // Error: Session not found: session-123
-	 * // Code: SESSION_NOT_FOUND
-	 * ```
-	 */
-	constructor(sessionId: SessionId) {
-		super(`Session not found: ${sessionId}`, ERROR_CODES.SESSION_NOT_FOUND);
-		this.name = 'SessionNotFoundError';
-	}
-}
-
-/**
- * Error thrown when an operation arrives after lifecycle admission has closed.
- *
- * The error carries both the optional session scope and the exact phase that
- * rejected admission so callers can distinguish session maintenance from global
- * shutdown without parsing prose.
- *
- * @example
- * ```typescript
- * throw new SessionLifecycleClosedError(sessionId, 'evicting');
- * ```
- */
-export class SessionLifecycleClosedError extends SequentialThinkingError {
-	/** Session whose admission is closed, or `undefined` for a global exclusive request. */
-	public readonly sessionId: SessionId | undefined;
-	/** Lifecycle phase that rejected admission. */
-	public readonly phase: SessionLifecycleClosedPhase;
-
-	/**
-	 * Creates a lifecycle admission error.
-	 *
-	 * @param sessionId - Rejected session, or `undefined` for global coordination.
-	 * @param phase - Lifecycle phase that currently owns admission.
-	 */
-	public constructor(sessionId: SessionId | undefined, phase: SessionLifecycleClosedPhase) {
-		const scope = sessionId === undefined ? 'Global' : `Session '${sessionId}'`;
-		super(
-			`${scope} lifecycle admission is closed in phase '${phase}'`,
-			ERROR_CODES.SESSION_LIFECYCLE_CLOSED
-		);
-		this.name = 'SessionLifecycleClosedError';
-		this.sessionId = sessionId;
-		this.phase = phase;
-	}
-}
-
-/**
  * Error thrown when the maximum number of sessions has been reached.
  *
  * This error is thrown when trying to create a new session when the
@@ -816,24 +701,6 @@ export class UnknownToolError extends SequentialThinkingError {
 	}
 }
 
-/**
- * Error thrown when a per-session async lock cannot be acquired in time.
- *
- * Indicates that a critical section held the lock for longer than the
- * configured timeout, suggesting a stuck handler or deadlock.
- */
-export class LockTimeoutError extends SequentialThinkingError {
-	public readonly sessionId: SessionId;
-	public readonly timeoutMs: number;
-
-	constructor(sessionId: SessionId, timeoutMs: number) {
-		super(`Lock timeout for session '${sessionId}' after ${timeoutMs}ms`, ERROR_CODES.LOCK_TIMEOUT);
-		this.name = 'LockTimeoutError';
-		this.sessionId = sessionId;
-		this.timeoutMs = timeoutMs;
-	}
-}
-
 /** Error thrown when the CLI's complete shutdown exceeds its outer deadline. */
 export class CliShutdownTimeoutError extends SequentialThinkingError {
 	public readonly timeoutMs: number;
@@ -842,33 +709,6 @@ export class CliShutdownTimeoutError extends SequentialThinkingError {
 		super(`CLI shutdown timed out after ${timeoutMs}ms`, ERROR_CODES.CLI_SHUTDOWN_TIMEOUT);
 		this.name = 'CliShutdownTimeoutError';
 		this.timeoutMs = timeoutMs;
-	}
-}
-
-/**
- * Error thrown when a session is accessed by a non-owner.
- *
- * Sessions are bound to an owner identifier on first creation when accessed
- * via a multi-user transport (SSE/HTTP). Subsequent access attempts using a
- * different owner are rejected to prevent IDOR (Insecure Direct Object
- * Reference) vulnerabilities.
- *
- * The stdio transport does not set an owner, so its sessions are unaffected.
- */
-export class SessionAccessDeniedError extends SequentialThinkingError {
-	public readonly sessionId: SessionId;
-	public readonly expectedOwner: string;
-	public readonly actualOwner: string | undefined;
-
-	constructor(sessionId: SessionId, expectedOwner: string, actualOwner?: string) {
-		super(
-			`Access denied to session '${sessionId}': owned by '${expectedOwner}', accessed by '${actualOwner ?? 'anonymous'}'`,
-			ERROR_CODES.SESSION_ACCESS_DENIED
-		);
-		this.name = 'SessionAccessDeniedError';
-		this.sessionId = sessionId;
-		this.expectedOwner = expectedOwner;
-		this.actualOwner = actualOwner;
 	}
 }
 
@@ -941,159 +781,6 @@ export class PersistenceClosedError extends SequentialThinkingError {
 		super(`Persistence writer for '${dataDir}' is closed`, ERROR_CODES.PERSISTENCE_CLOSED);
 		this.name = 'PersistenceClosedError';
 		this.dataDir = dataDir;
-	}
-}
-
-/** Error raised when an explicit persistence drain has terminal write failures. */
-export class PersistenceDrainError extends SequentialThinkingError {
-	/** Failures captured when the drain generation settled. */
-	public readonly failures: readonly PersistenceWorkFailure[];
-
-	/**
-	 * Creates an aggregate persistence drain error.
-	 *
-	 * @param failures - Terminal failures from the completed drain generation
-	 */
-	constructor(failures: readonly PersistenceWorkFailure[]) {
-		super(
-			`Persistence drain failed with ${failures.length} terminal ${failures.length === 1 ? 'failure' : 'failures'}`,
-			ERROR_CODES.PERSISTENCE_DRAIN
-		);
-		this.name = 'PersistenceDrainError';
-		this.failures = Object.freeze([...failures]);
-	}
-}
-
-/**
- * Error raised when persistence work is submitted while a lifecycle owner holds the session.
- *
- * @example
- * ```typescript
- * try {
- *   buffer.bufferThought(sessionId, thought);
- * } catch (error) {
- *   if (error instanceof PersistenceSessionAdmissionClosedError) {
- *     console.error(`Session ${error.sessionId} is temporarily closed`);
- *   }
- * }
- * ```
- */
-export class PersistenceSessionAdmissionClosedError extends SequentialThinkingError {
-	/** Session whose persistence admission is closed. */
-	public readonly sessionId: SessionId;
-
-	/**
-	 * Creates a session admission error.
-	 *
-	 * @param sessionId - Session held by a lifecycle barrier
-	 */
-	constructor(sessionId: SessionId) {
-		super(
-			`Persistence admission for session '${sessionId}' is closed by a lifecycle barrier`,
-			ERROR_CODES.PERSISTENCE_SESSION_ADMISSION_CLOSED
-		);
-		this.name = 'PersistenceSessionAdmissionClosedError';
-		this.sessionId = sessionId;
-	}
-}
-
-/** Error raised when an owning async call chain tries to reacquire its session barrier. */
-export class PersistenceSessionBarrierReentrancyError extends SequentialThinkingError {
-	/** Session already owned by the current async call chain. */
-	public readonly sessionId: SessionId;
-
-	/**
-	 * Creates a session barrier reentrancy error.
-	 *
-	 * @param sessionId - Session already owned by the current async call chain
-	 */
-	constructor(sessionId: SessionId) {
-		super(
-			`Persistence lifecycle barrier for session '${sessionId}' is not reentrant`,
-			ERROR_CODES.PERSISTENCE_SESSION_BARRIER_REENTRANCY
-		);
-		this.name = 'PersistenceSessionBarrierReentrancyError';
-		this.sessionId = sessionId;
-	}
-}
-
-/** Scope requested through the legacy synchronous clear API. */
-export type AsyncResetScope = 'session' | 'all';
-
-/** Condition that makes the legacy synchronous clear API unsafe. */
-export type AsyncResetReason = 'persistent' | 'active';
-
-/** Error raised when state requires the awaitable reset API. */
-export class AsyncResetRequiredError extends SequentialThinkingError {
-	public readonly scope: AsyncResetScope;
-	public readonly sessionId: SessionId | undefined;
-	public readonly reason: AsyncResetReason;
-
-	constructor(
-		scope: AsyncResetScope,
-		sessionId?: SessionId,
-		reason: AsyncResetReason = 'persistent'
-	) {
-		const target = scope === 'session' ? `session '${sessionId}'` : 'all sessions';
-		super(
-			`Synchronous clear cannot reset ${reason} ${target}; use the awaitable ${scope === 'session' ? 'resetSession()' : 'resetAll()'} API`,
-			ERROR_CODES.ASYNC_RESET_REQUIRED
-		);
-		this.name = 'AsyncResetRequiredError';
-		this.scope = scope;
-		this.sessionId = sessionId;
-		this.reason = reason;
-	}
-}
-
-/** Durable namespace associated with a persistence write. */
-export type PersistenceScope = {
-	readonly sessionId: SessionId;
-	readonly branchId?: BranchId;
-};
-
-/** Operations whose payload ownership is validated before mutation. */
-export type PersistenceWriteOperation =
-	| 'saveThought'
-	| 'saveThoughtForSession'
-	| 'saveBranch'
-	| 'saveBranchForSession'
-	| 'saveEdges'
-	| 'saveSummaries';
-
-/** Error raised when a custom backend lacks the complete scoped capability. */
-export class PersistenceCapabilityError extends SequentialThinkingError {
-	public readonly operation: SessionScopedPersistenceOperation;
-
-	constructor(operation: SessionScopedPersistenceOperation) {
-		super(
-			`Persistence backend does not support required session operation '${operation}'`,
-			ERROR_CODES.PERSISTENCE_CAPABILITY_UNSUPPORTED
-		);
-		this.name = 'PersistenceCapabilityError';
-		this.operation = operation;
-	}
-}
-
-/** Error raised before a write whose payload belongs to another namespace. */
-export class PersistenceScopeMismatchError extends SequentialThinkingError {
-	public readonly operation: PersistenceWriteOperation;
-	public readonly expectedScope: PersistenceScope;
-	public readonly actualScopes: readonly PersistenceScope[];
-
-	constructor(
-		operation: PersistenceWriteOperation,
-		expectedScope: PersistenceScope,
-		actualScopes: readonly PersistenceScope[]
-	) {
-		super(
-			`Persistence payload scope does not match '${expectedScope.sessionId}' for ${operation}`,
-			ERROR_CODES.PERSISTENCE_SCOPE_MISMATCH
-		);
-		this.name = 'PersistenceScopeMismatchError';
-		this.operation = operation;
-		this.expectedScope = expectedScope;
-		this.actualScopes = [...actualScopes];
 	}
 }
 
