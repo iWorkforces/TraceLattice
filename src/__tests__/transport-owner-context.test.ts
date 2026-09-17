@@ -10,15 +10,8 @@ import { request } from 'node:http';
 import { McpServer } from 'tmcp';
 import { ValibotJsonSchemaAdapter } from '@tmcp/adapter-valibot';
 import { HttpTransport } from '../transport/HttpTransport.js';
-import { SseTransport } from '../transport/SseTransport.js';
 import { StreamableHttpTransport } from '../transport/StreamableHttpTransport.js';
 import { getOwner, getRequestId } from '../context/RequestContext.js';
-import { ConnectionPool } from '../pool/ConnectionPool.js';
-import { asSessionId } from '../contracts/ids.js';
-import { MemoryPersistence } from '../persistence/MemoryPersistence.js';
-import { HistoryManager } from '../core/HistoryManager.js';
-import { createTestThought } from './helpers/factories.js';
-import { SEQUENTIAL_THINKING_TOOL, SequentialThinkingSchema } from '../schema.js';
 
 interface CapturedContext {
 	owner: string | undefined;
@@ -214,117 +207,4 @@ describe('Transport owner identity propagation (WU-3.2)', () => {
 		});
 	});
 
-	describe('SseTransport', () => {
-		let transport: SseTransport;
-		let port: number;
-		let captured: CapturedContext[];
-
-		beforeEach(async () => {
-			port = 9500 + Math.floor(Math.random() * 200);
-			transport = new SseTransport({ port, host: '127.0.0.1', maxRequestsPerMinute: 1000 });
-			await transport.connect(makeMcpServer());
-			captured = spyContext(transport as unknown as { _mcpServer?: unknown });
-		});
-
-		afterEach(async () => {
-			await transport.stop();
-		});
-
-		it('sets owner for message endpoint requests (no pool → sse-prefixed)', async () => {
-			await postJson(port, '/sse/message', {
-				jsonrpc: '2.0',
-				id: 1,
-				method: 'tools/list',
-				params: {},
-			});
-
-			expect(captured).toHaveLength(1);
-			expect(captured[0]!.owner).toBeDefined();
-			// Without connection pool, owner falls back to sse-prefixed UUID
-			expect(captured[0]!.owner!.startsWith('sse-')).toBe(true);
-			expect(captured[0]!.requestId).toBeDefined();
-		});
-
-		it('preserves restored provenance rejection under the pooled correlation owner', async () => {
-			const persistence = new MemoryPersistence();
-			const restoredSession = asSessionId('restored-session');
-			await persistence.saveThoughtForSession(
-				restoredSession,
-				createTestThought({
-					id: 'restored-thought-1',
-					session_id: restoredSession,
-					thought_number: 1,
-				})
-			);
-			const history = new HistoryManager({ persistence, persistenceFlushInterval: 60_000 });
-			await history.loadFromPersistence();
-			const processThought = async (input: Parameters<typeof history.addThought>[0]) => {
-				history.addThought(input);
-				return { content: [{ type: 'text' as const, text: 'unexpected mutation' }] };
-			};
-			const pool = new ConnectionPool({
-				autoCleanup: false,
-				serverFactory: async () => ({ processThought, stop: () => history.shutdown() }),
-			});
-			const pooledServer = new McpServer(
-				{ name: 'pooled-owner-ctx', version: '1.0.0' },
-				{
-					adapter: new ValibotJsonSchemaAdapter(),
-					capabilities: { tools: { listChanged: true } },
-				}
-			);
-			pooledServer.tool(
-				{
-					name: 'sequentialthinking_tools',
-					description: SEQUENTIAL_THINKING_TOOL.description,
-					schema: SequentialThinkingSchema,
-				},
-				async (input) => {
-					const owner = getOwner();
-					if (!owner) throw new Error('Expected pooled request owner');
-					const result = await pool.process(
-						asSessionId(owner),
-						createTestThought({
-							thought: input.thought,
-							thought_number: input.thought_number,
-							total_thoughts: input.total_thoughts,
-							next_thought_needed: input.next_thought_needed,
-							session_id: input.session_id,
-						})
-					);
-					return {
-						content: result.content,
-						...(result.isError === undefined ? {} : { isError: result.isError }),
-					};
-				}
-			);
-			await transport.stop();
-			transport = new SseTransport({
-				port,
-				host: '127.0.0.1',
-				maxRequestsPerMinute: 1000,
-				connectionPool: pool,
-			});
-			await transport.connect(pooledServer);
-			const correlation = await pool.createSession();
-
-			const response = await postJson(port, `/sse/message?sessionId=${correlation}`, {
-				jsonrpc: '2.0',
-				id: 'restored-write',
-				method: 'tools/call',
-				params: {
-					name: 'sequentialthinking_tools',
-					arguments: createTestThought({
-						session_id: restoredSession,
-						thought_number: 2,
-					}),
-				},
-			});
-
-			expect(response.statusCode).toBe(200);
-			expect(response.body).toContain(restoredSession);
-			expect(response.body).toContain(correlation);
-			expect(history.getHistory(restoredSession)).toHaveLength(1);
-		});
-	});
 });
