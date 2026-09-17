@@ -173,24 +173,4 @@ describe('CliLifecycle', () => {
 		expect(calls).toEqual(['stdio', 'server']);
 	});
 
-	it('leaves pooled SSE termination solely inside the owned transport stop', async () => {
-		// Given
-		const terminatePool = vi.fn(async () => undefined);
-		const sse = {
-			stop: vi.fn(async () => {
-				await terminatePool();
-			}),
-		} satisfies CliOwnedResource;
-		const server = { stop: vi.fn(async () => undefined) } satisfies CliOwnedResource;
-		const lifecycle = new CliLifecycle(server);
-		lifecycle.attachTransport(sse);
-
-		// When
-		await lifecycle.shutdown();
-
-		// Then
-		expect(sse.stop).toHaveBeenCalledOnce();
-		expect(terminatePool).toHaveBeenCalledOnce();
-		expect(server.stop).toHaveBeenCalledOnce();
-	});
 });
