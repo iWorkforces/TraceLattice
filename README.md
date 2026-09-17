@@ -81,7 +81,8 @@ Global (`~/.config/opencode/opencode.json`) or project-scoped (`.opencode.json`)
       ],
       "enabled": true,
       "environment": {
-        "MAX_HISTORY_SIZE": "10000"
+        "MAX_HISTORY_SIZE": "10000",
+        "LOG_LEVEL": "debug"
       }
     }
   }
@@ -91,6 +92,14 @@ Global (`~/.config/opencode/opencode.json`) or project-scoped (`.opencode.json`)
 ## Configuration
 
 ### Server
+
+Set `LOG_LEVEL` in the process environment to `debug`, `info`, `warn`, or `error`:
+
+```bash
+LOG_LEVEL=debug tracelattice
+```
+
+Environment variables override values from configuration files.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
