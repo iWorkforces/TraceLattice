@@ -65,12 +65,12 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/iWorkforces/TraceLattice.git"
+		"url": "https://github.com/iworkforces/TraceLattice"
 	},
 	"bugs": {
-		"url": "https://github.com/iWorkforces/TraceLattice/issues"
+		"url": "https://github.com/iworkforces/TraceLattice/issues"
 	},
-	"homepage": "https://github.com/iWorkforces/TraceLattice#readme",
+	"homepage": "https://github.com/iworkforces/TraceLattice#readme",
 	"dependencies": {
 		"@tmcp/adapter-valibot": "^0.1.6",
 		"@tmcp/transport-stdio": "^0.5.0",
