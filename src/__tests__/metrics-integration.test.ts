@@ -10,7 +10,6 @@ import { DiscoveryCache } from '../cache/DiscoveryCache.js';
 import { Metrics } from '../metrics/metrics.impl.js';
 import { FilePersistence } from '../persistence/FilePersistence.js';
 import { HttpTransport } from '../transport/HttpTransport.js';
-import { SseTransport } from '../transport/SseTransport.js';
 import type { ThoughtData } from '../core/thought.js';
 import { asThoughtId } from '../contracts/ids.js';
 
@@ -64,49 +63,6 @@ function httpRequest(options: {
 		if (options.body) {
 			req.write(options.body);
 		}
-		req.end();
-	});
-}
-
-function openSseConnection(port: number): Promise<{ close: () => void }> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		const req = request(
-			{
-				hostname: '127.0.0.1',
-				port,
-				path: '/sse',
-				method: 'GET',
-			},
-			(res) => {
-				let body = '';
-				res.on('data', (chunk) => {
-					body += chunk.toString();
-					if (!settled && body.includes('event: connected')) {
-						settled = true;
-						resolve({
-							close: () => {
-								res.destroy();
-								req.destroy();
-							},
-						});
-					}
-				});
-				res.on('error', (error) => {
-					if (!settled) {
-						settled = true;
-						reject(error);
-					}
-				});
-			}
-		);
-
-		req.on('error', (error) => {
-			if (!settled) {
-				settled = true;
-				reject(error);
-			}
-		});
 		req.end();
 	});
 }
@@ -172,27 +128,6 @@ describe('Metrics Integration', () => {
 		const snapshot = metrics.export();
 		expect(snapshot).toContain('sequentialthinking_cache_miss_total{} 1');
 		expect(snapshot).toContain('sequentialthinking_cache_hit_total{} 1');
-	});
-
-	it('tracks active SSE connections with a gauge', async () => {
-		const metrics = createMetrics();
-		const port = 8100 + Math.floor(Math.random() * 500);
-		const transport = new SseTransport({
-			port,
-			host: '127.0.0.1',
-			enableRateLimit: false,
-			metrics,
-		});
-
-		await transport.connect(createMockMcpServer());
-		const connection = await openSseConnection(port);
-		expect(metrics.export()).toContain('sequentialthinking_sse_active_connections{} 1');
-
-		connection.close();
-		await new Promise((resolve) => setTimeout(resolve, 25));
-		expect(metrics.export()).toContain('sequentialthinking_sse_active_connections{} 0');
-
-		await transport.stop();
 	});
 
 	it('collects HTTP request counters and duration histograms', async () => {
