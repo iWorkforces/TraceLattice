@@ -5,7 +5,7 @@
 
 ## OVERVIEW
 
-Multi-user session isolation for concurrent MCP clients. Each session is a `SessionServer` with independent thought state. Enforces max-session limits, auto-cleanup via TTL, and graceful teardown.
+Reusable HTTP-layer session isolation for concurrent MCP clients. Each session is a `SessionServer` with independent thought state. Enforces max-session limits, auto-cleanup via TTL, and graceful teardown.
 
 ## STRUCTURE
 
@@ -47,8 +47,8 @@ All errors are subclasses of `SequentialThinkingError` from `errors.ts`.
 
 ## NOTES
 
-- `ConnectionPool` is NOT the same as `HistoryManager`'s internal `SessionManager`. Pool manages HTTP-layer transport sessions (one per MCP client connection); `SessionManager` manages thought-history sessions (keyed by `session_id` in the thought data).
-- `SessionServer` is the per-user server instance created by `serverFactory`. Consumed by SSE and StreamableHTTP transports that need per-client isolation.
+- `ConnectionPool` is NOT the same as `HistoryManager`'s internal `SessionManager`. Pool manages reusable HTTP-layer sessions; `SessionManager` manages thought-history sessions (keyed by `session_id` in the thought data).
+- `SessionServer` is the per-user server instance created by `serverFactory` for HTTP-layer session isolation.
 - Auto-cleanup sweeps expired sessions every `cleanupInterval` ms; sessions idle longer than `sessionTimeout` ms are closed.
-- `IConnectionPool` is the interface used by transport layer code — import the interface, not the concrete class.
-- Shared pool types (`ContentBlock`, `ProcessResult`, `SessionServer`, `SessionInfo`, `ConnectionPoolStats`) are owned by `IConnectionPool.ts`. Transport files import them from here; do not re-define them in transport modules.
+- `IConnectionPool` defines the reusable pool boundary. Consumers should import the interface, not the concrete class.
+- Shared pool types (`ContentBlock`, `ProcessResult`, `SessionServer`, `SessionInfo`, `ConnectionPoolStats`) are owned by `IConnectionPool.ts`. Keep them there rather than re-defining them in consumers.
