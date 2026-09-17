@@ -6,15 +6,14 @@ import {
 	PersistenceCorruptionError,
 	PersistenceLegacyAmbiguityError,
 } from '../errors.js';
-import {
-	parseFileSnapshotV2,
-	serializeFileSnapshotV2,
-	type BranchRecordV2,
-	type EdgeSessionV2,
-	type FileSnapshotV2,
-	type SummarySessionV2,
-	type ThoughtSessionV2,
-} from './FileSnapshotV2.js';
+import { parseFileSnapshotV2, serializeFileSnapshotV2 } from './FileSnapshotV2.js';
+import type {
+	BranchRecordV2,
+	EdgeSessionV2,
+	FileSnapshotV2,
+	SummarySessionV2,
+	ThoughtSessionV2,
+} from './FileSnapshotTypes.js';
 import { isFileNotFound } from './FileWriter.js';
 import type { SqliteDatabase, SqliteDatabaseConstructor } from './SqliteDriver.js';
 import { validateSqliteV1Schema } from './SqliteLegacySchema.js';

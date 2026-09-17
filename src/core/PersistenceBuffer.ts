@@ -14,7 +14,7 @@ import {
 	PersistenceDrainError,
 	PersistenceSessionAdmissionClosedError,
 	PersistenceSessionBarrierReentrancyError,
-} from '../errors.js';
+} from './PersistenceBufferErrors.js';
 import { NullLogger } from '../logger/NullLogger.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import { assertNever } from '../utils.js';

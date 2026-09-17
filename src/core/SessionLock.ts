@@ -13,9 +13,9 @@
  */
 
 import type { ISessionLock } from '../contracts/interfaces.js';
-import { LockTimeoutError } from '../errors.js';
 import type { SessionId } from '../contracts/ids.js';
 import { GLOBAL_SESSION_ID } from '../contracts/ids.js';
+import { LockTimeoutError } from './SessionErrors.js';
 
 const DEFAULT_LOCK_TIMEOUT_MS = 5000;
 

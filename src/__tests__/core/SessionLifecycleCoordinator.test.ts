@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { asSessionId } from '../../contracts/ids.js';
 import { SessionLifecycleCoordinator } from '../../core/SessionLifecycleCoordinator.js';
-import { SessionLifecycleClosedError } from '../../errors.js';
+import { SessionLifecycleClosedError } from '../../core/SessionErrors.js';
 
 interface Deferred {
 	readonly promise: Promise<void>;

@@ -8,7 +8,8 @@
  */
 
 import type { IOutcomeRecorder, VerificationOutcome } from '../../contracts/interfaces.js';
-import { asSessionId, type SessionId } from '../../contracts/ids.js';
+import type { SessionId, ThoughtId } from '../../contracts/ids.js';
+import { ValidationError } from '../../errors.js';
 
 /**
  * Configuration for OutcomeRecorder.
@@ -39,7 +40,7 @@ export interface OutcomeRecorderConfig {
  * ```
  */
 export class OutcomeRecorder implements IOutcomeRecorder {
-	private readonly _outcomes: Map<SessionId, VerificationOutcome[]> = new Map();
+	private readonly _outcomes: Map<SessionId, Map<ThoughtId, VerificationOutcome>> = new Map();
 	private readonly _enabled: boolean;
 
 	/**
@@ -59,6 +60,23 @@ export class OutcomeRecorder implements IOutcomeRecorder {
 	}
 
 	/**
+	 * Assert that a target is available for one outcome label.
+	 *
+	 * @param sessionId - Canonical session namespace
+	 * @param thoughtId - Stable target identity
+	 * @throws {ValidationError} When the target was already labeled
+	 */
+	assertCanRecord(sessionId: SessionId, thoughtId: ThoughtId): void {
+		if (!this._enabled) return;
+		if (this._outcomes.get(sessionId)?.has(thoughtId)) {
+			throw new ValidationError(
+				'verification_result',
+				'The verification target already has a recorded result'
+			);
+		}
+	}
+
+	/**
 	 * Record a verification outcome.
 	 *
 	 * No-op when outcome recording is disabled.
@@ -67,16 +85,16 @@ export class OutcomeRecorder implements IOutcomeRecorder {
 	 */
 	recordVerification(outcome: Omit<VerificationOutcome, 'recordedAt'>): void {
 		if (!this._enabled) return;
+		this.assertCanRecord(outcome.sessionId, outcome.thoughtId);
 
 		const full: VerificationOutcome = {
 			...outcome,
 			recordedAt: Date.now(),
 		};
 
-		const sessionId = asSessionId(outcome.sessionId);
-		const sessionOutcomes = this._outcomes.get(sessionId) ?? [];
-		sessionOutcomes.push(full);
-		this._outcomes.set(sessionId, sessionOutcomes);
+		const sessionOutcomes = this._outcomes.get(outcome.sessionId) ?? new Map();
+		sessionOutcomes.set(outcome.thoughtId, full);
+		this._outcomes.set(outcome.sessionId, sessionOutcomes);
 	}
 
 	/**
@@ -85,9 +103,9 @@ export class OutcomeRecorder implements IOutcomeRecorder {
 	 * @param sessionId - The session id to query
 	 * @returns Array of outcomes (empty when disabled or no data)
 	 */
-	getOutcomes(sessionId: string): VerificationOutcome[] {
+	getOutcomes(sessionId: SessionId): VerificationOutcome[] {
 		if (!this._enabled) return [];
-		return this._outcomes.get(asSessionId(sessionId)) ?? [];
+		return [...(this._outcomes.get(sessionId)?.values() ?? [])].map((outcome) => ({ ...outcome }));
 	}
 
 	/**
@@ -99,7 +117,7 @@ export class OutcomeRecorder implements IOutcomeRecorder {
 		if (!this._enabled) return [];
 		const all: VerificationOutcome[] = [];
 		for (const outcomes of this._outcomes.values()) {
-			all.push(...outcomes);
+			for (const outcome of outcomes.values()) all.push({ ...outcome });
 		}
 		return all;
 	}
@@ -109,8 +127,8 @@ export class OutcomeRecorder implements IOutcomeRecorder {
 	 *
 	 * @param sessionId - The session id to clear
 	 */
-	clearOutcomes(sessionId: string): void {
-		this._outcomes.delete(asSessionId(sessionId));
+	clearOutcomes(sessionId: SessionId): void {
+		this._outcomes.delete(sessionId);
 	}
 
 	clearAllOutcomes(): void {

@@ -38,7 +38,7 @@ export interface SkillRegistryOptions {
 
 	/**
 	 * Directory paths to search for skills.
-	 * @default ['.claude/skills', '~/.claude/skills']
+	 * @default ['.claude/skills', '~/.claude/skills', '.agents/skills', '~/.agents/skills']
 	 */
 	skillDirs?: string[];
 
@@ -63,7 +63,12 @@ export class SkillRegistry extends BaseRegistry<Skill> {
 		super({
 			logger: options.logger,
 			cache: options.cache,
-			searchDirs: options.skillDirs || ['.claude/skills', join(homedir(), '.claude/skills')],
+			searchDirs: options.skillDirs ?? [
+				'.claude/skills',
+				join(homedir(), '.claude/skills'),
+				'.agents/skills',
+				join(homedir(), '.agents/skills'),
+			],
 			lazyDiscovery: options.lazyDiscovery,
 		});
 	}
@@ -134,7 +139,6 @@ export class SkillRegistry extends BaseRegistry<Skill> {
 	public addSkill(skill: Skill): void {
 		this.add(skill);
 	}
-
 
 	public updateSkill(name: string, updates: Partial<Skill>): void {
 		this.update(name, updates);

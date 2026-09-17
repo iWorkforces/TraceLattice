@@ -57,6 +57,7 @@ import { SequentialStrategy } from './reasoning/strategies/SequentialStrategy.js
 import type { CompressionService } from './compression/CompressionService.js';
 import { validateThoughtCrossReferences } from './CrossReferenceValidator.js';
 import { SessionLifecycleCoordinator } from './SessionLifecycleCoordinator.js';
+import { prepareVerificationOutcome } from './VerificationOutcomeAdmission.js';
 
 type ConfidenceSignalsResult = ReturnType<ThoughtEvaluator['computeConfidenceSignals']>;
 type ReasoningStatsResult = ReturnType<ThoughtEvaluator['computeReasoningStats']>;
@@ -462,6 +463,13 @@ export class ThoughtProcessor {
 			strictBranchReferences: resetState || registerBranchId !== undefined,
 			logger: this._logger,
 		});
+		const verificationOutcome = prepareVerificationOutcome({
+			input: checkedInput,
+			snapshot: validationSnapshot,
+			resolvedReferences,
+			sessionId,
+			recorder: this._outcomeRecorder,
+		});
 		const allWarnings = [...prepared.validationWarnings, ...refWarnings];
 		const validated = this._validateNewTypes(checkedInput);
 		const admissionContext: ThoughtAdmissionContext = { resolvedReferences };
@@ -495,6 +503,7 @@ export class ThoughtProcessor {
 		} else {
 			this.historyManager.addThought(checkedInput, admissionContext);
 		}
+		this._recordVerificationOutcome(verificationOutcome, sessionId);
 
 		const formattedThought = this.thoughtFormatter.formatThought(checkedInput);
 		this.log(formattedThought, { sessionId });
@@ -524,13 +533,27 @@ export class ThoughtProcessor {
 		});
 	}
 
+	private _recordVerificationOutcome(
+		outcome: ReturnType<typeof prepareVerificationOutcome>,
+		sessionId: SessionId
+	): void {
+		if (outcome === undefined) return;
+		if (this._outcomeRecorder?.enabled === true) {
+			this._outcomeRecorder.recordVerification(outcome);
+		}
+		if (this._calibrator?.enabled === true) this._calibrator.refit(sessionId);
+	}
+
 	private _collectReasoningSignals(
 		input: ThoughtData,
 		sessionId?: SessionId
 	): ReasoningSignalBundle {
 		const history = this.historyManager.getHistory(sessionId);
 		const branches = this.historyManager.getBranches(sessionId);
-		const confidenceSignals = this._thoughtEvaluator.computeConfidenceSignals(history, branches);
+		const confidenceSignals = this._thoughtEvaluator.computeConfidenceSignals(history, branches, {
+			currentThought: input,
+			sessionId: sessionId ?? GLOBAL_SESSION_ID,
+		});
 		const reasoningStats = this._thoughtEvaluator.computeReasoningStats(history, branches);
 		const patternSignals = this._thoughtEvaluator.computePatternSignals(history, branches);
 		const reasoningHints = this._generateHints(patternSignals, input.thought_number, sessionId);

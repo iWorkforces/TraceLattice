@@ -105,6 +105,7 @@ Reasoning Enhancement Parameters:
 - confidence: Confidence in this thought's correctness (0-1)
 - hypothesis_id: Links hypothesis to verification (alphanumeric, hyphens, underscores)
 - verification_target: For 'verification'/'critique' types, the thought_number being evaluated
+- verification_result: Optional exact outcome label (0 = incorrect, 1 = correct) for a verification_target; only has outcome semantics on thought_type='verification'
 - synthesis_sources: For 'synthesis' type, the thought_numbers being combined
 - merge_from_thoughts: Thought numbers from other branches merged (graph reasoning)
 - merge_branch_ids: Branch IDs merged into current context
@@ -555,6 +556,12 @@ export const SequentialThinkingSchema = v.object({
 			v.number(),
 			v.minValue(1),
 			v.description('Thought number being verified or critiqued')
+		)
+	),
+	verification_result: v.optional(
+		v.pipe(
+			v.union([v.literal(0), v.literal(1)]),
+			v.description('Exact verification outcome label: 0 for incorrect, 1 for correct')
 		)
 	),
 	synthesis_sources: v.optional(

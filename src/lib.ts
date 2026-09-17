@@ -51,12 +51,12 @@ export interface ServerOptions {
 	fileConfig?: ConfigFileOptions;
 	container?: Container;
 	/**
-	 * Enable automatic skill discovery on server startup
+	 * Enable automatic tool and skill discovery on server startup.
 	 * @default true
 	 */
 	autoDiscover?: boolean;
 	/**
-	 * Enable lazy discovery (discover on first access instead of startup)
+	 * Suppress startup discovery so callers can discover through registry APIs explicitly.
 	 * @default false
 	 */
 	lazyDiscovery?: boolean;
@@ -202,13 +202,17 @@ export class ToolAwareSequentialThinkingServer
 				...options,
 				container,
 			});
+			await Promise.all([
+				server._skillWatcher?.ready() ?? Promise.resolve(),
+				server._toolWatcher?.ready() ?? Promise.resolve(),
+			]);
 
 			if (options.loadFromPersistence !== false) {
 				await server.history.loadFromPersistence();
 			}
 
-			if (options.autoDiscover !== false) {
-				await server.discoverSkillsAsync();
+			if (options.autoDiscover !== false && options.lazyDiscovery !== true) {
+				await Promise.all([server.tools.discoverAsync(), server.discoverSkillsAsync()]);
 			}
 
 			return server;
@@ -334,8 +338,8 @@ export class ToolAwareSequentialThinkingServer
 
 		// Initialize watchers if enabled
 		if (options.enableWatcher) {
-			this._skillWatcher = new SkillWatcher(this.skills);
-			this._toolWatcher = new ToolWatcher(this.tools);
+			this._skillWatcher = new SkillWatcher(this.skills, this._logger, this.config.skillDirs);
+			this._toolWatcher = new ToolWatcher(this.tools, this._logger, this.config.toolDirs);
 		}
 	}
 
@@ -460,6 +464,8 @@ export class ToolAwareSequentialThinkingServer
 					cache: config.discoveryCache
 						? new DiscoveryCache({ ...config.discoveryCache, metrics })
 						: undefined,
+					toolDirs: config.toolDirs,
+					lazyDiscovery,
 				})
 		);
 		container.register(

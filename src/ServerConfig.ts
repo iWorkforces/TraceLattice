@@ -24,6 +24,7 @@ import type { PersistenceConfig } from './contracts/PersistenceBackend.js';
  *   maxHistorySize: 500,
  *   maxBranches: 25,
  *   skillDirs: ['./custom-skills'],
+ *   toolDirs: ['./custom-tools'],
  *   persistence: { enabled: true, backend: 'sqlite' }
  * };
  * ```
@@ -51,9 +52,15 @@ export interface ServerConfigOptions {
 
 	/**
 	 * Directory paths to search for skills.
-	 * @default ['.claude/skills', '~/.claude/skills']
+	 * @default ['.claude/skills', '~/.claude/skills', '.agents/skills', '~/.agents/skills']
 	 */
 	skillDirs?: string[];
+
+	/**
+	 * Directory paths to search for tools.
+	 * @default ['.claude/tools', '~/.claude/tools']
+	 */
+	toolDirs?: string[];
 
 	/**
 	 * Discovery cache configuration.
@@ -123,7 +130,7 @@ export interface ServerConfigOptions {
  * Server configuration with validation and defaults.
  *
  * This class manages all server configuration including history limits,
- * branch limits, skill directories, discovery cache settings, and persistence.
+ * branch limits, discovery directories, cache settings, and persistence.
  * All values are validated on construction with appropriate defaults applied.
  *
  * @remarks
@@ -159,6 +166,9 @@ export class ServerConfig {
 
 	/** Directory paths to search for skills. */
 	public skillDirs: string[];
+
+	/** Directory paths to search for tools. */
+	public toolDirs: string[];
 
 	/** Discovery cache configuration. */
 	public discoveryCache: { ttl: number; maxSize: number };
@@ -208,6 +218,7 @@ export class ServerConfig {
 		this.maxBranches = this.validateMaxBranches(options.maxBranches);
 		this.maxBranchSize = this.validateMaxBranchSize(options.maxBranchSize);
 		this.skillDirs = this.validateSkillDirs(options.skillDirs);
+		this.toolDirs = this.validateToolDirs(options.toolDirs);
 		this.discoveryCache = this.validateDiscoveryCache(options.discoveryCache);
 		this.persistence = this.validatePersistence(options.persistence);
 		this.persistenceBufferSize = this.validatePersistenceBufferSize(options.persistenceBufferSize);
@@ -295,13 +306,22 @@ export class ServerConfig {
 	/**
 	 * Validates the skill directories value.
 	 * @param value - The value to validate
-	 * @returns The validated value or default ['.claude/skills', '~/.claude/skills']
+	 * @returns The validated value or default ['.claude/skills', '~/.claude/skills', '.agents/skills', '~/.agents/skills']
 	 * @private
 	 */
 	private validateSkillDirs(value?: string[]): string[] {
-		const defaultValue = ['.claude/skills', join(homedir(), '.claude/skills')];
-		if (!value) return defaultValue;
-		return value;
+		const defaultValue = [
+			'.claude/skills',
+			join(homedir(), '.claude/skills'),
+			'.agents/skills',
+			join(homedir(), '.agents/skills'),
+		];
+		return value === undefined ? defaultValue : [...value];
+	}
+
+	private validateToolDirs(value?: string[]): string[] {
+		const defaultValue = ['.claude/tools', join(homedir(), '.claude/tools')];
+		return value === undefined ? defaultValue : [...value];
 	}
 
 	/**
@@ -473,17 +493,13 @@ export class ServerConfig {
 		const defaultValue = 50;
 		if (value === undefined || value === null) return defaultValue;
 		if (typeof value !== 'number' || !Number.isFinite(value)) {
-			throw new ConfigurationError(
-				`maxSessionsPerOwner must be a finite number, got ${value}`
-			);
+			throw new ConfigurationError(`maxSessionsPerOwner must be a finite number, got ${value}`);
 		}
 		if (value < 1) {
 			throw new ConfigurationError(`maxSessionsPerOwner must be at least 1, got ${value}`);
 		}
 		if (value > 10000) {
-			throw new ConfigurationError(
-				`maxSessionsPerOwner must not exceed 10000, got ${value}`
-			);
+			throw new ConfigurationError(`maxSessionsPerOwner must not exceed 10000, got ${value}`);
 		}
 		return value;
 	}
@@ -509,6 +525,7 @@ export class ServerConfig {
 			maxBranches: this.maxBranches,
 			maxBranchSize: this.maxBranchSize,
 			skillDirs: this.skillDirs,
+			toolDirs: this.toolDirs,
 			discoveryCache: this.discoveryCache,
 			persistence: this.persistence,
 			persistenceBufferSize: this.persistenceBufferSize,

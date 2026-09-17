@@ -1,6 +1,6 @@
 # TraceLattice
 
-[![npm version](https://img.shields.io/npm/v/tracelattice?color=blue&label=npm)](https://www.npmjs.com/package/tracelattice)
+[![npm version](https://img.shields.io/npm/v/%40iworkforces%2Ftracelattice?color=blue&label=npm)](https://www.npmjs.com/package/@iworkforces/tracelattice)
 
 An MCP server that gives AI agents structured sequential thinking with tool and skill recommendations. Thoughts live in a DAG, reasoning strategies are pluggable, and confidence scores can be calibrated against recorded outcomes.
 
@@ -23,7 +23,7 @@ An MCP server that gives AI agents structured sequential thinking with tool and 
 Requires [Node.js](https://nodejs.org/) v22+ for development and build tooling. The packaged CLI is built with a Bun shebang, so install [Bun](https://bun.sh/) when running the `tracelattice` binary directly.
 
 ```bash
-npm install -g tracelattice
+npm install -g @iworkforces/tracelattice
 ```
 
 ## Configure your MCP client
@@ -65,6 +65,20 @@ Or via CLI:
 codex mcp add tracelattice -- tracelattice
 ```
 
+### Grok Build
+
+Add TraceLattice as a local MCP server:
+
+```bash
+grok mcp add tracelattice -- tracelattice
+```
+
+For a project-scoped MCP configuration, add `--scope project`:
+
+```bash
+grok mcp add --scope project tracelattice -- tracelattice
+```
+
 ### OpenCode
 
 Global (`~/.config/opencode/opencode.json`) or project-scoped (`.opencode.json`):
@@ -77,11 +91,12 @@ Global (`~/.config/opencode/opencode.json`) or project-scoped (`.opencode.json`)
       "command": [
         "npx",
         "-y",
-        "tracelattice"
+        "@iworkforces/tracelattice"
       ],
       "enabled": true,
       "environment": {
-        "MAX_HISTORY_SIZE": "10000"
+        "MAX_HISTORY_SIZE": "10000",
+        "LOG_LEVEL": "debug"
       }
     }
   }
@@ -91,6 +106,14 @@ Global (`~/.config/opencode/opencode.json`) or project-scoped (`.opencode.json`)
 ## Configuration
 
 ### Server
+
+Set `LOG_LEVEL` in the process environment to `debug`, `info`, `warn`, or `error`:
+
+```bash
+LOG_LEVEL=debug tracelattice
+```
+
+Environment variables override values from configuration files.
 
 | Variable | Default | Description |
 |----------|---------|-------------|

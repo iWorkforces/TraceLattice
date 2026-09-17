@@ -6,6 +6,8 @@ import { describe, expect, it } from 'vitest';
 
 const projectRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const packageManifestSchema = v.object({
+	name: v.string(),
+	bin: v.object({ tracelattice: v.string() }),
 	dependencies: v.optional(v.record(v.string(), v.string())),
 	devDependencies: v.record(v.string(), v.string()),
 	scripts: v.looseObject({
@@ -41,6 +43,18 @@ async function readPackageManifest() {
 }
 
 describe('release gate package scripts', () => {
+	it('publishes the scoped package while preserving the public CLI bin', async () => {
+		// Given
+		const packageManifest = await readPackageManifest();
+		// When
+		const packageIdentity = { name: packageManifest.name, bin: packageManifest.bin };
+		// Then
+		expect(packageIdentity).toEqual({
+			name: '@iworkforces/tracelattice',
+			bin: { tracelattice: './dist/cli.js' },
+		});
+	});
+
 	it('defines the canonical release-gate command graph', async () => {
 		// Given
 		const packageManifest = await readPackageManifest();

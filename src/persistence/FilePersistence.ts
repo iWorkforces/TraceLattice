@@ -17,8 +17,8 @@ import {
 	parseFileSnapshotV2,
 	serializeFileSnapshotV2,
 	sessionsInSnapshot,
-	type FileSnapshotV2,
 } from './FileSnapshotV2.js';
+import type { FileSnapshotV2 } from './FileSnapshotTypes.js';
 import { FileWriter, isFileNotFound, type FileWriterOperations } from './FileWriter.js';
 import {
 	assertBranchScope,

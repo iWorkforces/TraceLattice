@@ -265,6 +265,137 @@ describe('retained-reference policy', () => {
 		expect(resolve(manager, 'reset-me', 2).kind).toBe('unique');
 	});
 
+	it.each([
+		{ name: 'missing target field', target: undefined },
+		{ name: 'missing target thought', target: 99 },
+	])('rejects a result-bearing verification with a $name before admission', async ({ target }) => {
+		const manager = new HistoryManager();
+		const result = await makeProcessor(manager).process({
+			thought: 'strict verification',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			thought_type: 'verification',
+			verification_target: target,
+			verification_result: 1,
+		});
+
+		expect(result.isError).toBe(true);
+		expect(payload(result)).toMatchObject({ code: 'VALIDATION_ERROR' });
+		expect(manager.getHistory()).toHaveLength(0);
+	});
+
+	it('rejects an ambiguous result target before admission', async () => {
+		const manager = new HistoryManager();
+		manager.addThought(createTestThought({ id: 'first', thought_number: 1, confidence: 0.7 }));
+		manager.addThought(createTestThought({ id: 'second', thought_number: 1, confidence: 0.8 }));
+
+		const result = await makeProcessor(manager).process({
+			thought: 'ambiguous strict verification',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			thought_type: 'verification',
+			verification_target: 1,
+			verification_result: 0,
+		});
+
+		expect(payload(result)).toMatchObject({ code: 'VALIDATION_ERROR' });
+		expect(manager.getHistory()).toHaveLength(2);
+	});
+
+	it.each([
+		{ name: 'retracted', target: createTestThought({ id: 'target', retracted: true, confidence: 0.8 }) },
+		{ name: 'confidence-less', target: createTestThought({ id: 'target' }) },
+	])('rejects a $name result target before admission', async ({ target }) => {
+		const manager = new HistoryManager();
+		manager.addThought(target);
+
+		const result = await makeProcessor(manager).process({
+			thought: 'invalid target state',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			thought_type: 'verification',
+			verification_target: 1,
+			verification_result: 1,
+		});
+
+		expect(payload(result)).toMatchObject({ code: 'VALIDATION_ERROR' });
+		expect(manager.getHistory()).toHaveLength(1);
+	});
+
+	it('does not resolve a result target from another session', async () => {
+		const manager = new HistoryManager();
+		manager.addThought(
+			createTestThought({ id: 'other-target', session_id: 'other', confidence: 0.8 })
+		);
+
+		const result = await makeProcessor(manager).process({
+			thought: 'cross-session verification',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			session_id: asSessionId('current'),
+			thought_type: 'verification',
+			verification_target: 1,
+			verification_result: 1,
+		});
+
+		expect(payload(result)).toMatchObject({ code: 'VALIDATION_ERROR' });
+		expect(manager.getHistory(asSessionId('current'))).toHaveLength(0);
+	});
+
+	it('accepts one stable target copied between main history and a branch', async () => {
+		const manager = new HistoryManager();
+		manager.addThought(
+			createTestThought({
+				id: 'copied-target',
+				thought_number: 1,
+				confidence: 0.8,
+				branch_from_thought: 1,
+				branch_id: asBranchId('copy'),
+			})
+		);
+
+		const result = await makeProcessor(manager).process({
+			thought: 'stable identity verification',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			thought_type: 'verification',
+			verification_target: 1,
+			verification_result: 1,
+		});
+
+		expect(result.isError).toBeUndefined();
+		expect(manager.getHistory()).toHaveLength(2);
+	});
+
+	it('validates reset result targets against the empty replacement scope before reset', async () => {
+		const manager = new HistoryManager();
+		manager.addThought(
+			createTestThought({ id: 'retained', session_id: 'reset-result', confidence: 0.8 })
+		);
+
+		const result = await makeProcessor(manager).process({
+			thought: 'invalid reset verification',
+			thought_number: 2,
+			total_thoughts: 2,
+			next_thought_needed: false,
+			session_id: asSessionId('reset-result'),
+			reset_state: true,
+			thought_type: 'verification',
+			verification_target: 1,
+			verification_result: 1,
+		});
+
+		expect(payload(result)).toMatchObject({ code: 'VALIDATION_ERROR' });
+		expect(manager.getHistory(asSessionId('reset-result'))).toEqual([
+			expect.objectContaining({ id: asThoughtId('retained') }),
+		]);
+	});
+
 	it('rejects ambiguous backtrack before mutating history or targets', async () => {
 		const manager = new HistoryManager();
 		manager.addThought(createTestThought({ id: 'one-a', thought_number: 1 }));

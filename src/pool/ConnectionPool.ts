@@ -21,12 +21,11 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import {
 	MaxSessionsReachedError,
 	PoolTerminatedError,
-	SessionNotActiveError,
-	SessionNotFoundError,
 } from '../errors.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import { asSessionId, type SessionId } from '../contracts/ids.js';
 import { assertNever } from '../utils.js';
+import { SessionNotActiveError, SessionNotFoundError } from './PoolErrors.js';
 import type {
 	ConnectionPoolStats,
 	IConnectionPool,

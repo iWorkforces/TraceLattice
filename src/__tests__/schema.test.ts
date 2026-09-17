@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
 	JsonRpcRequestSchema,
 	SequentialThinkingSchema,
+	SEQUENTIAL_THINKING_TOOL,
 	ToolRecommendationSchema,
 	StepRecommendationSchema,
 	PartialToolRecommendationSchema,
@@ -228,6 +229,40 @@ describe('SequentialThinkingSchema', () => {
 		};
 		const result = safeParse(SequentialThinkingSchema, withBranch);
 		expect(result.success).toBe(true);
+	});
+
+	it.each([0, 1] as const)('accepts verification_result %i as an exact outcome label', (actual) => {
+		const result = safeParse(SequentialThinkingSchema, {
+			thought: 'Result-bearing verification',
+			thought_number: 2,
+			total_thoughts: 2,
+			thought_type: 'verification',
+			verification_target: 1,
+			verification_result: actual,
+		});
+
+		expect(result.success).toBe(true);
+		if (result.success) expect(result.output.verification_result).toBe(actual);
+	});
+
+	it.each([2, -1, 0.5, '1', true, false, null])(
+		'rejects non-binary verification_result %j',
+		(actual) => {
+			const result = safeParse(SequentialThinkingSchema, {
+				thought: 'Invalid result-bearing verification',
+				thought_number: 2,
+				total_thoughts: 2,
+				thought_type: 'verification',
+				verification_target: 1,
+				verification_result: actual,
+			});
+
+			expect(result.success).toBe(false);
+		}
+	);
+
+	it('publishes verification_result on the MCP tool description', () => {
+		expect(SEQUENTIAL_THINKING_TOOL.description).toContain('verification_result');
 	});
 });
 

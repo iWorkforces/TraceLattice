@@ -7,6 +7,8 @@ import {
 	asThoughtId,
 	type SessionId,
 } from '../../contracts/ids.js';
+import type { ICalibrator } from '../../contracts/calibrator.js';
+import type { IOutcomeRecorder } from '../../contracts/interfaces.js';
 import type { Summary } from '../../core/compression/Summary.js';
 import { HistoryManager } from '../../core/HistoryManager.js';
 import { SessionLifecycleCoordinator } from '../../core/SessionLifecycleCoordinator.js';
@@ -42,6 +44,24 @@ function summary(sessionId: SessionId): Summary {
 		aggregateConfidence: 0.8,
 		createdAt: 1,
 	};
+}
+
+function seedFittedCalibration(
+	recorder: IOutcomeRecorder,
+	calibrator: ICalibrator,
+	sessionId: SessionId
+): void {
+	for (let index = 0; index < 10; index++) {
+		recorder.recordVerification({
+			thoughtId: asThoughtId(`${sessionId}-outcome-${index}`),
+			thoughtNumber: index + 1,
+			sessionId,
+			predicted: 0.99,
+			actual: 0,
+			type: 'verification',
+		});
+	}
+	calibrator.refit(sessionId);
 }
 
 describe('session lifecycle integration', () => {
@@ -379,6 +399,74 @@ describe('session lifecycle integration', () => {
 		await manager.shutdown();
 	});
 
+	it('clears recorded outcomes, duplicate keys, and fitted temperature on TTL eviction', async () => {
+		const sessionId = asSessionId('ttl-calibration');
+		const server = await createServer({
+			config: new ServerConfig({
+				features: { outcomeRecording: true, calibration: true },
+			}),
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		const recorder = server.getContainer().resolve('outcomeRecorder');
+		const calibrator = server.getContainer().resolve('calibrator');
+		server.history.addThought(thought(sessionId, 1));
+		seedFittedCalibration(recorder, calibrator, sessionId);
+		expect(calibrator.calibrate(0.9, 'verification', sessionId).temperature).toBeGreaterThan(1);
+
+		await vi.advanceTimersByTimeAsync(SESSION_TTL_MS + CLEANUP_INTERVAL_MS + 1);
+		await vi.waitFor(() => expect(server.history.getSessionIds()).not.toContain(sessionId));
+
+		expect(recorder.getOutcomes(sessionId)).toEqual([]);
+		expect(() => recorder.assertCanRecord(sessionId, asThoughtId(`${sessionId}-outcome-0`))).not.toThrow();
+		expect(calibrator.calibrate(0.9, 'verification', sessionId).temperature).toBe(1);
+		await server.stop();
+	});
+
+	it('clears calibration state when owner capacity removes the least-recent session', async () => {
+		const removedSession = asSessionId('owner-removed');
+		const retainedSession = asSessionId('owner-retained');
+		const server = await createServer({
+			config: new ServerConfig({
+				maxSessionsPerOwner: 1,
+				features: { outcomeRecording: true, calibration: true },
+			}),
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		const recorder = server.getContainer().resolve('outcomeRecorder');
+		const calibrator = server.getContainer().resolve('calibrator');
+		await runWithContext({ requestId: 'first', owner: 'owner' }, () =>
+			server.processThought({
+				thought: 'first owner session',
+				thought_number: 1,
+				total_thoughts: 1,
+				next_thought_needed: false,
+				session_id: removedSession,
+			})
+		);
+		seedFittedCalibration(recorder, calibrator, removedSession);
+
+		await runWithContext({ requestId: 'second', owner: 'owner' }, () =>
+			server.processThought({
+				thought: 'replacement owner session',
+				thought_number: 1,
+				total_thoughts: 1,
+				next_thought_needed: false,
+				session_id: retainedSession,
+			})
+		);
+
+		expect(server.history.getSessionIds()).not.toContain(removedSession);
+		expect(server.history.getSessionIds()).toContain(retainedSession);
+		expect(recorder.getOutcomes(removedSession)).toEqual([]);
+		expect(() =>
+			recorder.assertCanRecord(removedSession, asThoughtId(`${removedSession}-outcome-0`))
+		).not.toThrow();
+		expect(calibrator.calibrate(0.9, 'verification', removedSession).temperature).toBe(1);
+		await server.stop();
+	});
+
 	it('uses deterministic owner LRU and rejects admission when the required victim is active', async () => {
 		const lifecycle = new SessionLifecycleCoordinator();
 		const clearAuxiliaryState = vi.fn();
@@ -549,15 +637,8 @@ describe('session lifecycle integration', () => {
 			toolArguments: {},
 			expiresAt: 0,
 		});
-		outcomeRecorder.recordVerification({
-			thoughtId: asThoughtId('server-shutdown-2'),
-			thoughtNumber: 2,
-			sessionId,
-			predicted: 0.8,
-			actual: 1,
-			type: 'verification',
-		});
-		calibrator.refit(sessionId);
+		seedFittedCalibration(outcomeRecorder, calibrator, sessionId);
+		expect(calibrator.calibrate(0.9, 'verification', sessionId).temperature).toBeGreaterThan(1);
 
 		await server.stop();
 
@@ -565,7 +646,11 @@ describe('session lifecycle integration', () => {
 		expect(edgeStore.size()).toBe(0);
 		expect(suspensionStore.size()).toBe(0);
 		expect(outcomeRecorder.getAllOutcomes()).toEqual([]);
+		expect(() =>
+			outcomeRecorder.assertCanRecord(sessionId, asThoughtId(`${sessionId}-outcome-0`))
+		).not.toThrow();
 		expect(calibrator.metrics(sessionId).sampleCount).toBe(0);
+		expect(calibrator.calibrate(0.9, 'verification', sessionId).temperature).toBe(1);
 		await server.dispose();
 	});
 

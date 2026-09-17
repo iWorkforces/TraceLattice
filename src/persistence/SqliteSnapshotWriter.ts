@@ -1,6 +1,10 @@
 import type { Summary } from '../core/compression/Summary.js';
 import type { Edge } from '../core/graph/Edge.js';
-import type { BranchRecordV2, FileSnapshotV2, ThoughtSessionV2 } from './FileSnapshotV2.js';
+import type {
+	BranchRecordV2,
+	FileSnapshotV2,
+	ThoughtSessionV2,
+} from './FileSnapshotTypes.js';
 import type { SqliteDatabase } from './SqliteDriver.js';
 import { runSqliteTransaction } from './SqliteDriver.js';
 import {
