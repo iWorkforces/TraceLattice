@@ -29,5 +29,5 @@ health/
   - All healthy (or none registered) → `'ok'`
   - Some healthy → `'degraded'`
   - None healthy → `'unhealthy'`
-- Used by `GET /ready` on `StreamableHttpTransport` and `SseTransport`.
+- Used by `GET /ready` on `StreamableHttpTransport`.
 - Pass `null` for persistence when no backend is configured — checker skips it.
