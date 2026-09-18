@@ -2,7 +2,25 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { request } from 'node:http';
 import { McpServer } from 'tmcp';
 import { ValibotJsonSchemaAdapter } from '@tmcp/adapter-valibot';
+import { Metrics } from '../metrics/metrics.impl.js';
 import { HttpTransport } from '../transport/HttpTransport.js';
+
+const EXPECTED_METRICS =
+	'# HELP test_metric_total Test metric\n' +
+	'# TYPE test_metric_total counter\n' +
+	'test_metric_total{workflow="plan\\\\review\\"\\nnext"} 42';
+
+function createMockMcpServer(): McpServer {
+	return new McpServer(
+		{ name: 'test-http-transport', version: '1.0.0' },
+		{
+			adapter: new ValibotJsonSchemaAdapter(),
+			capabilities: {
+				tools: { listChanged: true },
+			},
+		}
+	);
+}
 
 function httpRequest(options: {
 	port: number;
@@ -53,26 +71,17 @@ describe('HttpTransport', () => {
 
 	beforeEach(async () => {
 		port = 7000 + Math.floor(Math.random() * 1000);
+		const metrics = new Metrics();
+		metrics.counter('test_metric_total', 42, { workflow: 'plan\\review"\nnext' }, 'Test metric');
 		transport = new HttpTransport({
 			port,
 			host: '127.0.0.1',
 			corsOrigin: 'https://allowed.example.com',
 			maxRequestsPerMinute: 1,
-			metricsProvider: () =>
-				'# HELP test_metric Test metric\n# TYPE test_metric counter\ntest_metric 1\n',
+			metricsProvider: () => metrics.export(),
 		});
 
-		const mockMcpServer = new McpServer(
-			{ name: 'test-http-transport', version: '1.0.0' },
-			{
-				adapter: new ValibotJsonSchemaAdapter(),
-				capabilities: {
-					tools: { listChanged: true },
-				},
-			}
-		);
-
-		await transport.connect(mockMcpServer);
+		await transport.connect(createMockMcpServer());
 	});
 
 	afterEach(async () => {
@@ -142,8 +151,24 @@ describe('HttpTransport', () => {
 		});
 
 		expect(response.statusCode).toBe(200);
-		expect(response.body).toContain('test_metric 1');
-		expect(response.headers['content-type']).toContain('text/plain');
+		expect(response.body).toBe(EXPECTED_METRICS);
+		expect(response.headers['content-type']).toBe('text/plain; version=0.0.4; charset=utf-8');
+	});
+
+	it('returns the existing 404 response when no metrics provider is configured', async () => {
+		await transport.stop();
+		transport = new HttpTransport({
+			port,
+			host: '127.0.0.1',
+			enableRateLimit: false,
+		});
+		await transport.connect(createMockMcpServer());
+
+		const response = await httpRequest({ port, method: 'GET', path: '/metrics' });
+
+		expect(response.statusCode).toBe(404);
+		expect(response.body).toBe('Not Found');
+		expect(response.headers['content-type']).toBe('text/plain');
 	});
 
 	it('returns 403 for invalid host header', async () => {
