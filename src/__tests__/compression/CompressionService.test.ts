@@ -12,6 +12,7 @@ import type { ThoughtReferenceResolution } from '../../core/ThoughtReferenceInde
 import type { ThoughtData } from '../../core/thought.js';
 import type { ConfidenceSignals } from '../../core/reasoning.js';
 import type { Edge } from '../../core/graph/Edge.js';
+import type { Logger, LogLevel } from '../../logger/StructuredLogger.js';
 import {
 	asBranchId,
 	asSessionId,
@@ -47,7 +48,21 @@ function makeThought(
 }
 
 class FakeHistoryManager implements IHistoryManager {
+	private readonly _branches: Record<BranchId, ThoughtData[]> = {} as Record<
+		BranchId,
+		ThoughtData[]
+	>;
+	private readonly _branchIds: BranchId[] = [];
+	public inspectCalls = 0;
+	public getHistoryCalls = 0;
+
 	constructor(private readonly _thoughts: ThoughtData[] = []) {}
+
+	addBranch(branchId: BranchId, thoughts: readonly ThoughtData[]): void {
+		this._branchIds.push(branchId);
+		this._branches[branchId] = [...thoughts];
+	}
+
 	addThought(t: ThoughtData): void {
 		this._thoughts.push(t);
 	}
@@ -55,16 +70,17 @@ class FakeHistoryManager implements IHistoryManager {
 		return { kind: 'missing' };
 	}
 	getHistory(): ThoughtData[] {
+		this.getHistoryCalls += 1;
 		return this._thoughts;
 	}
 	getHistoryLength(): number {
 		return this._thoughts.length;
 	}
 	getBranches(): Record<BranchId, ThoughtData[]> {
-		return {} as Record<BranchId, ThoughtData[]>;
+		return this._branches;
 	}
 	getBranchIds(): BranchId[] {
-		return [];
+		return [...this._branchIds];
 	}
 	registerBranch(): void {}
 	branchExists(): boolean {
@@ -86,10 +102,13 @@ class FakeHistoryManager implements IHistoryManager {
 		this.clear();
 	}
 	inspectSession(): HistorySessionSnapshot {
+		this.inspectCalls += 1;
 		return {
 			history: [...this._thoughts],
-			branches: {},
-			branchIds: [],
+			branches: Object.fromEntries(
+				this._branchIds.map((branchId) => [branchId, [...(this._branches[branchId] ?? [])]])
+			) as Record<BranchId, readonly ThoughtData[]>,
+			branchIds: [...this._branchIds],
 			availableMcpTools: undefined,
 			availableSkills: undefined,
 		};
@@ -136,20 +155,23 @@ function newHarness(thoughts: ThoughtData[] = []): Harness {
 	const edges = new EdgeStore();
 	const store = new InMemorySummaryStore();
 	const logs: Array<{ msg: string; ctx?: unknown }> = [];
-	const logger = {
+	const logger: Logger = {
 		debug(msg: string, ctx?: unknown): void {
 			logs.push({ msg, ctx });
 		},
 		info(): void {},
 		warn(): void {},
 		error(): void {},
+		setLevel(): void {},
+		getLevel(): LogLevel {
+			return 'debug';
+		},
 	};
 	const svc = new CompressionService({
 		historyManager: hm,
 		edgeStore: edges,
 		summaryStore: store,
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		logger: logger as any,
+		logger,
 	});
 	return { svc, store, edges, hm, logs };
 }
@@ -182,6 +204,33 @@ describe('CompressionService', () => {
 		const summary = h.svc.compressBranch(SESSION, BRANCH, asThoughtId('a'));
 		expect(summary.coveredIds).toEqual(['a', 'b', 'c']);
 		expect(summary.coveredRange).toEqual([1, 3]);
+	});
+
+	it('resolves branch-only thoughts from exactly one session snapshot', () => {
+		const root = makeThought('branch-root', 'branch snapshot root', 4, 0.6);
+		const child = makeThought('branch-child', 'branch snapshot child', 5, 0.8);
+		h.hm.addBranch(BRANCH, [root, child]);
+		addSeqEdge(h.edges, 'branch-root', 'branch-child');
+
+		const summary = h.svc.compressBranch(SESSION, BRANCH, asThoughtId('branch-root'));
+
+		expect(summary.coveredIds).toEqual(['branch-root', 'branch-child']);
+		expect(summary.coveredRange).toEqual([4, 5]);
+		expect(summary.aggregateConfidence).toBeCloseTo(0.7);
+		expect(h.hm.inspectCalls).toBe(1);
+		expect(h.hm.getHistoryCalls).toBe(0);
+	});
+
+	it('prefers the main-history record when a branch snapshot repeats its id', () => {
+		h.hm.addThought(makeThought('shared', 'canonical main topic', 2, 0.9));
+		h.hm.addBranch(BRANCH, [makeThought('shared', 'duplicate branch topic', 99, 0.1)]);
+
+		const summary = h.svc.compressBranch(SESSION, BRANCH, asThoughtId('shared'));
+
+		expect(summary.coveredRange).toEqual([2, 2]);
+		expect(summary.aggregateConfidence).toBeCloseTo(0.9);
+		expect(summary.topics).toContain('canonical');
+		expect(summary.topics).not.toContain('duplicate');
 	});
 
 	it('is idempotent: re-compressing returns the same Summary instance', () => {
@@ -239,14 +288,26 @@ describe('CompressionService', () => {
 		expect(summary.coveredRange).toEqual([2, 9]);
 	});
 
-	it('silently skips covered ids missing from history', () => {
+	it('excludes graph ghost ids from every derived summary field', () => {
 		h.hm.addThought(makeThought('a', 'alpha keyword', 1, 0.4));
 		// 'ghost' has an edge but no thought in history
 		addSeqEdge(h.edges, 'a', 'ghost');
 		const summary = h.svc.compressBranch(SESSION, BRANCH, asThoughtId('a'));
-		expect(summary.coveredIds).toEqual(['a', 'ghost']);
+		expect(summary.coveredIds).toEqual(['a']);
 		expect(summary.coveredRange).toEqual([1, 1]);
 		expect(summary.aggregateConfidence).toBeCloseTo(0.4);
+	});
+
+	it('retains resolved descendants when the requested root is missing', () => {
+		h.hm.addThought(makeThought('child', 'resolved descendant topic', 7, 0.6));
+		addSeqEdge(h.edges, 'missing-root', 'child');
+
+		const summary = h.svc.compressBranch(SESSION, BRANCH, asThoughtId('missing-root'));
+
+		expect(summary.rootThoughtId).toBe('missing-root');
+		expect(summary.coveredIds).toEqual(['child']);
+		expect(summary.coveredRange).toEqual([7, 7]);
+		expect(summary.aggregateConfidence).toBeCloseTo(0.6);
 	});
 
 	it('emits a debug log on compression when logger provided', () => {
@@ -271,7 +332,8 @@ describe('CompressionService', () => {
 	it('returns 0 confidence and [0,0] range when history has no matching thought', () => {
 		// Root id has no entry in history at all
 		const summary = h.svc.compressBranch(SESSION, BRANCH, asThoughtId('orphan'));
-		expect(summary.coveredIds).toEqual(['orphan']);
+		expect(summary.rootThoughtId).toBe('orphan');
+		expect(summary.coveredIds).toEqual([]);
 		expect(summary.aggregateConfidence).toBe(0);
 		expect(summary.coveredRange).toEqual([0, 0]);
 		expect(summary.topics).toEqual([]);
