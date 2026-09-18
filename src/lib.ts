@@ -40,6 +40,11 @@ import { ServerConfig } from './ServerConfig.js';
 import { SkillWatcher } from './watchers/SkillWatcher.js';
 import { ToolWatcher } from './watchers/ToolWatcher.js';
 
+export { HttpTransport, createHttpTransport } from './transport/HttpTransport.js';
+export type { HttpTransportOptions } from './transport/HttpTransport.js';
+export type { TransportOptions } from './transport/BaseTransport.js';
+export type { ITransport, TransportKind } from './contracts/transport.js';
+
 export interface ServerOptions {
 	maxHistorySize?: number;
 	maxBranches?: number;
@@ -770,6 +775,8 @@ export class ToolAwareSequentialThinkingServer
  *
  * @example
  * ```typescript
+ * import { createServer } from '@iworkforces/tracelattice';
+ *
  * // Basic usage (with async discovery and persistence)
  * const server = await createServer();
  *
@@ -780,11 +787,6 @@ export class ToolAwareSequentialThinkingServer
  *   maxHistorySize: 500,
  *   loadFromPersistence: true
  * });
- *
- * // With custom container for testing
- * const mockContainer = new Container();
- * mockContainer.registerInstance('Logger', mockLogger);
- * const server = await createServer({ container: mockContainer });
  * ```
  */
 export async function createServer(
