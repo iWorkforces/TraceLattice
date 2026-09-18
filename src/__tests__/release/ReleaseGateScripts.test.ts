@@ -42,6 +42,10 @@ async function readPackageManifest() {
 	return v.parse(packageManifestSchema, JSON.parse(packageContents));
 }
 
+async function readPackedVerifier() {
+	return readFile(resolve(projectRoot, 'scripts/verify-packed-cli.mjs'), 'utf8');
+}
+
 describe('release gate package scripts', () => {
 	it('publishes the scoped package while preserving the public CLI bin', async () => {
 		// Given
@@ -110,5 +114,22 @@ describe('release gate package scripts', () => {
 			undefined,
 			undefined,
 		]);
+	});
+
+	it('runs installed library consumers after inspection and before CLI runtime checks', async () => {
+		// Given
+		const verifierSource = await readPackedVerifier();
+		// When
+		const inspection = verifierSource.indexOf(
+			'artifact = await inspectPackedPackage(packageDirectory)'
+		);
+		const library = verifierSource.indexOf(
+			'await verifyPackedLibraryApi(artifact, repositoryRoot)'
+		);
+		const runtime = verifierSource.indexOf('await verifyPackedRuntime(artifact)');
+		// Then
+		expect(inspection).toBeGreaterThan(-1);
+		expect(library).toBeGreaterThan(inspection);
+		expect(runtime).toBeGreaterThan(library);
 	});
 });

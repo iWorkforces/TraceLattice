@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { PackedCliError, appendCleanupDiagnostics } from './packed-cli-cleanup.mjs';
 import { cleanupPackedPackage, inspectPackedPackage } from './packed-cli-package.mjs';
 import { verifyPackedRuntime } from './packed-cli-runtime.mjs';
+import { verifyPackedLibraryApi } from './packed-library-api.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -114,6 +115,7 @@ async function run() {
 	let verificationSucceeded = false;
 	try {
 		artifact = await inspectPackedPackage(packageDirectory);
+		await verifyPackedLibraryApi(artifact, repositoryRoot);
 		const runtime = await verifyPackedRuntime(artifact);
 		verificationSucceeded = true;
 		if (outputDirectory) {

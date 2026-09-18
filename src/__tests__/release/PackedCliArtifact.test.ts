@@ -37,6 +37,81 @@ if (process.argv.includes('--version')) {
   });
 }
 `;
+const libraryBody = `import { createServer as createNodeServer } from 'node:http';
+export class HttpTransport {
+  constructor(options = {}) {
+    this.port = options.port ?? 9108;
+    this.host = options.host ?? '127.0.0.1';
+    this.path = options.path ?? '/messages';
+    this.receiver = null;
+    this.server = createNodeServer(async (request, response) => {
+      if (request.method !== 'POST' || request.url !== this.path) {
+        response.writeHead(404).end();
+        return;
+      }
+      let body = '';
+      for await (const chunk of request) body += chunk;
+      const message = JSON.parse(body);
+      const result = await this.receiver.receive(message, { sessionInfo: {} });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(result));
+    });
+  }
+  get kind() { return 'http'; }
+  get clientCount() { return 0; }
+  get isShuttingDown() { return false; }
+  get serverUrl() { return \`http://\${this.host}:\${this.port}\`; }
+  async connect(receiver) {
+    this.receiver = receiver;
+    await new Promise((resolve, reject) => {
+      this.server.once('error', reject);
+      this.server.listen(this.port, this.host, resolve);
+    });
+  }
+  async stop() {
+    if (!this.server.listening) return;
+    await new Promise((resolve, reject) => this.server.close((error) => error ? reject(error) : resolve()));
+  }
+}
+export function createHttpTransport(options = {}) { return new HttpTransport(options); }
+export class ToolAwareSequentialThinkingServer { async stop() {} async dispose() {} }
+export async function createServer() { return new ToolAwareSequentialThinkingServer(); }
+export async function initializeServer() { return createServer(); }
+`;
+const libraryDeclarations = `export type TransportKind = 'http' | 'streamable-http';
+export interface TransportOptions {
+  readonly port?: number;
+  readonly host?: string;
+  readonly enableRateLimit?: boolean;
+}
+export interface HttpTransportOptions extends TransportOptions { readonly path?: string; }
+export interface ITransport {
+  readonly kind: TransportKind;
+  readonly clientCount: number;
+  readonly isShuttingDown: boolean;
+  readonly serverUrl: string;
+  connect(server: object): Promise<void>;
+  stop(timeout?: number): Promise<void>;
+}
+export declare class HttpTransport implements ITransport {
+  constructor(options?: HttpTransportOptions);
+  readonly kind: 'http';
+  readonly clientCount: number;
+  readonly isShuttingDown: boolean;
+  readonly serverUrl: string;
+  connect(server: object): Promise<void>;
+  stop(timeout?: number): Promise<void>;
+}
+export declare function createHttpTransport(options?: HttpTransportOptions): HttpTransport;
+export interface ServerOptions { readonly autoDiscover?: boolean; readonly loadFromPersistence?: boolean; }
+export declare class ToolAwareSequentialThinkingServer {
+  static create(options?: ServerOptions): Promise<ToolAwareSequentialThinkingServer>;
+  stop(): Promise<void>;
+  dispose(): Promise<void>;
+}
+export declare function createServer(options?: ServerOptions): Promise<ToolAwareSequentialThinkingServer>;
+export declare function initializeServer(): Promise<ToolAwareSequentialThinkingServer>;
+`;
 
 const cases: readonly FixtureCase[] = [
 	{
@@ -137,6 +212,27 @@ const cases: readonly FixtureCase[] = [
 			manifest.files = ['dist', 'README.md', 'LICENSE', '../outside'];
 		},
 	},
+	{
+		label: 'broken runtime root export with library file present',
+		code: 'PACKED_LIBRARY_RUNTIME_FAILED',
+		mutate: async (root) =>
+			writeFile(
+				join(root, 'dist/lib.js'),
+				libraryBody.replace('export function createHttpTransport', 'function createHttpTransport')
+			),
+	},
+	{
+		label: 'broken root declaration with declaration file present',
+		code: 'PACKED_LIBRARY_TYPES_FAILED',
+		mutate: async (root) =>
+			writeFile(
+				join(root, 'dist/lib.d.ts'),
+				libraryDeclarations.replace(
+					'export declare function createHttpTransport(options?: HttpTransportOptions): HttpTransport;\n',
+					''
+				)
+			),
+	},
 ];
 
 async function createFixture(fixtureCase: FixtureCase): Promise<string> {
@@ -145,8 +241,8 @@ async function createFixture(fixtureCase: FixtureCase): Promise<string> {
 	await mkdir(join(root, 'dist'));
 	await writeFile(join(root, 'README.md'), 'fixture\n');
 	await writeFile(join(root, 'LICENSE'), 'fixture\n');
-	await writeFile(join(root, 'dist/lib.js'), 'export const fixture = true;\n');
-	await writeFile(join(root, 'dist/lib.d.ts'), 'export declare const fixture: true;\n');
+	await writeFile(join(root, 'dist/lib.js'), libraryBody);
+	await writeFile(join(root, 'dist/lib.d.ts'), libraryDeclarations);
 	await writeFile(join(root, 'dist/cli.js'), cliBody);
 	await chmod(join(root, 'dist/cli.js'), 0o755);
 	const manifest: FixtureManifest = {
@@ -190,6 +286,43 @@ async function runVerifier(
 			resolve({ code, stderr });
 		});
 	});
+}
+
+async function createCleanupFailureLoader(): Promise<string> {
+	const loaderRoot = await mkdtemp(join(tmpdir(), 'tracelattice-cleanup-loader-'));
+	temporaryRoots.push(loaderRoot);
+	const loader = join(loaderRoot, 'cleanup-failure-loader.mjs');
+	await writeFile(
+		loader,
+		`const cleanupModuleUrl = ${JSON.stringify(cleanupModuleUrl)};
+export async function resolve(specifier, context, nextResolve) {
+  if (specifier === 'node:fs/promises' && context.parentURL === cleanupModuleUrl) {
+    return { url: 'cleanup-failure:fs-promises', shortCircuit: true };
+  }
+  return nextResolve(specifier, context);
+}
+export async function load(url, context, nextLoad) {
+  if (url !== 'cleanup-failure:fs-promises') return nextLoad(url, context);
+  return {
+    format: 'module',
+    shortCircuit: true,
+    source: \`import * as fs from 'node:fs/promises';
+import { basename } from 'node:path';
+export const { access, mkdtemp, readFile, readdir, writeFile } = fs;
+let rejected = false;
+export async function rm(path, options) {
+  if (!rejected && typeof path === 'string' && basename(path).startsWith('tracelattice-consumer-')) {
+    rejected = true;
+    await fs.rm(path, options);
+    throw new Error('injected consumer cleanup rejection');
+  }
+  return fs.rm(path, options);
+}\`,
+  };
+}
+`
+	);
+	return loader;
 }
 
 afterEach(async () => {
@@ -244,39 +377,7 @@ describe('packed CLI artifact contract', () => {
 		const missingImport = cases.find((fixtureCase) => fixtureCase.label === 'missing root import');
 		if (!missingImport) throw new Error('missing root import fixture case is required');
 		const packageDirectory = await createFixture(missingImport);
-		const loaderRoot = await mkdtemp(join(tmpdir(), 'tracelattice-cleanup-loader-'));
-		temporaryRoots.push(loaderRoot);
-		const loader = join(loaderRoot, 'cleanup-failure-loader.mjs');
-		await writeFile(
-			loader,
-			`const cleanupModuleUrl = ${JSON.stringify(cleanupModuleUrl)};
-export async function resolve(specifier, context, nextResolve) {
-  if (specifier === 'node:fs/promises' && context.parentURL === cleanupModuleUrl) {
-    return { url: 'cleanup-failure:fs-promises', shortCircuit: true };
-  }
-  return nextResolve(specifier, context);
-}
-export async function load(url, context, nextLoad) {
-  if (url !== 'cleanup-failure:fs-promises') return nextLoad(url, context);
-  return {
-    format: 'module',
-    shortCircuit: true,
-    source: \`import * as fs from 'node:fs/promises';
-import { basename } from 'node:path';
-export const { access, mkdtemp, readFile, readdir, writeFile } = fs;
-let rejected = false;
-export async function rm(path, options) {
-  if (!rejected && typeof path === 'string' && basename(path).startsWith('tracelattice-consumer-')) {
-    rejected = true;
-    await fs.rm(path, options);
-    throw new Error('injected consumer cleanup rejection');
-  }
-  return fs.rm(path, options);
-}\`,
-  };
-}
-`
-		);
+		const loader = await createCleanupFailureLoader();
 		const before = new Set(
 			(await readdir(tmpdir())).filter((entry) => /^tracelattice-(?:pack|consumer)-/.test(entry))
 		);
@@ -285,6 +386,31 @@ export async function rm(path, options) {
 		// Then
 		expect(result.code).not.toBe(0);
 		expect(result.stderr).toContain('PACKED_EXPORT_MISSING: . import');
+		expect(result.stderr).toContain('injected consumer cleanup rejection');
+		expect(result.stderr).toContain('PACK_SUCCEEDED=true');
+		expect(result.stderr).toContain('INSTALL_SUCCEEDED=true');
+		const leaked = (await readdir(tmpdir())).filter(
+			(entry) => /^tracelattice-(?:pack|consumer)-/.test(entry) && !before.has(entry)
+		);
+		expect(leaked).toEqual([]);
+	}, 120_000);
+
+	it('preserves a library runtime failure when artifact cleanup also fails', async () => {
+		// Given
+		const brokenRuntime = cases.find(
+			(fixtureCase) => fixtureCase.label === 'broken runtime root export with library file present'
+		);
+		if (!brokenRuntime) throw new Error('broken runtime fixture case is required');
+		const packageDirectory = await createFixture(brokenRuntime);
+		const loader = await createCleanupFailureLoader();
+		const before = new Set(
+			(await readdir(tmpdir())).filter((entry) => /^tracelattice-(?:pack|consumer)-/.test(entry))
+		);
+		// When
+		const result = await runVerifier(packageDirectory, { loader });
+		// Then
+		expect(result.code).not.toBe(0);
+		expect(result.stderr).toContain('PACKED_LIBRARY_RUNTIME_FAILED');
 		expect(result.stderr).toContain('injected consumer cleanup rejection');
 		expect(result.stderr).toContain('PACK_SUCCEEDED=true');
 		expect(result.stderr).toContain('INSTALL_SUCCEEDED=true');
