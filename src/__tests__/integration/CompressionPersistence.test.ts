@@ -48,6 +48,11 @@ const SQLITE_AVAILABLE = await (async () => {
 
 type BackendKind = 'memory' | 'file' | 'sqlite';
 
+interface BackendHarness {
+	readonly persistence: PersistenceBackend;
+	readonly reopen: () => Promise<PersistenceBackend>;
+}
+
 function makeThought(num: number, overrides?: Partial<ThoughtData>): ThoughtData {
 	return createTestThought({
 		id: generateUlid(),
@@ -110,14 +115,26 @@ describe('Compression persistence integration', () => {
 		await rm(tmpRoot, { recursive: true, force: true });
 	});
 
-	async function makeBackend(kind: BackendKind): Promise<PersistenceBackend> {
+	async function makeBackend(kind: BackendKind): Promise<BackendHarness> {
 		switch (kind) {
-			case 'memory':
-				return new MemoryPersistence();
-			case 'file':
-				return new FilePersistence({ dataDir: await mkdtemp(join(tmpRoot, 'file-')) });
-			case 'sqlite':
-				return await SqlitePersistence.create({ dbPath: ':memory:' });
+			case 'memory': {
+				const persistence = new MemoryPersistence();
+				return { persistence, reopen: async () => persistence };
+			}
+			case 'file': {
+				const dataDir = await mkdtemp(join(tmpRoot, 'file-'));
+				return {
+					persistence: await FilePersistence.create({ dataDir }),
+					reopen: async () => await FilePersistence.create({ dataDir }),
+				};
+			}
+			case 'sqlite': {
+				const dbPath = join(await mkdtemp(join(tmpRoot, 'sqlite-')), 'history.db');
+				return {
+					persistence: await SqlitePersistence.create({ dbPath }),
+					reopen: async () => await SqlitePersistence.create({ dbPath }),
+				};
+			}
 		}
 	}
 
@@ -130,9 +147,10 @@ describe('Compression persistence integration', () => {
 		// Flag-ON: compression service is wired and explicitly invoked
 		// -------------------------------------------------------------------
 		it.skipIf(skip)(
-			`flag ON: persists and reloads a Summary on the ${kind} backend`,
+			`flag ON: persists and reloads a Summary after reopening the ${kind} backend`,
 			async () => {
-				const persistence = await makeBackend(kind);
+				const backend = await makeBackend(kind);
+				const { persistence } = backend;
 				const edgeStore = new EdgeStore();
 				const summaryStore = new InMemorySummaryStore();
 				const manager = new HistoryManager({
@@ -161,9 +179,11 @@ describe('Compression persistence integration', () => {
 				const inMem = summaryStore.forBranch(SESSION, BRANCH);
 				expect(inMem).toHaveLength(1);
 
-				// Persist + reload.
 				await persistence.saveSummaries(SESSION, summaryStore.forSession(SESSION));
-				const reloaded = await persistence.loadSummaries(SESSION);
+				await manager.shutdown();
+				await persistence.close();
+				const reopened = await backend.reopen();
+				const reloaded = await reopened.loadSummaries(SESSION);
 
 				expect(reloaded).toHaveLength(1);
 				const r = reloaded[0]!;
@@ -180,8 +200,7 @@ describe('Compression persistence integration', () => {
 				expect(r.aggregateConfidence).toBeCloseTo(summary.aggregateConfidence);
 				expect(r.createdAt).toBe(summary.createdAt);
 
-				await manager.shutdown();
-				await persistence.close();
+				await reopened.close();
 			}
 		);
 
@@ -189,9 +208,10 @@ describe('Compression persistence integration', () => {
 		// Flag-OFF: compression service is NOT wired / not invoked
 		// -------------------------------------------------------------------
 		it.skipIf(skip)(
-			`flag OFF: produces no summaries on the ${kind} backend`,
+			`flag OFF: produces no summaries after reopening the ${kind} backend`,
 			async () => {
-				const persistence = await makeBackend(kind);
+				const backend = await makeBackend(kind);
+				const { persistence } = backend;
 				const edgeStore = new EdgeStore();
 				const summaryStore = new InMemorySummaryStore();
 				const manager = new HistoryManager({
@@ -210,11 +230,13 @@ describe('Compression persistence integration', () => {
 
 				// Save the (empty) summary set, then reload — backend must report nothing.
 				await persistence.saveSummaries(SESSION, summaryStore.forSession(SESSION));
-				const reloaded = await persistence.loadSummaries(SESSION);
-				expect(reloaded).toHaveLength(0);
-
 				await manager.shutdown();
 				await persistence.close();
+				const reopened = await backend.reopen();
+				const reloaded = await reopened.loadSummaries(SESSION);
+				expect(reloaded).toHaveLength(0);
+
+				await reopened.close();
 			}
 		);
 	}

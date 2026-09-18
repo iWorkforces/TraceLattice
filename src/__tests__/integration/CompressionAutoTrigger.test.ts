@@ -123,8 +123,15 @@ describe('Compression Auto-Trigger Integration', () => {
 
 		const summaries = deps.summaryStore.forBranch('__global__', asBranchId('alt-1'));
 		expect(summaries.length).toBe(1);
-		expect(summaries[0]!.branchId).toBe('alt-1');
-		expect(summaries[0]!.sessionId).toBe('__global__');
+		const summary = summaries[0];
+		const branchThought = deps.history.getBranches()[asBranchId('alt-1')]?.[0];
+		if (summary === undefined || branchThought?.id === undefined) {
+			throw new TypeError('Expected one identified branch thought and its summary');
+		}
+		expect(summary.branchId).toBe('alt-1');
+		expect(summary.sessionId).toBe('__global__');
+		expect(summary.coveredIds).toEqual([branchThought.id]);
+		expect(summary.coveredRange).toEqual([2, 2]);
 	});
 
 	it('does NOT compress when compression service is not wired (flag-off path)', async () => {
@@ -304,7 +311,7 @@ describe('Compression → Dehydration Roundtrip', () => {
 		// Compress: produces a Summary covering thoughts 1..8.
 		const summary = compression.compressBranch(sessionId, asBranchId('b1'), asThoughtId('t-1'));
 		expect(summary.coveredRange).toEqual([1, 8]);
-		expect(summary.coveredIds.length).toBe(8);
+		expect(summary.coveredIds).toEqual(['t-1', 't-2', 't-3', 't-4', 't-5', 't-6', 't-7', 't-8']);
 
 		// Now apply DehydrationPolicy with keepLastK=3 → cold prefix (1..5) collapses.
 		const policy = new DehydrationPolicy(summaryStore);
@@ -314,7 +321,11 @@ describe('Compression → Dehydration Roundtrip', () => {
 
 		// Expected: 1 SummaryRef (covering 1..5 via dedup) + 3 hot thoughts.
 		expect(hydrated.length).toBe(4);
-		const ref = hydrated[0] as { kind: 'summary'; summaryId: string; coveredRange: readonly [number, number] };
+		const ref = hydrated[0] as {
+			kind: 'summary';
+			summaryId: string;
+			coveredRange: readonly [number, number];
+		};
 		expect(ref.kind).toBe('summary');
 		expect(ref.summaryId).toBe(summary.id);
 		expect(ref.coveredRange).toEqual([1, 8]);
