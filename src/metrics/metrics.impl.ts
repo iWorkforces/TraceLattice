@@ -44,6 +44,14 @@ export interface Metric {
 	timestamp?: number;
 }
 
+interface HistogramMetric {
+	name: string;
+	labels: Record<string, string>;
+	sum: number;
+	count: number;
+	buckets: Map<number, number>;
+}
+
 /**
  * Histogram bucket boundaries for latency tracking.
  */
@@ -99,7 +107,7 @@ export class Metrics {
 	private _metrics: Map<string, Metric>;
 
 	/** Histogram samples */
-	private _histograms: Map<string, { sum: number; count: number; buckets: Map<number, number> }>;
+	private _histograms: Map<string, HistogramMetric>;
 
 	/** Prefix for all metric names */
 	private _prefix: string;
@@ -124,7 +132,7 @@ export class Metrics {
 		this._metrics = new Map();
 		this._histograms = new Map();
 		this._prefix = options.prefix ?? '';
-		this._defaultLabels = options.defaultLabels ?? {};
+		this._defaultLabels = { ...options.defaultLabels };
 	}
 
 	/**
@@ -157,7 +165,7 @@ export class Metrics {
 				name: fullName,
 				type: MetricType.Counter,
 				value,
-				labels: allLabels,
+				labels: { ...allLabels },
 				help,
 			});
 		}
@@ -188,7 +196,7 @@ export class Metrics {
 			name: fullName,
 			type: MetricType.Gauge,
 			value,
-			labels: allLabels,
+			labels: { ...allLabels },
 			help: help ?? existing?.help,
 		});
 		this._operationsCounter++;
@@ -233,6 +241,8 @@ export class Metrics {
 			histogram.buckets.set(Infinity, (histogram.buckets.get(Infinity) ?? 0) + 1);
 		} else {
 			const histogramData = {
+				name: fullName,
+				labels: { ...allLabels },
 				sum: value,
 				count: 1,
 				buckets: new Map<number, number>(),
@@ -345,7 +355,7 @@ export class Metrics {
 		const lines: string[] = [];
 
 		const metrics = Array.from(this._metrics.values());
-		const histograms = Array.from(this._histograms.entries());
+		const histograms = Array.from(this._histograms.values());
 
 		const helpEntries = new Map<string, string>();
 		const typeEntries = new Map<string, MetricType>();
@@ -361,23 +371,19 @@ export class Metrics {
 				typeEntries.set(metric.name, metric.type);
 			}
 
-			const labelStr = Object.entries(metric.labels)
-				.map(([k, v]) => `${k}="${v}"`)
-				.join(',');
+			const labelStr = this._formatLabels(metric.labels);
 			lines.push(`${metric.name}{${labelStr}} ${metric.value}`);
 		}
 
-		for (const [key, histogram] of histograms) {
-			const { name: fullName, labels } = this._parseMetricKey(key);
+		for (const histogram of histograms) {
+			const { name: fullName, labels } = histogram;
 			if (histogram.count > 0) {
 				if (!typeEntries.has(fullName)) {
 					lines.push(`# TYPE ${fullName} histogram`);
 					typeEntries.set(fullName, MetricType.Histogram);
 				}
 
-				const labelStr = Object.entries(labels)
-					.map(([k, v]) => `${k}="${v}"`)
-					.join(',');
+				const labelStr = this._formatLabels(labels);
 				const formatMetricLine = (suffix: string, value: number): string => {
 					if (labelStr.length === 0) {
 						return `${fullName}${suffix} ${value}`;
@@ -396,8 +402,9 @@ export class Metrics {
 							: Number.isFinite(boundary)
 								? String(boundary)
 								: String(boundary);
+					const boundaryLabelStr = this._formatLabels({ le: boundaryLabel });
 					const bucketLabels =
-						labelStr.length === 0 ? `le="${boundaryLabel}"` : `${labelStr},le="${boundaryLabel}"`;
+						labelStr.length === 0 ? boundaryLabelStr : `${labelStr},${boundaryLabelStr}`;
 					lines.push(`${fullName}_bucket{${bucketLabels}} ${count}`);
 				}
 			}
@@ -429,42 +436,17 @@ export class Metrics {
 	 * @private
 	 */
 	private _metricKey(name: string, labels: Record<string, string>): string {
-		const sortedLabels = Object.entries(labels)
-			.sort(([a], [b]) => a.localeCompare(b))
-			.map(([k, v]) => `${k}=${v}`)
-			.join(',');
-		return `${name}{${sortedLabels}}`;
+		const sortedLabels = Object.entries(labels).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+		return JSON.stringify([name, sortedLabels]);
 	}
 
-	/**
-	 * Parses a metric key back into name and labels.
-	 * @param key - Metric key
-	 * @returns Name and labels
-	 * @private
-	 */
-	private _parseMetricKey(key: string): { name: string; labels: Record<string, string> } {
-		const match = key.match(/^([^{}]+)\{([^{}]*)\}$/);
-		if (!match) {
-			return { name: key, labels: {} };
-		}
+	private _formatLabels(labels: Record<string, string>): string {
+		return Object.entries(labels)
+			.map(([key, value]) => `${key}="${this._escapeLabelValue(value)}"`)
+			.join(',');
+	}
 
-		const [, name, labelsPart] = match as [string, string, string | undefined];
-		if (!labelsPart) {
-			return { name, labels: {} };
-		}
-
-		const labels: Record<string, string> = {};
-		for (const label of labelsPart.split(',')) {
-			const separatorIndex = label.indexOf('=');
-			if (separatorIndex <= 0) {
-				continue;
-			}
-
-			const labelKey = label.slice(0, separatorIndex);
-			const labelValue = label.slice(separatorIndex + 1);
-			labels[labelKey] = labelValue;
-		}
-
-		return { name, labels };
+	private _escapeLabelValue(value: string): string {
+		return value.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('\n', '\\n');
 	}
 }
