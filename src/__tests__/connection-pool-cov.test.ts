@@ -269,14 +269,14 @@ describe('ConnectionPool additional coverage', () => {
 	describe('cleanup error handling', () => {
 		it('should handle session.close() error during auto cleanup', async () => {
 			vi.useFakeTimers();
+			const stopFailure = new Error('stop failed');
+			const stop = vi.fn().mockRejectedValueOnce(stopFailure).mockResolvedValue(undefined);
 
 			const failingFactory = vi.fn().mockImplementation(async () => ({
 				processThought: vi.fn().mockResolvedValue({
 					content: [{ type: 'text', text: 'test' }],
 				}),
-				stop: vi.fn().mockImplementation(() => {
-					throw new Error('stop failed');
-				}),
+				stop,
 			}));
 
 			const pool = new ConnectionPool({
@@ -294,9 +294,59 @@ describe('ConnectionPool additional coverage', () => {
 
 			// Pool should still be running despite the error
 			expect(pool.isRunning()).toBe(true);
+			expect(stop).toHaveBeenCalledTimes(2);
 
 			await pool.terminate();
 			vi.useRealTimers();
+		});
+
+		it('routes internal timeout failures through cleanup and retries on the next sweep', async () => {
+			vi.useFakeTimers();
+			const startTime = Date.now();
+			const stopFailure = new Error('timed cleanup failed');
+			const stop = vi.fn().mockRejectedValueOnce(stopFailure).mockResolvedValue(undefined);
+			const pool = new ConnectionPool({
+				maxSessions: 1,
+				sessionTimeout: 100,
+				autoCleanup: true,
+				cleanupInterval: 200,
+				serverFactory: async () => ({ processThought: async () => ({ content: [] }), stop }),
+			});
+			const sessionId = await pool.createSession();
+
+			vi.setSystemTime(new Date(startTime + 1));
+			await vi.advanceTimersByTimeAsync(100);
+
+			expect(stop).toHaveBeenCalledTimes(1);
+			expect(pool.getSessionInfo(sessionId)).toBeUndefined();
+			await expect(pool.createSession()).rejects.toThrow('Max sessions (1) reached');
+
+			await vi.advanceTimersByTimeAsync(100);
+			expect(stop).toHaveBeenCalledTimes(2);
+			await expect(pool.createSession()).resolves.toMatch(/^session_/);
+
+			await pool.terminate();
+			vi.useRealTimers();
+		});
+
+		it('retries a synchronous child stop throw on explicit close', async () => {
+			const stopFailure = new Error('synchronous stop failure');
+			const stop = vi
+				.fn()
+				.mockImplementationOnce(() => {
+					throw stopFailure;
+				})
+				.mockResolvedValue(undefined);
+			const pool = new ConnectionPool({
+				autoCleanup: false,
+				serverFactory: async () => ({ processThought: async () => ({ content: [] }), stop }),
+			});
+			const sessionId = await pool.createSession();
+
+			await expect(pool.closeSession(sessionId)).rejects.toBe(stopFailure);
+			await expect(pool.closeSession(sessionId)).resolves.toBeUndefined();
+			expect(stop).toHaveBeenCalledTimes(2);
+			await pool.terminate();
 		});
 	});
 
@@ -402,8 +452,7 @@ describe('ConnectionPool additional coverage', () => {
 			vi.setSystemTime(new Date(startTime + 101));
 			await vi.advanceTimersByTimeAsync(100);
 
-			const info = pool.getSessionInfo(sessionId);
-			expect(info?.isActive).toBe(false);
+			expect(pool.getSessionInfo(sessionId)).toBeUndefined();
 
 			await pool.terminate();
 			vi.useRealTimers();
@@ -420,6 +469,21 @@ describe('ConnectionPool additional coverage', () => {
 
 			await pool.terminate();
 			await expect(pool.terminate()).resolves.toBeUndefined();
+		});
+
+		it('attempts a persistent failure only once per termination generation', async () => {
+			const stopFailure = new Error('persistent stop failure');
+			const stop = vi.fn().mockRejectedValue(stopFailure);
+			const pool = new ConnectionPool({
+				autoCleanup: false,
+				serverFactory: async () => ({ processThought: async () => ({ content: [] }), stop }),
+			});
+			await pool.createSession();
+
+			await expect(pool.terminate()).rejects.toMatchObject({ errors: [stopFailure] });
+			expect(stop).toHaveBeenCalledTimes(1);
+			await expect(pool.terminate()).rejects.toMatchObject({ errors: [stopFailure] });
+			expect(stop).toHaveBeenCalledTimes(2);
 		});
 	});
 });

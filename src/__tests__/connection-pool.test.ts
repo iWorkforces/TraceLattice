@@ -149,6 +149,33 @@ describe('ConnectionPool', () => {
 
 			expect(id1).not.toBe(id2);
 		});
+
+		it('rejects an owned-session ID collision before creating another child', async () => {
+			const stopFailure = new Error('first stop failed');
+			const stop = vi.fn().mockRejectedValueOnce(stopFailure).mockResolvedValue(undefined);
+			const serverFactory = vi.fn(async () => ({
+				processThought: async () => ({ content: [] }),
+				stop,
+			}));
+			const collisionPool = new ConnectionPool({
+				maxSessions: 2,
+				autoCleanup: false,
+				serverFactory,
+			});
+			vi.spyOn(Date, 'now').mockReturnValue(1234);
+			vi.spyOn(Math, 'random').mockReturnValue(0.5);
+
+			const sessionId = await collisionPool.createSession();
+			await expect(collisionPool.closeSession(sessionId)).rejects.toBe(stopFailure);
+
+			try {
+				await expect(collisionPool.createSession()).rejects.toThrow('Session ID collision');
+				expect(serverFactory).toHaveBeenCalledTimes(1);
+			} finally {
+				vi.restoreAllMocks();
+				await collisionPool.terminate();
+			}
+		});
 	});
 
 	describe('process', () => {
@@ -329,6 +356,42 @@ describe('ConnectionPool', () => {
 			stopGate.resolve();
 			await firstClose;
 			await closingPool.terminate();
+		});
+
+		it('retains failed cleanup as inactive owned capacity until a retry succeeds', async () => {
+			const stopFailure = new Error('stop failed');
+			const stop = vi.fn().mockRejectedValueOnce(stopFailure).mockResolvedValue(undefined);
+			const retainedPool = new ConnectionPool({
+				maxSessions: 1,
+				autoCleanup: false,
+				serverFactory: async () => ({ processThought: async () => ({ content: [] }), stop }),
+			});
+			const sessionId = await retainedPool.createSession();
+
+			await expect(retainedPool.closeSession(sessionId)).rejects.toBe(stopFailure);
+
+			expect(retainedPool.getSessionInfo(sessionId)).toBeUndefined();
+			expect(retainedPool.getStats().totalSessions).toBe(0);
+			await expect(
+				retainedPool.runWithSession(sessionId, async () => 'unexpected')
+			).resolves.toEqual({ status: 'inactive' });
+			await expect(
+				retainedPool.process(sessionId, {
+					thought: 'rejected after cleanup failure',
+					thought_number: 1,
+					total_thoughts: 1,
+					next_thought_needed: false,
+				})
+			).rejects.toBeInstanceOf(SessionNotActiveError);
+			await expect(retainedPool.createSession()).rejects.toThrow('Max sessions (1) reached');
+
+			await expect(retainedPool.closeSession(sessionId)).resolves.toBeUndefined();
+			expect(stop).toHaveBeenCalledTimes(2);
+			await expect(
+				retainedPool.runWithSession(sessionId, async () => 'unexpected')
+			).resolves.toEqual({ status: 'missing' });
+			await expect(retainedPool.createSession()).resolves.toMatch(/^session_/);
+			await retainedPool.terminate();
 		});
 	});
 
@@ -519,13 +582,12 @@ describe('ConnectionPool', () => {
 		it('reports a pending-created child stop failure through shared termination', async () => {
 			const factory = Promise.withResolvers<ReturnType<typeof createMockServer>>();
 			const stopFailure = new Error('pending child stop failed');
-			const stop = vi.fn(() => Promise.reject(stopFailure));
+			const stop = vi.fn().mockRejectedValueOnce(stopFailure).mockResolvedValue(undefined);
 			const terminatingPool = new ConnectionPool({
 				autoCleanup: false,
 				serverFactory: () => factory.promise,
 			});
 			const create = terminatingPool.createSession();
-			await new Promise<void>((resolve) => setImmediate(resolve));
 
 			const terminate = terminatingPool.terminate();
 			factory.resolve({
@@ -540,6 +602,82 @@ describe('ConnectionPool', () => {
 				reason: { errors: [stopFailure] },
 			});
 			expect(stop).toHaveBeenCalledTimes(1);
+			expect(terminatingPool.getStats().totalSessions).toBe(0);
+
+			await expect(terminatingPool.terminate()).resolves.toBeUndefined();
+			expect(stop).toHaveBeenCalledTimes(2);
+		});
+
+		it('retries retained failures once in a later termination generation', async () => {
+			const stopFailure = new Error('first generation failed');
+			const stop = vi.fn().mockRejectedValueOnce(stopFailure).mockResolvedValue(undefined);
+			const terminatingPool = new ConnectionPool({
+				autoCleanup: false,
+				serverFactory: async () => ({ processThought: async () => ({ content: [] }), stop }),
+			});
+			await terminatingPool.createSession();
+
+			const firstTerminate = terminatingPool.terminate();
+			const concurrentTerminate = terminatingPool.terminate();
+			expect(concurrentTerminate).toBe(firstTerminate);
+			await expect(firstTerminate).rejects.toMatchObject({ errors: [stopFailure] });
+			expect(stop).toHaveBeenCalledTimes(1);
+
+			await expect(terminatingPool.terminate()).resolves.toBeUndefined();
+			expect(stop).toHaveBeenCalledTimes(2);
+			await expect(terminatingPool.terminate()).resolves.toBeUndefined();
+			expect(stop).toHaveBeenCalledTimes(2);
+		});
+
+		it('shares an overlapping close attempt and retries it only in a later generation', async () => {
+			const firstStop = Promise.withResolvers<void>();
+			const stopFailure = new Error('shared attempt failed');
+			const stop = vi
+				.fn()
+				.mockImplementationOnce(() => firstStop.promise)
+				.mockResolvedValue(undefined);
+			const terminatingPool = new ConnectionPool({
+				autoCleanup: false,
+				serverFactory: async () => ({ processThought: async () => ({ content: [] }), stop }),
+			});
+			const sessionId = await terminatingPool.createSession();
+
+			const close = terminatingPool.closeSession(sessionId);
+			const terminate = terminatingPool.terminate();
+			expect(stop).toHaveBeenCalledTimes(1);
+			firstStop.reject(stopFailure);
+
+			await expect(close).rejects.toBe(stopFailure);
+			await expect(terminate).rejects.toMatchObject({ errors: [stopFailure] });
+			expect(stop).toHaveBeenCalledTimes(1);
+			await expect(terminatingPool.terminate()).resolves.toBeUndefined();
+			expect(stop).toHaveBeenCalledTimes(2);
+		});
+
+		it('waits for successful late-factory cleanup in the active generation', async () => {
+			const factory = Promise.withResolvers<ReturnType<typeof createMockServer>>();
+			const stopGate = deferred();
+			const stop = vi.fn(() => stopGate.promise);
+			const terminatingPool = new ConnectionPool({
+				autoCleanup: false,
+				serverFactory: () => factory.promise,
+			});
+			const create = terminatingPool.createSession();
+
+			const terminate = terminatingPool.terminate();
+			factory.resolve({
+				processThought: vi.fn().mockResolvedValue({ content: [] }),
+				stop,
+			});
+			await Promise.resolve();
+			expect(stop).toHaveBeenCalledTimes(1);
+			expect(
+				await Promise.race([terminate.then(() => 'terminated'), Promise.resolve('pending')])
+			).toBe('pending');
+
+			stopGate.resolve();
+			await expect(create).rejects.toThrow('ConnectionPool has been terminated');
+			await expect(terminate).resolves.toBeUndefined();
 			expect(terminatingPool.getStats().totalSessions).toBe(0);
 		});
 	});
@@ -812,6 +950,34 @@ describe('Session close lifecycle', () => {
 		await firstClose;
 		expect(stop).toHaveBeenCalledTimes(1);
 	});
+
+	it('shares a rejected attempt, retries later, and makes success terminal', async () => {
+		const firstStop = Promise.withResolvers<void>();
+		const stopFailure = new Error('stop rejected');
+		const stop = vi
+			.fn()
+			.mockImplementationOnce(() => firstStop.promise)
+			.mockResolvedValue(undefined);
+		const session = new Session(
+			asSessionId('session-retry'),
+			{ processThought: async () => ({ content: [] }), stop },
+			60_000,
+			new NullLogger()
+		);
+
+		const firstClose = session.close();
+		const concurrentClose = session.close();
+		expect(concurrentClose).toBe(firstClose);
+		firstStop.reject(stopFailure);
+		await expect(firstClose).rejects.toBe(stopFailure);
+		expect(session.isActive).toBe(false);
+
+		const retry = session.close();
+		expect(retry).not.toBe(firstClose);
+		await expect(retry).resolves.toBeUndefined();
+		expect(session.close()).toBe(retry);
+		expect(stop).toHaveBeenCalledTimes(2);
+	});
 });
 
 describe('ConnectionPool edge cases', () => {
@@ -842,23 +1008,22 @@ describe('ConnectionPool edge cases', () => {
 	});
 
 	it('should handle very short sessionTimeout', async () => {
+		vi.useFakeTimers();
+		const startTime = Date.now();
 		const shortTimeoutPool = new ConnectionPool({
 			sessionTimeout: 1, // 1ms
 			autoCleanup: false,
 			serverFactory: createMockServerFactory(),
 		});
 
-		// Session should be created but time out immediately
 		const sessionId = await shortTimeoutPool.createSession();
+		vi.setSystemTime(new Date(startTime + 1));
+		await vi.advanceTimersByTimeAsync(1);
 
-		// Wait for timeout
-		await new Promise((resolve) => setTimeout(resolve, 10));
-
-		// Session should still exist but be timed out
-		const info = shortTimeoutPool.getSessionInfo(sessionId);
-		expect(info).toBeDefined();
+		expect(shortTimeoutPool.getSessionInfo(sessionId)).toBeUndefined();
 
 		await shortTimeoutPool.terminate();
+		vi.useRealTimers();
 	});
 
 	it('should handle very long sessionTimeout', () => {
