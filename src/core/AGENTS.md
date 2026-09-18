@@ -2,69 +2,50 @@
 
 ## OVERVIEW
 
-Reasoning engine: thought ingest → graph mutation → quality signals → strategy decision.
+Reasoning engine: ingest → graph mutation → quality signals → strategy. `HistoryManager` owns live session maps. `ThoughtProcessor` is the only admission seam.
 
-## PIPELINE FLOW
+## PIPELINE
 
-`ThoughtProcessor.process()` (7 stages):
+`ThoughtProcessor.process()`:
 
-1. **normalize** (`InputNormalizer`): fix LLM field mistakes, fill defaults, sanitize `branch_id`, strip urgency phrases from step-level fields (`step_description`, `expected_outcome`, `meta_observation`, `next_step_conditions`)
-2. **validate** (valibot via `schema.ts`): throw `ValidationError` with `field`
-3. **persist** (`HistoryManager.addThought`): append to history, mutate branches, emit edges
-4. **format** (`ThoughtFormatter`): chalk display for stderr (💭🔄🌿🔬✅🔍🧬🧠📝)
-5. **evaluate** (`ThoughtEvaluator`): `ConfidenceSignals` + `ReasoningStats`
-6. **strategy** (`IReasoningStrategy.decideNext`): sequential vs ToT dispatch via `StrategyFactory`
-7. **hints** (`PatternDetector`): priority-based selection, max 3, 3-thought cooldown
+1. **prepare** (unlocked): `normalizeInput` → valibot → re-normalize → bump `total_thoughts` → flag type gates
+2. **admit**: `SessionLifecycleCoordinator.runOperation` (or exclusive reset)
+3. **lock**: `SessionLock.withLock` (~5s)
+4. **cross-ref** `CrossReferenceValidator` + optional reset / `registerBranch`
+5. **persist**: `tool_call` → suspend envelope (skip evaluate/strategy); `tool_observation` → `compareAndAdmit`; else `addThought`
+6. **outcome** + calibrator `refit` (verification only)
+7. **format** → **evaluate** → max-3 warning hints (cooldown on processor, not detector)
+8. **strategy** `decide()`. On `terminate` + `branch_id` + compression wired → rollup
 
 ## SUBSYSTEMS
 
-| Dir              | Role                                                           |
-| ---------------- | -------------------------------------------------------------- |
-| `graph/`         | DAG edges. 8 kinds. `EdgeStore` per-session, `GraphView` read-only traversal (Kahn's topological) |
-| `compression/`   | Branch rollup (`CompressionService`) plus sliding-window `DehydrationPolicy` |
-| `evaluator/`     | Decomposed: `SignalComputer`, `Aggregator`, `PatternDetector`, `Calibrator` (own AGENTS.md) |
-| `tools/`         | `InMemorySuspensionStore`: suspend/resume on `tool_call`, TTL expiry, periodic sweep |
-| `reasoning/`          | `OutcomeRecorder`: per-session outcome recording for calibration (own AGENTS.md). `strategies/` subdir has own AGENTS.md |
+| Dir / cluster | Role |
+|---------------|------|
+| `graph/` | Edges + `EdgeEmitter` (moved here) + `GraphView` |
+| `compression/` | Deterministic `Summary` rollup |
+| `evaluator/` | Signals / stats / patterns / calibrator |
+| `tools/` | `InMemorySuspensionStore` |
+| `reasoning/` | `OutcomeRecorder` + `strategies/` |
+| Session cluster | `SessionManager` (policy only), `SessionLock`, `SessionLifecycleCoordinator`, `SessionResetCoordinator` |
+| Persistence cluster | `PersistenceBuffer` / `PersistenceWriter` / `PersistenceWorkQueue` / `PersistenceRestore` |
 
 ## WHERE TO LOOK
 
-| Task                          | File                                  |
-| ----------------------------- | ------------------------------------- |
-| Add a thought type            | `contracts/reasoning-types.ts` (canonical union) + `core/reasoning.ts` compatibility export + `thought.ts` + processor branches |
-| Change pipeline order         | `ThoughtProcessor.process()`          |
-| Tweak quality scoring         | `evaluator/SignalComputer.ts`         |
-| New hint pattern              | `evaluator/PatternDetector.ts`        |
-| Edge resolution bug           | `EdgeEmitter._resolveThoughtId` (searches history + branches) |
-| Session eviction              | `SessionManager` (TTL 30min, LRU 100) |
-| Batched writes                | `PersistenceBuffer` (flush timer)     |
-| New reasoning strategy        | `reasoning/strategies/` + `StrategyFactory` dispatch |
-| Outcome recording             | `reasoning/OutcomeRecorder.ts` (no-op when `outcomeRecording` flag off) |
-| Branch collapse               | `compression/CompressionService.ts`   |
-| Sanitization of step fields   | `InputNormalizer.ts` (uses `sanitizeStepField` from `sanitize.ts`) |
-
-## KEY INTERFACES
-
-- `IHistoryManager` (8 methods + session lifecycle): contract for the coordinator
-- `ThoughtData`: 11 optional reasoning fields + `retracted: boolean` (logical retraction via `backtrack`). Now derived from `v.InferOutput<SequentialThinkingSchema>` (single source of truth). Uses branded ID types (`ThoughtId`, `SessionId`, `SuspensionToken`, `BranchId`) from `contracts/ids.ts`.
-- `ValidatedThought` (`thought.ts`): discriminated union over `kind` with 7 variants — `ToolCallThought`, `ToolObservationThought`, `BacktrackThought`, `VerificationThought`, `CritiqueThought`, `SynthesisThought`, `BaseThought`. Returned by `_validateNewTypes` so handlers no longer use `!` non-null assertions.
-- `BranchId` (branded): keys `Map<BranchId, ThoughtData[]>` for branch storage. Imported from `contracts/ids.ts`.
-- `ThoughtType`: 11-variant union. Canonical definition lives in `contracts/reasoning-types.ts`; `core/reasoning.ts` re-exports it for compatibility. Flag gates:
-  - `newThoughtTypes`: `assumption`, `decomposition`, `backtrack`
-  - `toolInterleave`: `tool_call`, `tool_observation`
-- `IReasoningStrategy.decideNext(ctx) → StrategyDecision`: pure policy
-- `ConfidenceSignals.confidence_stability`: `null` when n<2, excluded from geomean with redistributed weights
+| Task | File |
+|------|------|
+| Add a thought type | `contracts/reasoning-types.ts` + `thought.ts` + processor gates + `totScoring` `assertNever` |
+| Change pipeline order | `ThoughtProcessor.ts` — extract helpers, don't reorder casually |
+| Edge emit | `graph/EdgeEmitter.ts` |
+| Session eviction | `SessionManager` (TTL 30min, cap 100, 50/owner). Never evicts `GLOBAL_SESSION_ID`. |
+| Drain / barriers | `PersistenceBuffer.ts` |
+| Outcome samples | `VerificationOutcomeAdmission.ts` — verification + `verification_result` 0\|1 only |
 
 ## NOTES
 
-- `HistoryManager` was decomposed (572L). Mutation logic lives in `EdgeEmitter` / `PersistenceBuffer` / `SessionManager`. Keep it that way: HM coordinates, doesn't compute.
-- `_resolveThoughtId` walks BOTH `session.thought_history` AND every `session.branches[*]`. Branch thoughts are NOT in main history.
-- `ThoughtProcessor` is 851L because it's the seam between schema, persistence, and policy. Don't fold helpers back in. Extract further if it grows.
-- `EdgeStore` is always registered in DI. Feature flag `dagEdges` gates the WRITE path only, not the registration.
-- `reasoning/strategies/` lives at depth 4 deliberately. Strategies are leaf policies, not infrastructure.
-- `generateUlid` is timestamp-base36 + random hex. Not a real ULID. Don't rename.
-- `HistoryManager.clear()` enforces ownership via `_getSession()` — cross-owner `reset_state` throws `SessionAccessDeniedError`. Stdio path (no owner) is unrestricted.
-- Input sanitization has two layers: `sanitizeStepField` (urgency phrases + HTML + control chars + length cap) for step-level and reasoning fields, and `sanitizeRationale` (same + 2000-char cap) for tool/skill recommendation rationales. Both use `stripUrgencyPhrases` internally.
-- `_validateNewTypes` returns a `ValidatedThought` discriminated union — `_handleToolCall` / `_handleToolObservation` / backtrack handlers consume the narrowed variant directly. No more `!` assertions in processor branches.
-- `_hintCooldowns` is typed `Map<SessionId, Map<PatternName, number>>` (inner key is the `PatternName` union from `contracts/reasoning-types.ts`, not raw string).
-- `GLOBAL_SESSION_ID` constant (in `contracts/ids.ts`) replaces the `'__global__'` literal previously sprinkled across session code. Always use the constant.
-- `SessionLock` (`src/core/SessionLock.ts`): per-session concurrency primitive. Registered in DI as `sessionLock: ISessionLock` (19th service). `@internal` — never inject outside of `HistoryManager`.
+- Branch thoughts are appended to **both** `thought_history` and `session.branches[id]`.
+- Backtrack is append-only (`retracted: true`). Evaluator filters retracted.
+- `clear()` throws `AsyncResetRequiredError` if persistence is on or a lock is held.
+- Restored sessions (`provenance: 'restored'`) deny owner-aware access.
+- Processor constructor `DEFAULT_FLAGS` are **off**; production flags come from `ServerConfig` (on).
+- Hint cooldown `Map<SessionId, Map<PatternName, number>>` **survives** `reset_state`.
+- `ISessionLock` is `withLock` / `isActive` / `size` — not acquire/release. `@internal` — only HM / processor / DI.

@@ -1,32 +1,53 @@
 # WATCHERS MODULE
 
-**Updated:** 2026-05-17
+**Updated:** 2026-09-17
 **Parent:** ../AGENTS.md
 
 ## OVERVIEW
 
-File-system watchers for live tool/skill discovery. Monitors configured directories with chokidar; triggers registry updates when files are added, changed, or removed. Keeps the tool/skill registries in sync without server restarts.
+Chokidar live-refresh for tool/skill registries. Both watchers serialize `refreshAsync()` — they do **not** mutate the registry by name.
 
-## STRUCTURE
+## FILES
 
 ```
 watchers/
-├── ToolWatcher.ts    # Watches .claude/tools + ~/.claude/tools (184L)
-└── SkillWatcher.ts   # Watches .claude/skills + ~/.claude/skills (215L)
+├── ToolWatcher.ts    # .tool.md add/change/unlink → ToolRegistry.refreshAsync()
+└── SkillWatcher.ts   # add/change/unlink → SkillRegistry.refreshAsync()
 ```
 
-## BEHAVIOR
+## EVENTS
 
-| Watcher | add | change | unlink |
-|---------|-----|--------|--------|
-| `ToolWatcher` | triggers `ToolRegistry.discoverAsync()` | — | removes tool by name |
-| `SkillWatcher` | triggers `SkillRegistry.discoverAsync()` | triggers re-discovery | removes skill by name |
+| Event | ToolWatcher | SkillWatcher |
+|-------|-------------|--------------|
+| `add` | refresh | refresh |
+| `change` | refresh | refresh |
+| `unlink` | refresh | refresh |
 
-Note: `ToolWatcher` does NOT watch `change` events — tools don't support hot-reload of tool body; only add/remove. `SkillWatcher` watches `change` because skill frontmatter can be updated without re-adding.
+`ToolWatcher` **does** watch `change`. Unlink is **not** delete-by-name. Both queue a single in-flight refresh (`_pendingRefresh` + `_refreshQueued`).
 
-## NOTES
+## DIRS
 
-- Both watchers use chokidar `persistent: true` and ignore `node_modules`.
-- Instantiated in `lib.ts` during `initializeServer()`, stopped on `SIGINT`/`SIGTERM`.
-- Watched dirs are hardcoded: `.claude/tools` / `~/.claude/tools` for tools; `.claude/skills` / `~/.claude/skills` for skills. Configurable via `SKILL_DIRS` only affects the registry discovery dirs, not the watcher dirs.
-- Errors are logged and swallowed (watcher failures should not crash the server).
+Wired in `lib.ts` when `enableWatcher`:
+
+- `new ToolWatcher(tools, logger, config.toolDirs)`
+- `new SkillWatcher(skills, logger, config.skillDirs)`
+
+Constructor fallbacks (only if no dirs passed):
+
+- tools: `.claude/tools`, `~/.claude/tools`
+- skills: `.claude/skills`, `~/.claude/skills`
+
+Skill **discovery** defaults also include `.agents/skills` + `~/.agents/skills`. Watcher fallbacks do **not**. Pass `config.skillDirs` so those extra dirs are watched.
+
+## RULES
+
+- Errors from `refreshAsync()` are logged, never thrown.
+- `ignoreInitial: true`. Ignore `node_modules` + `.DS_Store`.
+- Tool events that are not `.tool.md` are ignored. Skills log add/change/remove when `WATCHER_VERBOSE=true`.
+- `ready()` waits for chokidar's initial scan. `stop()` closes the watcher and joins the in-flight refresh.
+- Instantiated only if `enableWatcher`. Stopped with the server.
+
+## FORBIDDEN
+
+- `watchers → persistence`.
+- Do not embed watcher logic in `src/registry/`.

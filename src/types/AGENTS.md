@@ -1,35 +1,45 @@
-# TYPES MODULE
+# TYPES
 
-**Updated:** 2026-05-17
+**Updated:** 2026-09-17
 **Parent:** ../AGENTS.md
 
 ## OVERVIEW
 
-Shared TypeScript type definitions for domain objects. Hand-written interfaces (NOT inferred from schemas) because normalizer fills optional fields that are required in runtime types.
+Hand-written domain types. **Not inferred from `schema.ts`.** Normalizer fills schema-optional fields; these types are post-normalize.
 
-## STRUCTURE
+## FILES
 
 ```
 types/
-├── tool.ts          # Tool, ToolRecommendation, JsonSchema (87L)
-├── skill.ts         # Skill, SkillRecommendation (84L)
-├── disposable.ts    # IDisposable interface (21L)
-└── server-config.ts # ServerConfig re-export alias (930B)
+├── tool.ts           # Tool, ToolRecommendation, JsonSchema
+├── skill.ts          # Skill, SkillRecommendation
+├── disposable.ts     # IDisposable
+└── server-config.ts  # ServerConfig — NAME COLLISION
 ```
 
-## KEY TYPES
+## CRITICAL: `ServerConfig` COLLISION
 
-| Symbol | File | Role |
-|--------|------|------|
-| `Tool` | `tool.ts` | `{ name, description, inputSchema: JsonSchema }` |
-| `ToolRecommendation` | `tool.ts` | `{ tool_name, confidence, rationale, priority, suggested_inputs?, alternatives? }` — `priority` REQUIRED (unlike schema) |
-| `JsonSchema` | `tool.ts` | `Record<string, unknown>` alias for tool `inputSchema` |
-| `Skill` | `skill.ts` | `{ name, description, user_invocable?, allowed_tools? }` |
-| `SkillRecommendation` | `skill.ts` | `{ skill_name, confidence, rationale, priority, alternatives?, allowed_tools?, user_invocable? }` — `confidence`/`rationale`/`priority` REQUIRED |
-| `IDisposable` | `disposable.ts` | `{ dispose(): Promise<void> }` — implement on services with resources |
+`types/server-config.ts` `ServerConfig` is `{ available_tools, available_skills }` maps.
+**Not** a re-export of `src/ServerConfig.ts` (validated config + 7 flags).
+Do not import one when you mean the other.
+
+## REQUIRED AFTER NORMALIZE
+
+Schema-optional, **required** here (normalizer fills defaults):
+
+| Type | Required fields |
+|------|-----------------|
+| `ToolRecommendation` | `tool_name`, `confidence`, `rationale`, **`priority`** |
+| `SkillRecommendation` | `skill_name`, **`confidence`**, **`rationale`**, **`priority`** |
+
+**Do not infer these from `schema.ts`.** Optionality mismatch breaks call sites.
+
+## DISPOSABLE
+
+`IDisposable`: `{ dispose(): Promise<void> }`.
+Used by `Container.registerDisposable`. Implement on anything with timers, DB, handles.
 
 ## NOTES
 
-- `ToolRecommendation.priority` and `SkillRecommendation.confidence/rationale/priority` are REQUIRED here even though they're optional in valibot schemas. The normalizer fills defaults; these types reflect post-normalization state.
-- `IDisposable` is used by `Container.registerDisposable()` — anything with open resources (DB, timers, file handles) should implement it.
-- Do NOT infer these types from `schema.ts` schemas — the optionality mismatch would break call sites.
+- `JsonSchema` is `Record<string, unknown>` for `Tool.inputSchema`.
+- `Tool` / `Skill` are registry item shapes. No barrel.

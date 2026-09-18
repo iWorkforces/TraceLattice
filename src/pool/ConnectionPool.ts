@@ -18,10 +18,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import {
-	MaxSessionsReachedError,
-	PoolTerminatedError,
-} from '../errors.js';
+import { MaxSessionsReachedError, PoolTerminatedError } from '../errors.js';
 import type { Logger } from '../logger/StructuredLogger.js';
 import { asSessionId, type SessionId } from '../contracts/ids.js';
 import { assertNever } from '../utils.js';
@@ -84,8 +81,15 @@ export class Session {
 	private _closePromise: Promise<void> | null = null;
 	private _activeOperationCount = 0;
 	private _operationDrain: PromiseWithResolvers<void> | null = null;
+	private readonly _onTimeout: ((sessionId: SessionId) => void) | null;
 
-	constructor(id: SessionId, server: SessionServer, timeout: number, logger: Logger) {
+	constructor(
+		id: SessionId,
+		server: SessionServer,
+		timeout: number,
+		logger: Logger,
+		onTimeout: ((sessionId: SessionId) => void) | null = null
+	) {
 		this._server = server;
 		this._id = id;
 		this._createdAt = Date.now();
@@ -93,6 +97,7 @@ export class Session {
 		this._isActiveValue = true;
 		this._timeout = timeout;
 		this._logger = logger;
+		this._onTimeout = onTimeout;
 
 		// Start session timeout timer
 		this._startTimeout();
@@ -172,6 +177,9 @@ export class Session {
 
 		const completion = Promise.withResolvers<void>();
 		this._closePromise = completion.promise;
+		void completion.promise.then(undefined, () => {
+			if (this._closePromise === completion.promise) this._closePromise = null;
+		});
 		this._isActiveValue = false;
 
 		// Stop timeout timer
@@ -211,9 +219,13 @@ export class Session {
 		this._cleanupTimer = setTimeout(() => {
 			if (this.isTimedOut()) {
 				this._logger.warn(`Session ${this._id} timed out, closing`);
-				this.close().catch((err) => {
-					this._logger.error(`Error closing timed out session ${this._id}:`, err);
-				});
+				if (this._onTimeout) {
+					this._onTimeout(this._id);
+				} else {
+					this.close().catch((err) => {
+						this._logger.error(`Error closing timed out session ${this._id}:`, err);
+					});
+				}
 			}
 		}, this._timeout);
 	}
@@ -226,6 +238,11 @@ export class Session {
 	}
 }
 
+interface TerminationGeneration {
+	readonly attempts: Map<SessionId, Promise<void>>;
+	readonly completion: PromiseWithResolvers<void>;
+}
+
 /**
  * ConnectionPool manages multiple concurrent user sessions.
  *
@@ -234,6 +251,7 @@ export class Session {
  */
 export class ConnectionPool implements IConnectionPool {
 	private _sessions: Map<SessionId, Session> = new Map();
+	private readonly _ownedSessions = new Map<SessionId, Session>();
 	private readonly _closingSessions = new Map<SessionId, Promise<void>>();
 	private _createSessionLock: Promise<void> | null = null;
 	private _maxSessions: number;
@@ -244,13 +262,12 @@ export class ConnectionPool implements IConnectionPool {
 	private _terminated: boolean = false;
 	private _logger: Logger;
 	private _serverFactory: (() => Promise<SessionServer>) | null;
-	private _terminatePromise: Promise<void> | null = null;
+	private _terminationGeneration: TerminationGeneration | null = null;
 	private readonly _admissionContext = new AsyncLocalStorage<{
 		readonly sessionId: SessionId;
 		readonly session: Session;
 		open: boolean;
 	}>();
-	private readonly _pendingCreateStopFailures = new Set<unknown>();
 
 	constructor(options: SessionOptions = {}) {
 		this._maxSessions = options.maxSessions ?? 100;
@@ -294,7 +311,7 @@ export class ConnectionPool implements IConnectionPool {
 			throw new PoolTerminatedError();
 		}
 
-		if (this._sessions.size >= this._maxSessions) {
+		if (this._ownedSessions.size >= this._maxSessions) {
 			throw new MaxSessionsReachedError(this._maxSessions);
 		}
 
@@ -312,21 +329,30 @@ export class ConnectionPool implements IConnectionPool {
 			const sessionId = asSessionId(
 				`session_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
 			);
+			if (this._ownedSessions.has(sessionId)) {
+				throw new Error(`Session ID collision: ${sessionId}`);
+			}
 
 			// Create a new server instance for this session
 			const server = await this._serverFactory();
+			const session = new Session(
+				sessionId,
+				server,
+				this._sessionTimeout,
+				this._logger,
+				(timedOutSessionId) => this._handleSessionTimeout(timedOutSessionId)
+			);
+			this._ownedSessions.set(sessionId, session);
 			if (this._terminated) {
-				try {
-					await server.stop();
-				} catch (error) {
-					this._pendingCreateStopFailures.add(error);
-					throw error;
+				const generation = this._terminationGeneration;
+				if (generation) {
+					await this._coordinateCleanup(sessionId, generation);
+				} else {
+					await this._coordinateCleanup(sessionId);
 				}
 				throw new PoolTerminatedError();
 			}
 
-			// Create session
-			const session = new Session(sessionId, server, this._sessionTimeout, this._logger);
 			this._sessions.set(sessionId, session);
 
 			this._logger.info(
@@ -382,7 +408,7 @@ export class ConnectionPool implements IConnectionPool {
 		const session = this._sessions.get(sessionId);
 		if (!session) {
 			return Promise.resolve(
-				this._closingSessions.has(sessionId) ? { status: 'inactive' } : { status: 'missing' }
+				this._ownedSessions.has(sessionId) ? { status: 'inactive' } : { status: 'missing' }
 			);
 		}
 
@@ -405,32 +431,62 @@ export class ConnectionPool implements IConnectionPool {
 	 * @throws Error if session not found
 	 */
 	closeSession(sessionId: SessionId): Promise<void> {
-		const closing = this._closingSessions.get(sessionId);
-		if (closing) {
-			return closing;
-		}
-
-		const session = this._sessions.get(sessionId);
-
-		if (!session) {
+		if (!this._ownedSessions.has(sessionId)) {
 			return Promise.reject(new SessionNotFoundError(sessionId));
 		}
 
+		const generation = this._terminationGeneration;
+		return generation
+			? this._coordinateCleanup(sessionId, generation)
+			: this._coordinateCleanup(sessionId);
+	}
+
+	private _coordinateCleanup(
+		sessionId: SessionId,
+		generation?: TerminationGeneration
+	): Promise<void> {
+		const generationAttempt = generation?.attempts.get(sessionId);
+		if (generationAttempt) return generationAttempt;
+
+		const session = this._ownedSessions.get(sessionId);
+		if (!session) return Promise.reject(new SessionNotFoundError(sessionId));
+
 		this._sessions.delete(sessionId);
-		const closePromise = session.close();
-		this._closingSessions.set(sessionId, closePromise);
-		void closePromise.then(
-			() => {
-				this._closingSessions.delete(sessionId);
-				this._logger.info(
-					`Closed session ${sessionId} (${this._sessions.size}/${this._maxSessions} active sessions)`
-				);
-			},
-			() => {
-				this._closingSessions.delete(sessionId);
-			}
-		);
-		return closePromise;
+		const currentAttempt = this._closingSessions.get(sessionId);
+		const attempt = currentAttempt ?? session.close();
+		if (!currentAttempt) this._closingSessions.set(sessionId, attempt);
+		generation?.attempts.set(sessionId, attempt);
+
+		if (!currentAttempt)
+			void attempt.then(
+				() => {
+					if (this._closingSessions.get(sessionId) === attempt) {
+						this._closingSessions.delete(sessionId);
+					}
+					if (this._ownedSessions.get(sessionId) === session) {
+						this._ownedSessions.delete(sessionId);
+					}
+					this._logger.info(
+						`Closed session ${sessionId} (${this._sessions.size}/${this._maxSessions} active sessions)`
+					);
+				},
+				() => {
+					if (this._closingSessions.get(sessionId) === attempt) {
+						this._closingSessions.delete(sessionId);
+					}
+				}
+			);
+		return attempt;
+	}
+
+	private _handleSessionTimeout(sessionId: SessionId): void {
+		const generation = this._terminationGeneration;
+		const attempt = generation
+			? this._coordinateCleanup(sessionId, generation)
+			: this._coordinateCleanup(sessionId);
+		void attempt.catch((err) => {
+			this._logger.error(`Error closing timed out session ${sessionId}:`, err);
+		});
 	}
 
 	/**
@@ -488,9 +544,9 @@ export class ConnectionPool implements IConnectionPool {
 	private _cleanupTimedOutSessions(): void {
 		let cleaned = 0;
 
-		for (const [sessionId, session] of this._sessions.entries()) {
+		for (const [sessionId, session] of this._ownedSessions.entries()) {
 			if (session.isTimedOut()) {
-				this.closeSession(sessionId).catch((err) => {
+				this._coordinateCleanup(sessionId).catch((err) => {
 					this._logger.error(`Error closing timed out session ${sessionId}:`, err);
 				});
 				cleaned++;
@@ -508,12 +564,13 @@ export class ConnectionPool implements IConnectionPool {
 	 * Close all sessions and stop the cleanup timer.
 	 */
 	terminate(): Promise<void> {
-		if (this._terminatePromise) {
-			return this._terminatePromise;
+		if (this._terminationGeneration) {
+			return this._terminationGeneration.completion.promise;
 		}
 
 		const completion = Promise.withResolvers<void>();
-		this._terminatePromise = completion.promise;
+		const generation: TerminationGeneration = { attempts: new Map(), completion };
+		this._terminationGeneration = generation;
 		this._terminated = true;
 
 		// Stop cleanup timer
@@ -522,32 +579,34 @@ export class ConnectionPool implements IConnectionPool {
 			this._cleanupTimerId = null;
 		}
 
-		const sessions = Array.from(this._sessions.values());
-		this._sessions.clear();
-		const closePromises = new Set<Promise<void>>(this._closingSessions.values());
-		if (this._createSessionLock) {
-			closePromises.add(this._createSessionLock);
-		}
-		for (const session of sessions) {
-			closePromises.add(session.close());
+		const pendingCreate = this._createSessionLock;
+		for (const sessionId of this._ownedSessions.keys()) {
+			this._coordinateCleanup(sessionId, generation);
 		}
 
-		void Promise.allSettled(closePromises).then((outcomes) => {
-			const failures = [
-				...this._pendingCreateStopFailures,
-				...outcomes
-					.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')
-					.map((outcome) => outcome.reason),
-			];
-			if (failures.length > 0) {
-				completion.reject(new AggregateError(failures, 'ConnectionPool termination failed'));
-				return;
-			}
-			this._logger.info('ConnectionPool terminated');
-			completion.resolve();
-		});
+		void this._completeTerminationGeneration(generation, pendingCreate);
 
 		return completion.promise;
+	}
+
+	private async _completeTerminationGeneration(
+		generation: TerminationGeneration,
+		pendingCreate: Promise<void> | null
+	): Promise<void> {
+		if (pendingCreate) await pendingCreate;
+		const outcomes = await Promise.allSettled(generation.attempts.values());
+		const failures = outcomes
+			.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')
+			.map((outcome) => outcome.reason);
+		if (failures.length > 0) {
+			if (this._terminationGeneration === generation) this._terminationGeneration = null;
+			generation.completion.reject(
+				new AggregateError(failures, 'ConnectionPool termination failed')
+			);
+			return;
+		}
+		this._logger.info('ConnectionPool terminated');
+		generation.completion.resolve();
 	}
 
 	/**

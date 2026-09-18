@@ -459,17 +459,19 @@ describe('PersistenceBuffer joinable drain generation', () => {
 });
 
 describe('PersistenceBuffer bounded attributable retries', () => {
-	it('rejects invalid retry bounds before accepting a persistence policy', () => {
-		// Given
-		const persistence = new RecordingPersistence();
+	it.each([-1, 0.5])(
+		'rejects invalid retry bound %s before accepting a persistence policy',
+		(maxRetries) => {
+			// Given
+			const persistence = new RecordingPersistence();
 
-		// When
-		const construct = (): PersistenceWriter =>
-			new PersistenceWriter({ persistence, maxRetries: -1 });
+			// When
+			const construct = (): PersistenceWriter => new PersistenceWriter({ persistence, maxRetries });
 
-		// Then
-		expect(construct).toThrow(new RangeError('maxRetries must be a non-negative safe integer'));
-	});
+			// Then
+			expect(construct).toThrow(new RangeError('maxRetries must be a non-negative safe integer'));
+		}
+	);
 
 	it('retries with zero delay from an explicitly empty schedule and persists the work', async () => {
 		// Given

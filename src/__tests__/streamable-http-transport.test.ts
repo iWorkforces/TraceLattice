@@ -2,10 +2,16 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { request } from 'node:http';
 import { McpServer } from 'tmcp';
 import { ValibotJsonSchemaAdapter } from '@tmcp/adapter-valibot';
+import { Metrics } from '../metrics/metrics.impl.js';
 import {
 	StreamableHttpTransport,
 	createStreamableHttpTransport,
 } from '../transport/StreamableHttpTransport.js';
+
+const EXPECTED_METRICS =
+	'# HELP test_metric_total Test metric\n' +
+	'# TYPE test_metric_total counter\n' +
+	'test_metric_total{workflow="plan\\\\review\\"\\nnext"} 42';
 
 /**
  * Helper: send an HTTP request and collect the full response.
@@ -266,16 +272,20 @@ describe('StreamableHttpTransport', () => {
 			await startTransport();
 			const res = await httpRequest({ port, method: 'GET', path: '/metrics' });
 			expect(res.statusCode).toBe(404);
+			expect(res.body).toBe('Not Found');
+			expect(res.headers['content-type']).toBe('text/plain');
 		});
 
 		it('GET /metrics returns 200 when metricsProvider is configured', async () => {
+			const metrics = new Metrics();
+			metrics.counter('test_metric_total', 42, { workflow: 'plan\\review"\nnext' }, 'Test metric');
 			await startTransport({
-				metricsProvider: () => '# HELP test\n# TYPE test counter\ntest 42\n',
+				metricsProvider: () => metrics.export(),
 			});
 			const res = await httpRequest({ port, method: 'GET', path: '/metrics' });
 			expect(res.statusCode).toBe(200);
-			expect(res.body).toContain('test 42');
-			expect(res.headers['content-type']).toContain('text/plain');
+			expect(res.body).toBe(EXPECTED_METRICS);
+			expect(res.headers['content-type']).toBe('text/plain; version=0.0.4; charset=utf-8');
 		});
 
 		it('unknown path returns 404', async () => {

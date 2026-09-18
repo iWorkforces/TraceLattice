@@ -1,51 +1,45 @@
 # PERSISTENCE MODULE
 
-**Updated:** 2026-05-15
+**Updated:** 2026-09-17
 **Parent:** ../AGENTS.md
 
 ## OVERVIEW
 
-State backends for thoughts + DAG edges. 3 implementations behind one interface, selected via `PersistenceFactory`. Per-session edge storage; `__global__` is the default session for backward compat.
+Dumb session-scoped sinks. Buffering / flush / restore live in `src/core/`. Contract is `src/contracts/PersistenceBackend.ts` (not in this folder).
 
 ## STRUCTURE
 
 ```
 persistence/
-├── PersistenceBackend.ts   # 13-method interface (116L)
-├── PersistenceFactory.ts   # Backend selector
-├── MemoryPersistence.ts    # In-memory (default, tests)
-├── FilePersistence.ts      # JSON files (452L)
-├── SqlitePersistence.ts    # SQLite + WAL (468L)
-├── types.ts                # `PersistenceConfig` + backend option shapes (path, WAL mode, etc.)
-└── better-sqlite3.d.ts     # Type shim
+├── PersistenceFactory.ts     # file | sqlite | memory | null
+├── MemoryPersistence.ts
+├── FilePersistence.ts + FileWriter + FileSnapshotV2 + FileLegacyImport
+├── SqlitePersistence.ts + SqliteDriver + SqliteSchemaV2 + SqliteLegacyImport
+├── PersistenceScope.ts / PersistenceCodec.ts / PersistenceErrors.ts
+└── SessionScopedPersistence.ts
 ```
 
 ## BACKENDS
 
-| Backend  | Thoughts                      | Edges                                       | Notes                                  |
-| -------- | ----------------------------- | ------------------------------------------- | -------------------------------------- |
-| Memory   | `Map`                         | `Map<string, Edge[]>` keyed by session      | No I/O, fastest, ephemeral             |
-| File     | `{dataDir}/thoughts.json`     | `{dataDir}/edges/{sessionId}.json`          | Atomic writes, path traversal guarded  |
-| SQLite   | `thoughts` table              | `edges` table with `session_id` column      | WAL mode, prepared stmts, transactions |
+| Backend | Storage | Notes |
+|---------|---------|-------|
+| Memory | 4 `Map`s by `SessionId` | Tests / default |
+| File v2 | **one** `<dataDir>/snapshot.json` | Exclusive lock; full rewrite; not `edges/{session}.json` |
+| SQLite v2 | tables + `schema_version=(1,2)` | WAL unless `enableWAL === false`; `better-sqlite3` optional |
 
-## INTERFACE
+All three implement **indivisible** `SessionScopedPersistenceBackend`. Unscoped methods are `GLOBAL_SESSION_ID` aliases. Named sessions must use `*ForSession`.
 
-`PersistenceBackend` — 13 methods. Full interface:
-- `saveThought`, `loadHistory`, `saveBranch`, `loadBranch`, `listBranches`, `healthy`, `clear`, `close` (8 core)
-- `saveEdges(sessionId, edges)`, `loadEdges(sessionId)`, `listEdgeSessions()` (3 edge methods)
-- `saveSummaries(sessionId, summaries)`, `loadSummaries(sessionId)` (2 summary methods)
+## CONVENTIONS
 
-- `saveEdges(sessionId, edges): Promise<void>` — per-session write
-- `loadEdges(sessionId): Promise<Edge[]>` — per-session read
-- `listEdgeSessions(): Promise<string[]>` — enumerate all sessions with edge data
-  - File: scan `edges/` dir
-  - SQLite: `SELECT DISTINCT session_id FROM edges`
-  - Memory: `Array.from(map.keys())`
+- Sinks only: no timers, no batching, no debounce.
+- Capability is all-or-nothing (`supportsSessionScopedPersistence`). Never fall back to global `clear()`.
+- Restore session list is `listSessions()`, **not** `listEdgeSessions()`.
+- Edges/summaries are replace-sets per session. Scope mismatch → `PersistenceScopeMismatchError`.
+- **No auto-migrate.** Leftover v1 files/tables → `PersistenceImportRequiredError`. Import is explicit + destination-absent (`importLegacyFileV1` / `importLegacySqliteV1`).
 
-## NOTES
+## ANTI-PATTERNS
 
-- `HistoryManager._loadFromPersistence()` iterates **all** sessions returned by `listEdgeSessions()`, not just `__global__`.
-- `HistoryManager._flushEdges()` writes per-session, looping `_sessions.keys()` plus `DEFAULT_SESSION` (`'__global__'`).
-- Write buffering + batched flush handled by `PersistenceBuffer` in `core/`, not here. Backends are dumb sinks (no buffering, no batching, no scheduling).
-- `clear()` is destructive across both thoughts and edges; tests rely on this.
-- `JSON.parse()` results are narrowed via `as unknown as T` (explicit double-cast), not `as T` directly — keeps deserialization type-safe and avoids silent type widening.
+- Do not implement only the 13-method unscoped interface.
+- Do not swallow parse errors into `[]`.
+- Do not persist thoughts without `id`.
+- Forbidden: `persistence → transport`.

@@ -38,6 +38,9 @@ const ConfigFileOptionsSchema = v.looseObject({
 		})
 	),
 	persistence: v.optional(v.looseObject({})),
+	persistenceBufferSize: v.optional(v.number()),
+	persistenceFlushInterval: v.optional(v.number()),
+	persistenceMaxRetries: v.optional(v.number()),
 	features: v.optional(v.looseObject({})),
 	toolInterleaveTtlMs: v.optional(v.number()),
 	toolInterleaveSweepMs: v.optional(v.number()),
@@ -137,6 +140,12 @@ export interface ConfigFileOptions {
 	 * Persistence configuration for storing history and state.
 	 */
 	readonly persistence?: PersistenceConfig;
+
+	readonly persistenceBufferSize?: number;
+
+	readonly persistenceFlushInterval?: number;
+
+	readonly persistenceMaxRetries?: number;
 
 	/**
 	 * Feature flag overrides. Each field can be set independently.
@@ -506,6 +515,9 @@ export class ConfigLoader {
 			toolDirs: config.toolDirs,
 			discoveryCache: config.discoveryCache,
 			persistence: config.persistence,
+			persistenceBufferSize: config.persistenceBufferSize,
+			persistenceFlushInterval: config.persistenceFlushInterval,
+			persistenceMaxRetries: config.persistenceMaxRetries,
 			features: config.features,
 			toolInterleaveTtlMs: config.toolInterleaveTtlMs,
 			toolInterleaveSweepMs: config.toolInterleaveSweepMs,

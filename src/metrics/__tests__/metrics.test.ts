@@ -82,6 +82,101 @@ describe('Metrics', () => {
 
 			expect(metrics.get('requests_total', { method: 'GET', env: 'prod' })).toBe(1);
 		});
+
+		it('keeps delimiter-colliding label sets distinct for every metric type', () => {
+			const adversarialValue = '2{brace}"quote\\slash\nline';
+			const escapedAdversarialValue = '2{brace}\\"quote\\\\slash\\nline';
+			const combinedLabel = { a: `1,b=${adversarialValue}` };
+			const splitLabels = { a: '1', b: adversarialValue };
+
+			metrics.counter('collision_counter', 2, combinedLabel);
+			metrics.counter('collision_counter', 3, splitLabels);
+			metrics.gauge('collision_gauge', 5, combinedLabel);
+			metrics.gauge('collision_gauge', 7, splitLabels);
+			metrics.histogram('collision_histogram', 1, combinedLabel, [1, 2]);
+			metrics.histogram('collision_histogram', 2, splitLabels, [1, 2]);
+
+			expect(metrics.get('collision_counter', combinedLabel)).toBe(2);
+			expect(metrics.get('collision_counter', splitLabels)).toBe(3);
+			expect(metrics.get('collision_gauge', combinedLabel)).toBe(5);
+			expect(metrics.get('collision_gauge', splitLabels)).toBe(7);
+
+			const exported = metrics.export();
+			expect(exported).toContain(
+				`test_collision_histogram_sum{a="1,b=${escapedAdversarialValue}"} 1`
+			);
+			expect(exported).toContain(
+				`test_collision_histogram_sum{a="1",b="${escapedAdversarialValue}"} 2`
+			);
+			expect(exported).toContain(
+				`test_collision_histogram_count{a="1,b=${escapedAdversarialValue}"} 1`
+			);
+			expect(exported).toContain(
+				`test_collision_histogram_count{a="1",b="${escapedAdversarialValue}"} 1`
+			);
+		});
+
+		it('deduplicates equivalent reordered labels for get, inc, dec, and histogram', () => {
+			metrics.counter('ordered_counter', 1, { z: 'last', a: 'first' });
+			metrics.inc('ordered_counter', { a: 'first', z: 'last' });
+			metrics.gauge('ordered_gauge', 5, { z: 'last', a: 'first' });
+			metrics.dec('ordered_gauge', { a: 'first', z: 'last' });
+			metrics.histogram('ordered_histogram', 1, { z: 'last', a: 'first' }, [1, 2]);
+			metrics.histogram('ordered_histogram', 2, { a: 'first', z: 'last' }, [1, 2]);
+
+			expect(metrics.get('ordered_counter', { a: 'first', z: 'last' })).toBe(2);
+			expect(metrics.get('ordered_gauge', { z: 'last', a: 'first' })).toBe(4);
+
+			const exported = metrics.export();
+			expect(exported).toContain('test_ordered_histogram_sum{z="last",a="first"} 3');
+			expect(exported).toContain('test_ordered_histogram_count{z="last",a="first"} 2');
+			expect(exported.match(/test_ordered_histogram_sum/g)).toHaveLength(1);
+		});
+
+		it('deduplicates reordered Unicode-collation-equivalent label names', () => {
+			const precomposed = '\u00e9';
+			const decomposed = 'e\u0301';
+			const firstLabels = { [precomposed]: 'precomposed', [decomposed]: 'decomposed' };
+			const reorderedLabels = { [decomposed]: 'decomposed', [precomposed]: 'precomposed' };
+
+			metrics.counter('unicode_counter', 1, firstLabels);
+			metrics.counter('unicode_counter', 2, reorderedLabels);
+
+			expect(metrics.get('unicode_counter', reorderedLabels)).toBe(3);
+
+			const exported = metrics.export();
+			expect(exported).toContain(
+				`test_unicode_counter{${precomposed}="precomposed",${decomposed}="decomposed"} 3`
+			);
+			expect(exported.match(/test_unicode_counter\{/g)).toHaveLength(1);
+		});
+
+		it('copies constructor defaults and per-record labels while preserving overrides', () => {
+			const defaultLabels = { env: 'prod', region: 'us' };
+			const counterLabels = { route: 'before' };
+			const gaugeLabels = { state: 'before' };
+			const histogramLabels = { operation: 'before' };
+			metrics = new Metrics({ prefix: 'test', defaultLabels });
+
+			metrics.counter('copied_counter', 1, counterLabels);
+			metrics.gauge('copied_gauge', 2, gaugeLabels);
+			metrics.histogram('copied_histogram', 0.5, histogramLabels, [1]);
+			metrics.counter('override_counter', 3, { env: 'staging' });
+			defaultLabels.env = 'dev';
+			counterLabels.route = 'after';
+			gaugeLabels.state = 'after';
+			histogramLabels.operation = 'after';
+			metrics.counter('after_default_mutation', 4);
+
+			const exported = metrics.export();
+			expect(exported).toContain('env="prod",region="us",route="before"');
+			expect(exported).toContain('env="prod",region="us",state="before"');
+			expect(exported).toContain('env="prod",region="us",operation="before"');
+			expect(exported).toContain('test_override_counter{env="staging",region="us"} 3');
+			expect(exported).toContain('test_after_default_mutation{env="prod",region="us"} 4');
+			expect(exported).not.toContain('env="dev"');
+			expect(exported).not.toContain('="after"');
+		});
 	});
 
 	describe('Export', () => {
@@ -118,6 +213,44 @@ describe('Metrics', () => {
 			expect(exported).toContain('latency_ms_bucket{le="0.05"} 2');
 			expect(exported).toContain('latency_ms_bucket{le="+Inf"} 2');
 		});
+
+		it('escapes label values identically for counters, gauges, and every histogram sample', () => {
+			const labels = { value: 'comma,value={path}\\segment"quoted\nnext' };
+			const escapedLabel = 'value="comma,value={path}\\\\segment\\"quoted\\nnext"';
+
+			metrics.counter('escaped_counter', 2, labels);
+			metrics.gauge('escaped_gauge', 3, labels);
+			metrics.histogram('escaped_histogram', 0.5, labels, [1]);
+
+			const exported = metrics.export();
+			expect(exported).toContain(`test_escaped_counter{${escapedLabel}} 2`);
+			expect(exported).toContain(`test_escaped_gauge{${escapedLabel}} 3`);
+			expect(exported).toContain(`test_escaped_histogram_sum{${escapedLabel}} 0.5`);
+			expect(exported).toContain(`test_escaped_histogram_count{${escapedLabel}} 1`);
+			expect(exported).toContain(`test_escaped_histogram_bucket{${escapedLabel},le="1"} 1`);
+			expect(exported).toContain(`test_escaped_histogram_bucket{${escapedLabel},le="+Inf"} 1`);
+			expect(exported).not.toContain('\nnext');
+		});
+
+		it('preserves arithmetic and custom finite, NaN, and positive-infinity buckets', () => {
+			metrics.counter('numeric_counter', 2.5);
+			metrics.counter('numeric_counter', -0.5);
+			metrics.gauge('numeric_gauge', -3);
+			metrics.dec('numeric_gauge');
+			metrics.histogram('numeric_histogram', 0.5, {}, [1, NaN]);
+			metrics.histogram('numeric_histogram', 2, {}, [1, NaN]);
+
+			expect(metrics.get('numeric_counter')).toBe(2);
+			expect(metrics.get('numeric_gauge')).toBe(-4);
+			expect(metrics.getOperationCount()).toBe(6);
+
+			const exported = metrics.export();
+			expect(exported).toContain('test_numeric_histogram_sum 2.5');
+			expect(exported).toContain('test_numeric_histogram_count 2');
+			expect(exported).toContain('test_numeric_histogram_bucket{le="1"} 1');
+			expect(exported).toContain('test_numeric_histogram_bucket{le="NaN"} 0');
+			expect(exported).toContain('test_numeric_histogram_bucket{le="+Inf"} 2');
+		});
 	});
 
 	describe('Reset', () => {
@@ -132,6 +265,23 @@ describe('Metrics', () => {
 			metrics.reset();
 
 			expect(metrics.get('test')).toBeUndefined();
+			expect(metrics.getOperationCount()).toBe(0);
+		});
+
+		it('clears adversarially distinct series and their copied metadata', () => {
+			const combinedLabel = { a: '1,b=2' };
+			const splitLabels = { a: '1', b: '2' };
+			metrics.counter('collision_counter', 2, combinedLabel);
+			metrics.gauge('collision_gauge', 3, splitLabels);
+			metrics.histogram('collision_histogram', 4, combinedLabel, [5]);
+
+			metrics.reset();
+			combinedLabel.a = 'mutated';
+			splitLabels.a = 'mutated';
+
+			expect(metrics.get('collision_counter', { a: '1,b=2' })).toBeUndefined();
+			expect(metrics.get('collision_gauge', { a: '1', b: '2' })).toBeUndefined();
+			expect(metrics.export()).toBe('');
 			expect(metrics.getOperationCount()).toBe(0);
 		});
 	});

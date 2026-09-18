@@ -1,74 +1,43 @@
 # CONFIG MODULE
 
-**Updated:** 2026-05-17
+**Updated:** 2026-09-17
 **Parent:** ../AGENTS.md
 
 ## OVERVIEW
 
-Two-layer configuration: `ConfigLoader` reads YAML/JSON from standard locations + env var overrides → `ServerConfig` in `src/ServerConfig.ts` validates and exposes a typed, immutable config + 7 feature flags.
+This folder is **only** `ConfigLoader.ts`. There is **no** `server-config.ts` shim here.
 
-## STRUCTURE
+Canonical validated config is `src/ServerConfig.ts`. Loader returns raw `ConfigFileOptions`; `ServerConfig` validates + resolves feature flags.
 
-```
-src/config/
-├── ConfigLoader.ts    # YAML+JSON loader, env override mapping, ConfigFileOptions schema (480L)
-└── server-config.ts   # Re-export shim (thin, delegates to src/ServerConfig.ts)
-```
+## LOAD ORDER
 
-> Note: The canonical `ServerConfig` class lives at `src/ServerConfig.ts` (517L), not inside this directory.
+env > project > user > defaults.
 
-## CONFIGLOADER
+1. `TRACELATTICE_CONFIG` (custom path)
+2. `.claude/config.yaml` \| `.claude/config.json`
+3. `~/.claude/config.yaml` \| `~/.claude/config.json`
 
-Loads from the following locations in priority order (env > project > user > defaults):
+YAML or JSON. All fields optional. Extra keys kept (`looseObject`).
 
-1. `TRACELATTICE_CONFIG` env var (custom path)
-2. `.claude/config.yaml` / `.claude/config.json` (project-local)
-3. `~/.claude/config.yaml` / `~/.claude/config.json` (user-global)
+## DI KEYS
 
-```typescript
-const loader = new ConfigLoader();
-const config: ConfigFileOptions = await loader.load();
-```
+| Key | Type | Meaning |
+|-----|------|---------|
+| `FileConfig` | `ConfigFileOptions` | raw pre-validation blob |
+| `Config` | `ServerConfig` | validated + flags |
 
-`ConfigFileOptions` exported type fields:
-- `maxHistorySize`, `maxBranches`, `maxBranchSize`
-- `logLevel: 'debug'|'info'|'warn'|'error'`, `prettyLog: boolean`
-- `skillDirs: string[]`
-- `discoveryCache: { ttl?, maxSize? }`
-- `persistence` (backend config blob, shape varies by backend type)
-- `features` (feature flag overrides blob)
-- `toolInterleaveTtlMs`, `toolInterleaveSweepMs`
-- `maxSessionsPerOwner`
+## FLAGS
 
-All fields optional. Unknown extra fields are preserved (Valibot `looseObject`).
+`ServerConfig.validateFeatures()`:
 
-## ENV VAR OVERRIDES
+- booleans default **ON** (`dagEdges`, `calibration`, `compression`, `toolInterleave`, `newThoughtTypes`, `outcomeRecording`)
+- `reasoningStrategy` default `'sequential'` (`'tot'` allowed)
 
-All config fields can be overridden via `TRACELATTICE_*` env vars:
-
-```
-TRACELATTICE_MAX_HISTORY_SIZE=1000
-TRACELATTICE_LOG_LEVEL=debug
-TRACELATTICE_PRETTY_LOG=true
-TRACELATTICE_FEATURES_DAG_EDGES=true
-TRACELATTICE_FEATURES_REASONING_STRATEGY=tot
-TRACELATTICE_FEATURES_CALIBRATION=true
-TRACELATTICE_FEATURES_COMPRESSION=true
-TRACELATTICE_FEATURES_TOOL_INTERLEAVE=true
-TRACELATTICE_FEATURES_NEW_THOUGHT_TYPES=true
-TRACELATTICE_FEATURES_OUTCOME_RECORDING=true
-```
-
-## SERVERCONFIG (src/ServerConfig.ts)
-
-Canonical config class with validation + feature flag resolution.
-
-- `ServerConfig.validateFeatures()`: defaults all boolean flags to `true`; env vars document off-by-default opt-ins.
-- 7 feature flags: `dagEdges`, `reasoningStrategy ('sequential'|'tot')`, `calibration`, `compression`, `toolInterleave`, `newThoughtTypes`, `outcomeRecording`.
-- Exposes `hasFeature(flag)` from `contracts/features.ts`.
+`contracts/features.ts` exports `FeatureFlags` + `DEFAULT_FLAGS`. **No `hasFeature()`**.
 
 ## NOTES
 
-- CLI (`cli.ts`) does not parse config args — all config via env vars or config files.
-- `ConfigFileOptions` is exported and registered as `FileConfig` in DI (raw pre-validation data).
-- `ServerConfig` is registered as `Config` in DI (validated config + feature flags).
+- CLI does **not** parse config args. Env + files only.
+- Env overrides use `TRACELATTICE_*` (and a few unprefixed aliases like `SKILL_DIRS` / `TOOL_DIRS`).
+- `src/types/server-config.ts` is a **runtime** tools/skills bag — not this loader, not `ServerConfig`.
+- Do not add a re-export shim in this directory.

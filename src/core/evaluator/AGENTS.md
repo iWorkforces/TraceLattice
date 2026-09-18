@@ -1,56 +1,52 @@
 # EVALUATOR
 
+**Parent:** ../AGENTS.md
+
 ## OVERVIEW
 
-Decomposed evaluation pipeline. `ThoughtEvaluator` (parent) is a thin facade delegating to 4 specialists. Stateless per-call; no shared mutable state across components.
+Specialists only. Facade is parent `ThoughtEvaluator` — filters `retracted` first, then delegates.
 
 ## COMPONENTS
 
 | File | Role |
-| --- | --- |
-| `SignalComputer.ts` | Computes `ConfidenceSignals` per response. Owns `structural_quality` geomean + `quality_components` (floored) + `quality_components_raw` (pre-floor, debug). Uses `roundToPrecision()` for FP-safe averages. |
-| `Aggregator.ts` | Builds `ReasoningStats`: hypothesis chains (id → verifications/critiques), type distribution, averages. Uses `roundToPrecision()` for FP-safe averages. |
-| `PatternDetector.ts` | 6 detectors → priority-ranked hints. 5 warning-severity patterns produce hints; `healthy_verification` is `info`-only and does NOT produce hints. Per-session cooldowns tracked via `_hintCooldowns: Map<SessionId, Map<PatternName, number>>` (inner Map keyed by the `PatternName` union from `contracts/reasoning-types.ts`). Max-3 cap applied at selection. |
-| `Calibrator.ts` | Beta(2,2) prior smoothing of confidence; Brier + ECE (10 bins); calls temperature helpers from `calibration-math.ts`. |
-| `calibration-math.ts` | Extracted temperature-scaling math: `TEMPERATURE_GRID`, `MIN_OUTCOMES_FOR_TEMPERATURE`, `EPSILON`, `applyTemperature`, `negativeLogLikelihood`, `fitTemperature`. Pure; imports only `VerificationOutcome`. |
-| `internals.ts` | Shared private helpers reused across evaluator modules, including `ALL_THOUGHT_TYPES`. Not exported from `src/index.ts`. |
+|------|------|
+| `SignalComputer.ts` | `ConfidenceSignals` + structural quality |
+| `Aggregator.ts` | `ReasoningStats` |
+| `PatternDetector.ts` | Firehose of pattern signals |
+| `Calibrator.ts` | Shrinkage + optional temperature |
+| `calibration-math.ts` | `TEMPERATURE_GRID`, `MIN_OUTCOMES_FOR_TEMPERATURE=10` |
+| `internals.ts` | `ALL_THOUGHT_TYPES` — **must stay 11-wide** |
 
-## QUALITY SCORING
+## SIGNALCOMPUTER
 
-Geometric mean over 4 components (weighted), floored at `FLOOR = 0.01` to prevent collapse:
+`type_diversity` = Shannon entropy / **`log2(6)`** even though there are **11** types. Do not “fix” the divisor without a scoring-compat decision.
 
-- `QUALITY_WEIGHTS` — td=0.3, vc=0.3, de=0.2, cs=0.2
-- `QUALITY_WEIGHTS_NO_CS` — td=0.375, vc=0.375, de=0.25 (used when `confidence_stability` is null)
-- `confidence_stability` returns `null` when n &lt; 2 (single sample has no variance signal); excluded from the geomean and weights renormalize.
+Other components: `verification_coverage`, `depth_efficiency`, `confidence_stability` (null when n<2). Geomean, floor 0.01; no-cs weights renormalize.
 
-Components: `type_diversity`, `verification_coverage`, `depth_efficiency`, `confidence_stability`. Raw (pre-floor) values surface as `quality_components_raw`.
+## PATTERNS / HINTS
 
-## PATTERNS
+Detector is a **firehose**. Hint selection lives on **`ThoughtProcessor`**, not here.
 
-`PatternName` union (canonical in `contracts/reasoning-types.ts`, re-exported from `core/reasoning.ts`): `'consecutive_without_verification' | 'unverified_hypothesis' | 'no_alternatives_explored' | 'monotonic_type' | 'confidence_drift' | 'healthy_verification'`.
+- Warning-only, **max 3**, **3-thought cooldown**.
+- Cooldown is **not** on the detector. Map **survives `reset_state`** (cleared only via processor auxiliary-state wipe).
 
-Priority order (lower fires first, max 3 hints per response):
+Processor priority (lower first):
 
-1. `confidence_drift` — warning
-2. `unverified_hypothesis` — warning. Needs ≥ 3 thoughts AFTER the hypothesis before firing
-3. `consecutive_without_verification` — warning
-4. `monotonic_type` — warning. Gated on `history.length ≥ 5` AND `runLength ≥ 4`
-5. `no_alternatives_explored` — warning
-6. `healthy_verification` — info-only. Diagnostic signal; never emitted as a hint
+1. `confidence_drift`
+2. `unverified_hypothesis`
+3. `no_alternatives_explored`
+4. `consecutive_without_verification`
 
-Per-pattern cooldown is configurable per session, stored in `_hintCooldowns: Map<SessionId, Map<PatternName, number>>`.
+`monotonic_type` is **warning** but **unranked (99)** — after the four. `healthy_verification` is **info**, never a hint.
 
-## CALIBRATION
+Detector still emits all six (`PatternName` in `contracts/reasoning-types.ts`).
 
-- Beta(2,2) priors smooth low-sample bins.
-- Brier score + ECE (10 equal-width bins) reported in `CalibrationMetrics`.
-- Temperature scaling lives in `calibration-math.ts`. `Calibrator` calls `fitTemperature()` and `applyTemperature()`; the grid and threshold constants live there.
-- Requires `MIN_OUTCOMES_FOR_TEMPERATURE = 10` recorded outcomes; otherwise temperature scaling falls back to T=1.0 / identity.
-- `ALL_THOUGHT_TYPES` lives in `internals.ts` and must include all 11 `ThoughtType` variants; `Calibrator` uses it for `perTypeBrier` and disabled-mode empty metrics.
-- Gated by `outcomeRecording` feature flag (records `tool_call`/`tool_observation` outcomes via `HistoryManager`).
+## CALIBRATOR
 
-## NOTES
+Actual math: **shrinkage toward per-type empirical mean** (`priorWeight = 1/(1+n/10)`; empty type mean 0.5). “Beta(2,2) prior updates” is **overstated** — no α/β counters.
 
-- All four specialists are pure: no I/O, no clocks, no DI lookups beyond constructor injection.
-- Adding a pattern: extend `PatternDetector`, assign a priority, add cooldown default. Don't bypass the selection cap.
-- Adding a quality component: update both weight tables and renormalization logic. Floor must remain.
+- Temperature applied only if outcomes **≥ 10**. Else identity on the shrunk value.
+- Mutable **per-session T map** (`refit` writes it). Grid in `calibration-math.ts`: `{0.5, 0.75, 1.0, 1.25, 1.5, 2.0}`.
+- Brier + 10-bin ECE. `perTypeBrier` keyed by all 11 types.
+
+Outcomes come from `OutcomeRecorder` (verification path) — not this dir.

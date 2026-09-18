@@ -88,6 +88,61 @@ describe('Metrics Integration', () => {
 		expect(snapshot).toContain('sequentialthinking_');
 	});
 
+	it('returns the exporter snapshot with escaped label values unchanged', () => {
+		const metrics = server.getContainer().resolve('Metrics');
+		metrics.counter('snapshot_total', 2, { workflow: 'plan\\review"\nnext' });
+
+		const exported = metrics.export();
+		expect(server.getMetricsSnapshot()).toBe(exported);
+		expect(exported).toBe(
+			'# HELP sequentialthinking_snapshot_total sequentialthinking_snapshot_total metric\n' +
+				'# TYPE sequentialthinking_snapshot_total counter\n' +
+				'sequentialthinking_snapshot_total{workflow="plan\\\\review\\"\\nnext"} 2'
+		);
+	});
+
+	it('keeps colliding DI metric series distinct through lookup, export, and reset', () => {
+		const metrics = server.getContainer().resolve('Metrics');
+		const combinedLabel = { a: '1,b=2' };
+		const splitLabels = { a: '1', b: '2' };
+		metrics.counter('collision_total', 2, combinedLabel);
+		metrics.inc('collision_total', splitLabels);
+
+		expect(metrics.get('collision_total', combinedLabel)).toBe(2);
+		expect(metrics.get('collision_total', splitLabels)).toBe(1);
+		expect(server.getMetricsSnapshot()).toContain(
+			'sequentialthinking_collision_total{a="1,b=2"} 2'
+		);
+		expect(server.getMetricsSnapshot()).toContain(
+			'sequentialthinking_collision_total{a="1",b="2"} 1'
+		);
+
+		metrics.reset();
+		expect(server.getMetricsSnapshot()).toBe('');
+	});
+
+	it('preserves histogram totals and custom buckets with copied labels', () => {
+		const metrics = server.getContainer().resolve('Metrics');
+		const labels = { operation: 'read' };
+		metrics.histogram('custom_latency', 3, labels, [1, 5]);
+		metrics.histogram('custom_latency', 7, labels, [1, 5]);
+		labels.operation = 'mutated';
+
+		const snapshot = server.getMetricsSnapshot();
+		expect(snapshot).toContain('sequentialthinking_custom_latency_sum{operation="read"} 10');
+		expect(snapshot).toContain('sequentialthinking_custom_latency_count{operation="read"} 2');
+		expect(snapshot).toContain(
+			'sequentialthinking_custom_latency_bucket{operation="read",le="1"} 0'
+		);
+		expect(snapshot).toContain(
+			'sequentialthinking_custom_latency_bucket{operation="read",le="5"} 1'
+		);
+		expect(snapshot).toContain(
+			'sequentialthinking_custom_latency_bucket{operation="read",le="+Inf"} 2'
+		);
+		expect(snapshot).not.toContain('operation="mutated"');
+	});
+
 	it('increments thought_requests_total from HistoryManager addThought', async () => {
 		const thought: ThoughtData = {
 			thought: 'Test thought',
@@ -216,10 +271,7 @@ describe('Metrics Integration', () => {
 			expect(snapshot).toContain('raw_counter{} 5');
 		});
 
-		it('should handle _parseMetricKey when key has no braces', () => {
-			// This exercises the !match branch in _parseMetricKey.
-			// We can trigger it indirectly by creating a histogram with an unusual key.
-			// Direct test: create histogram, export, verify output is valid.
+		it('should export histogram names from stored metadata', () => {
 			metrics.histogram('parse_test', 0.5, {});
 			const snapshot = metrics.export();
 			expect(snapshot).toContain('sequentialthinking_parse_test_sum');
@@ -266,17 +318,13 @@ describe('Metrics Integration', () => {
 			expect(metrics.get('nonexistent_gauge')).toBe(-1);
 		});
 
-		it('should handle _parseMetricKey with empty labelsPart', () => {
-			// Create a metric with no labels — the key will be "name{}"
-			// which produces empty labelsPart in _parseMetricKey
+		it('should export histogram metadata with no labels', () => {
 			metrics.histogram('empty_labels_key', 2.5, {});
 			const snapshot = metrics.export();
 			expect(snapshot).toContain('sequentialthinking_empty_labels_key_sum 2.5');
 		});
 
-		it('should handle _parseMetricKey with separator index <= 0', () => {
-			// A label like "=value" or just "badlabel" would hit the continue branch.
-			// This is exercised indirectly; we verify that well-formed labels still work.
+		it('should export ordinary counter labels', () => {
 			metrics.counter('separator_test', 1, { key: 'val' });
 			const snapshot = metrics.export();
 			expect(snapshot).toContain('sequentialthinking_separator_test{key="val"} 1');

@@ -5,7 +5,12 @@ import * as v from 'valibot';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ConfigFileOptions } from '../../config/ConfigLoader.js';
 import { ConfigLoader } from '../../config/ConfigLoader.js';
+import {
+	supportsSessionScopedPersistence,
+	type SessionScopedPersistenceBackend,
+} from '../../contracts/PersistenceBackend.js';
 import { asSessionId } from '../../contracts/ids.js';
+import { PersistenceDrainError } from '../../core/PersistenceBufferErrors.js';
 import { TreeOfThoughtStrategy } from '../../core/reasoning/strategies/TreeOfThoughtStrategy.js';
 import { InMemorySuspensionStore } from '../../core/tools/InMemorySuspensionStore.js';
 import { ConfigurationError } from '../../errors.js';
@@ -64,6 +69,36 @@ function loadConfig(configPath: string): ConfigFileOptions {
 async function dispose(server: ToolAwareSequentialThinkingServer): Promise<void> {
 	await server.dispose();
 	liveServers.delete(server);
+}
+
+async function disposeAfterExpectedFailure(
+	server: ToolAwareSequentialThinkingServer
+): Promise<void> {
+	try {
+		await expect(server.dispose()).rejects.toBeInstanceOf(AggregateError);
+	} finally {
+		liveServers.delete(server);
+	}
+}
+
+function scopedPersistence(
+	server: ToolAwareSequentialThinkingServer
+): SessionScopedPersistenceBackend {
+	const persistence = server.getContainer().resolve('Persistence');
+	if (persistence === null || !supportsSessionScopedPersistence(persistence)) {
+		throw new TypeError('Expected session-scoped persistence');
+	}
+	return persistence;
+}
+
+function thoughtInput(sessionId: string, thoughtNumber: number, totalThoughts: number) {
+	return {
+		thought: `configured persistence thought ${thoughtNumber}`,
+		thought_number: thoughtNumber,
+		total_thoughts: totalThoughts,
+		next_thought_needed: thoughtNumber < totalThoughts,
+		session_id: sessionId,
+	};
 }
 
 function skillDocument(name: string, description: string): string {
@@ -164,6 +199,188 @@ describe('effective runtime configuration', () => {
 		expect(server.getContainer().resolve('EdgeStore').size(asSessionId('effective-flags'))).toBe(0);
 	});
 
+	it('starts a persistence drain only when the configured file threshold is reached', async () => {
+		vi.stubEnv('MAX_HISTORY_SIZE', '4321');
+		const server = await createServer({
+			fileConfig: {
+				maxHistorySize: 123,
+				persistence: { enabled: true, backend: 'memory' },
+				persistenceBufferSize: 2,
+				persistenceFlushInterval: 60_000,
+				persistenceMaxRetries: 0,
+				features: { toolInterleave: false },
+			},
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		liveServers.add(server);
+		const persistence = scopedPersistence(server);
+		const save = vi.spyOn(persistence, 'saveThoughtForSession');
+		const sessionId = asSessionId('configured-threshold');
+
+		expect(server.config.maxHistorySize).toBe(4321);
+		expect(server.config.persistenceBufferSize).toBe(2);
+		expect(server.config.persistenceFlushInterval).toBe(60_000);
+		expect(server.config.persistenceMaxRetries).toBe(0);
+
+		await server.processThought(thoughtInput(sessionId, 1, 2));
+		expect(save).not.toHaveBeenCalled();
+		expect(server.history.getWriteBufferLength()).toBe(1);
+
+		await server.processThought(thoughtInput(sessionId, 2, 2));
+		expect(save).toHaveBeenCalled();
+		await server.history.drainSession(sessionId);
+		expect(save).toHaveBeenCalledTimes(2);
+		expect(server.history.getWriteBufferLength()).toBe(0);
+	});
+
+	it('flushes at the exact configured file timer boundary', async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: false });
+		const server = await createServer({
+			fileConfig: {
+				persistence: { enabled: true, backend: 'memory' },
+				persistenceBufferSize: 100,
+				persistenceFlushInterval: 250,
+				persistenceMaxRetries: 0,
+				features: { toolInterleave: false },
+			},
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		liveServers.add(server);
+		const persistence = scopedPersistence(server);
+		const save = vi.spyOn(persistence, 'saveThoughtForSession');
+
+		expect(server.config.persistenceFlushInterval).toBe(250);
+		await server.processThought(thoughtInput('configured-timer', 1, 1));
+
+		await vi.advanceTimersByTimeAsync(249);
+		expect(save).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(save).toHaveBeenCalledOnce();
+		expect(server.history.getWriteBufferLength()).toBe(0);
+	});
+
+	it.each([
+		{ maxRetries: 0, expectedAttempts: 1, elapsedRetryTime: 0 },
+		{ maxRetries: 2, expectedAttempts: 3, elapsedRetryTime: 600 },
+	])(
+		'limits configured file retries to $maxRetries after the initial attempt',
+		async ({ maxRetries, expectedAttempts, elapsedRetryTime }) => {
+			vi.useFakeTimers({ shouldAdvanceTime: false });
+			const server = await createServer({
+				fileConfig: {
+					persistence: { enabled: true, backend: 'memory' },
+					persistenceBufferSize: 100,
+					persistenceFlushInterval: 60_000,
+					persistenceMaxRetries: maxRetries,
+					features: { toolInterleave: false },
+				},
+				autoDiscover: false,
+				loadFromPersistence: false,
+			});
+			liveServers.add(server);
+			expect(server.config.persistenceMaxRetries).toBe(maxRetries);
+			const persistence = scopedPersistence(server);
+			const firstAttempt = Promise.withResolvers<void>();
+			const failure = new Error(`controlled retry failure ${maxRetries}`);
+			const save = vi.spyOn(persistence, 'saveThoughtForSession').mockImplementation(async () => {
+				firstAttempt.resolve();
+				throw failure;
+			});
+			const sessionId = asSessionId(`configured-retries-${maxRetries}`);
+			await server.processThought(thoughtInput(sessionId, 1, 1));
+
+			const stopOutcomePromise = server.stop().then(
+				() => ({ status: 'fulfilled' as const }),
+				(error: unknown) => ({ status: 'rejected' as const, error })
+			);
+			await firstAttempt.promise;
+			await Promise.resolve();
+			await vi.advanceTimersByTimeAsync(elapsedRetryTime);
+			const stopOutcome = await stopOutcomePromise;
+
+			expect(save).toHaveBeenCalledTimes(expectedAttempts);
+			expect(stopOutcome.status).toBe('rejected');
+			if (stopOutcome.status !== 'rejected') throw new TypeError('Expected server stop to reject');
+			expect(stopOutcome.error).toBeInstanceOf(AggregateError);
+			if (!(stopOutcome.error instanceof AggregateError)) {
+				throw new TypeError('Expected aggregate stop failure');
+			}
+			expect(stopOutcome.error.errors).toHaveLength(1);
+			const drainFailure = stopOutcome.error.errors[0];
+			expect(drainFailure).toBeInstanceOf(PersistenceDrainError);
+			expect(drainFailure).toMatchObject({
+				code: 'PERSISTENCE_DRAIN',
+				failures: [
+					{
+						kind: 'thought',
+						sessionId,
+						attempts: expectedAttempts,
+						cause: failure,
+					},
+				],
+			});
+			await disposeAfterExpectedFailure(server);
+		}
+	);
+
+	it('waits for a configured threshold write during shutdown and clears timers', async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: false });
+		const server = await createServer({
+			fileConfig: {
+				persistence: { enabled: true, backend: 'memory' },
+				persistenceBufferSize: 1,
+				persistenceFlushInterval: 500,
+				persistenceMaxRetries: 0,
+				features: { toolInterleave: false },
+			},
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		liveServers.add(server);
+		expect(server.config.persistenceBufferSize).toBe(1);
+		const persistence = scopedPersistence(server);
+		const originalSave = persistence.saveThoughtForSession.bind(persistence);
+		const writeStarted = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		vi.spyOn(persistence, 'saveThoughtForSession').mockImplementation(
+			async (sessionId, thought) => {
+				writeStarted.resolve();
+				await releaseWrite.promise;
+				await originalSave(sessionId, thought);
+			}
+		);
+		const shutdownStarted = Promise.withResolvers<void>();
+		const originalShutdown = server.history.shutdownWithinLifecycle.bind(server.history);
+		vi.spyOn(server.history, 'shutdownWithinLifecycle').mockImplementation(() => {
+			const shutdown = originalShutdown();
+			shutdownStarted.resolve();
+			return shutdown;
+		});
+
+		await server.processThought(thoughtInput('configured-shutdown', 1, 1));
+		await writeStarted.promise;
+		let settled = false;
+		const stopping = server.stop().then(() => {
+			settled = true;
+		});
+		await shutdownStarted.promise;
+
+		try {
+			expect(settled).toBe(false);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			releaseWrite.resolve();
+			await stopping;
+		}
+		expect(settled).toBe(true);
+		expect(
+			await persistence.loadHistoryForSession(asSessionId('configured-shutdown'))
+		).toHaveLength(1);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
 	it('uses configured suspension TTL and sweep intervals in the running store', async () => {
 		vi.useFakeTimers({ now: new Date('2026-09-09T00:00:00.000Z') });
 		const rawFileConfig: ConfigFileOptions = {
@@ -258,14 +475,38 @@ describe('effective runtime configuration', () => {
 	it('uses one loaded configuration snapshot during initialization', async () => {
 		const loadSpy = vi
 			.spyOn(ConfigLoader.prototype, 'load')
-			.mockReturnValueOnce({ maxHistorySize: 321 })
-			.mockReturnValueOnce({ maxHistorySize: 654 });
+			.mockReturnValueOnce({
+				maxHistorySize: 321,
+				persistence: { enabled: true, backend: 'memory' },
+				persistenceBufferSize: 2,
+				persistenceFlushInterval: 60_000,
+				persistenceMaxRetries: 0,
+				features: { toolInterleave: false },
+			})
+			.mockReturnValueOnce({
+				maxHistorySize: 654,
+				persistence: { enabled: true, backend: 'memory' },
+				persistenceBufferSize: 1,
+				persistenceFlushInterval: 100,
+				persistenceMaxRetries: 10,
+			});
 
 		const server = await initializeServer();
 		liveServers.add(server);
+		const persistence = scopedPersistence(server);
+		const save = vi.spyOn(persistence, 'saveThoughtForSession');
 
 		expect(loadSpy).toHaveBeenCalledOnce();
 		expect(server.config.maxHistorySize).toBe(321);
+		expect(server.config.persistenceBufferSize).toBe(2);
+		expect(server.config.persistenceFlushInterval).toBe(60_000);
+		expect(server.config.persistenceMaxRetries).toBe(0);
+		await server.processThought(thoughtInput('one-config-snapshot', 1, 2));
+		expect(save).not.toHaveBeenCalled();
+		await server.processThought(thoughtInput('one-config-snapshot', 2, 2));
+		expect(save).toHaveBeenCalled();
+		await server.history.drainSession(asSessionId('one-config-snapshot'));
+		expect(save).toHaveBeenCalledTimes(2);
 	});
 
 	it('applies environment overrides exactly once during initialization', async () => {
@@ -273,7 +514,12 @@ describe('effective runtime configuration', () => {
 		const loadSpy = vi.spyOn(ConfigLoader.prototype, 'load').mockImplementation(function (
 			this: ConfigLoader
 		) {
-			return this.applyEnvironmentOverrides({ maxHistorySize: 321 });
+			return this.applyEnvironmentOverrides({
+				maxHistorySize: 321,
+				persistenceBufferSize: 3,
+				persistenceFlushInterval: 700,
+				persistenceMaxRetries: 1,
+			});
 		});
 
 		const server = await initializeServer();
@@ -282,6 +528,9 @@ describe('effective runtime configuration', () => {
 		expect(loadSpy).toHaveBeenCalledOnce();
 		expect(overlaySpy).toHaveBeenCalledOnce();
 		expect(server.config.maxHistorySize).toBe(321);
+		expect(server.config.persistenceBufferSize).toBe(3);
+		expect(server.config.persistenceFlushInterval).toBe(700);
+		expect(server.config.persistenceMaxRetries).toBe(1);
 	});
 
 	it('initializes both registries from one configured temporary root snapshot', async () => {
@@ -515,6 +764,10 @@ describe('effective runtime configuration', () => {
 			maxHistorySize: 111,
 			skillDirs: [],
 			toolDirs: [],
+			persistence: { enabled: true, backend: 'memory' },
+			persistenceBufferSize: 2,
+			persistenceFlushInterval: 60_000,
+			persistenceMaxRetries: 0,
 			features: { toolInterleave: false },
 		});
 		const server = await createServer({
@@ -523,16 +776,69 @@ describe('effective runtime configuration', () => {
 				maxHistorySize: 222,
 				skillDirs: ['/file/skills'],
 				toolDirs: ['/file/tools'],
+				persistence: { enabled: true, backend: 'memory' },
+				persistenceBufferSize: 1,
+				persistenceFlushInterval: 100,
+				persistenceMaxRetries: 10,
 			},
 			maxHistorySize: 333,
 			autoDiscover: false,
 			loadFromPersistence: false,
 		});
 		liveServers.add(server);
+		const persistence = scopedPersistence(server);
+		const save = vi.spyOn(persistence, 'saveThoughtForSession');
 
 		expect(server.config).toBe(config);
 		expect(server.config.maxHistorySize).toBe(111);
 		expect(server.config.skillDirs).toEqual([]);
 		expect(server.config.toolDirs).toEqual([]);
+		expect(server.config.persistenceBufferSize).toBe(2);
+		expect(server.config.persistenceFlushInterval).toBe(60_000);
+		expect(server.config.persistenceMaxRetries).toBe(0);
+		await server.processThought(thoughtInput('explicit-config-threshold', 1, 2));
+		expect(save).not.toHaveBeenCalled();
+		await server.processThought(thoughtInput('explicit-config-threshold', 2, 2));
+		expect(save).toHaveBeenCalled();
+		await server.history.drainSession(asSessionId('explicit-config-threshold'));
+		expect(save).toHaveBeenCalledTimes(2);
+	});
+
+	it('restores a threshold-drained thought after a public file-backed restart', async () => {
+		const dataDir = await mkdtemp(join(tmpdir(), 'tracelattice-configured-file-restart-'));
+		temporaryDirectories.add(dataDir);
+		const fileConfig: ConfigFileOptions = {
+			persistence: { enabled: true, backend: 'file', options: { dataDir } },
+			persistenceBufferSize: 1,
+			persistenceFlushInterval: 60_000,
+			persistenceMaxRetries: 0,
+			features: { toolInterleave: false },
+		};
+		const sessionId = asSessionId('configured-file-restart');
+		const first = await createServer({
+			fileConfig,
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		liveServers.add(first);
+		expect(first.config.persistenceBufferSize).toBe(1);
+
+		await first.processThought(thoughtInput(sessionId, 1, 1));
+		await first.stop();
+		await dispose(first);
+
+		const second = await createServer({
+			fileConfig,
+			autoDiscover: false,
+			loadFromPersistence: true,
+		});
+		liveServers.add(second);
+
+		expect(second.history.getHistory(sessionId)).toHaveLength(1);
+		expect(second.history.getHistory(sessionId)[0]?.thought).toBe(
+			'configured persistence thought 1'
+		);
+		expect(second.history.getWriteBufferLength()).toBe(0);
+		await dispose(second);
 	});
 });

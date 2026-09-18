@@ -1,51 +1,41 @@
-# REASONING MODULE
+# REASONING
 
 **Parent:** ../AGENTS.md
 
 ## OVERVIEW
 
-Two concerns live here: `OutcomeRecorder` (calibration data collection) and `strategies/` (pluggable reasoning policies). They share no state. `OutcomeRecorder` feeds `Calibrator`; `strategies/` feeds `ThoughtProcessor`.
+Two unrelated seams: `OutcomeRecorder` (calibration samples) and `strategies/` (policy). No shared state.
 
 ## STRUCTURE
 
 ```
 reasoning/
-├── OutcomeRecorder.ts   # Per-session calibration outcome storage (116L)
-└── strategies/          # Pure reasoning policies — has own AGENTS.md
-    ├── SequentialStrategy.ts
-    ├── TreeOfThoughtStrategy.ts
-    ├── StrategyFactory.ts
-    ├── totScoring.ts
-    └── plateau.ts
+├── OutcomeRecorder.ts
+└── strategies/          # own AGENTS.md — contract method is decide(), not decideNext
 ```
 
-## OUTCOME RECORDER
+## OUTCOMERECORDER
 
-`OutcomeRecorder` records a `VerificationOutcome` per thought so `Calibrator` can compute calibration metrics (Brier, ECE) over real outcomes.
+Dumb store. Records `VerificationOutcome` for `Calibrator`. Does not score.
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `thoughtId` | `ThoughtId` | Branded |
-| `thoughtNumber` | `number` | Ordinal within session |
-| `sessionId` | `SessionId` | Branded |
-| `predicted` | `number` (0–1) | The `confidence` on the thought |
-| `actual` | `number` (0–1) | Observed outcome (set by LLM on `tool_observation`) |
-| `type` | `ThoughtType` | For per-type breakdown |
+Write path: **`thought_type === 'verification'` + `verification_result` ∈ {0,1}** via `prepareVerificationOutcome` / `recordVerification`.
 
-- Gated by `outcomeRecording` feature flag. When off, `OutcomeRecorder` is a no-op.
-- Registered in `ServiceRegistry` as `outcomeRecorder`.
-- `Calibrator` reads outcomes via `ICalibrator` contract (`src/contracts/calibrator.ts`).
+**Not** `tool_call` / `tool_observation`.
 
-## WHERE TO LOOK
+| Field | Notes |
+|-------|--------|
+| `thoughtId` / `thoughtNumber` | **target** hypothesis, not the verification thought |
+| `predicted` | target `confidence` |
+| `actual` | `verification_result` 0\|1 |
+| `type` | target `thought_type` |
+| `recordedAt` | set by recorder |
 
-| Task | File |
-|------|------|
-| Outcome recording logic | `OutcomeRecorder.ts` |
-| Calibration computation | `src/core/evaluator/Calibrator.ts` |
-| Add / change reasoning strategy | `strategies/` + `StrategyFactory.ts` — see `strategies/AGENTS.md` |
-| Strategy contract | `src/contracts/strategy.ts` |
+Gated by `outcomeRecording`. Disabled → all writes/reads no-op (`enabled` false, `getOutcomes` `[]`). Duplicate target in-session → `ValidationError` (`assertCanRecord`).
 
-## NOTES
+Methods: `assertCanRecord` · `recordVerification` · `getOutcomes` · `getAllOutcomes` · `clearOutcomes` · `clearAllOutcomes`.
 
-- `OutcomeRecorder` is a dumb store — it records, it does not compute. All metric derivation happens in `Calibrator`.
-- `strategies/` sub-directory is at depth 4 deliberately. Strategies are leaf policies; they import from `contracts/` and `core/` types only, never from infrastructure or DI.
+DI key: `outcomeRecorder`.
+
+## STRATEGIES
+
+See `strategies/AGENTS.md`. Processor calls **`decide()`** only.

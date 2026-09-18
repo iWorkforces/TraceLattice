@@ -70,7 +70,14 @@ describe('ConfigLoader', () => {
 			loader = new ConfigLoader();
 			mockExistsSync.mockImplementation((path: string) => path.endsWith('.json'));
 			mockReadFileSync.mockReturnValue(
-				JSON.stringify({ maxHistorySize: 500, maxBranches: 20, logLevel: 'debug' })
+				JSON.stringify({
+					maxHistorySize: 500,
+					maxBranches: 20,
+					logLevel: 'debug',
+					persistenceBufferSize: 12,
+					persistenceFlushInterval: 345,
+					persistenceMaxRetries: 4,
+				})
 			);
 
 			const config = loader.load();
@@ -78,18 +85,56 @@ describe('ConfigLoader', () => {
 			expect(config!.maxHistorySize).toBe(500);
 			expect(config!.maxBranches).toBe(20);
 			expect(config!.logLevel).toBe('debug');
+			expect(config!.persistenceBufferSize).toBe(12);
+			expect(config!.persistenceFlushInterval).toBe(345);
+			expect(config!.persistenceMaxRetries).toBe(4);
 		});
 
 		it('should load YAML config file', () => {
 			loader = new ConfigLoader();
 			mockExistsSync.mockImplementation((path: string) => path.endsWith('.yaml'));
-			mockReadFileSync.mockReturnValue('maxHistorySize: 300\nmaxBranches: 15\nlogLevel: warn');
+			mockReadFileSync.mockReturnValue(
+				[
+					'maxHistorySize: 300',
+					'maxBranches: 15',
+					'logLevel: warn',
+					'persistenceBufferSize: 9',
+					'persistenceFlushInterval: 678',
+					'persistenceMaxRetries: 2',
+				].join('\n')
+			);
 
 			const config = loader.load();
 			expect(config).not.toBeNull();
 			expect(config!.maxHistorySize).toBe(300);
 			expect(config!.maxBranches).toBe(15);
 			expect(config!.logLevel).toBe('warn');
+			expect(config!.persistenceBufferSize).toBe(9);
+			expect(config!.persistenceFlushInterval).toBe(678);
+			expect(config!.persistenceMaxRetries).toBe(2);
+		});
+
+		it('should preserve unknown keys alongside persistence buffer settings', () => {
+			loader = new ConfigLoader();
+			mockExistsSync.mockImplementation((path: string) => path.endsWith('.json'));
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({
+					persistenceBufferSize: 7,
+					persistenceFlushInterval: 890,
+					persistenceMaxRetries: 1,
+					futureSetting: { enabled: true },
+				})
+			);
+
+			const config = loader.load();
+
+			expect(config).toMatchObject({
+				persistenceBufferSize: 7,
+				persistenceFlushInterval: 890,
+				persistenceMaxRetries: 1,
+				futureSetting: { enabled: true },
+			});
+			expect(loader.toServerConfigOptions(config ?? {})).not.toHaveProperty('futureSetting');
 		});
 
 		it('should load .yml config file', () => {
@@ -141,10 +186,56 @@ describe('ConfigLoader', () => {
 				.mockImplementationOnce(() => {
 					throw new Error('Bad JSON');
 				})
-				.mockImplementationOnce(() => JSON.stringify({ maxHistorySize: 750 }));
+				.mockImplementationOnce(() =>
+					[
+						'maxHistorySize: 750',
+						'persistenceBufferSize: 6',
+						'persistenceFlushInterval: 432',
+						'persistenceMaxRetries: 5',
+					].join('\n')
+				);
 
 			const config = loader.load();
 			expect(config!.maxHistorySize).toBe(750);
+			expect(config!.persistenceBufferSize).toBe(6);
+			expect(config!.persistenceFlushInterval).toBe(432);
+			expect(config!.persistenceMaxRetries).toBe(5);
+			consoleSpy.mockRestore();
+		});
+
+		it.each([
+			'persistenceBufferSize',
+			'persistenceFlushInterval',
+			'persistenceMaxRetries',
+		] as const)('should log a wrong %s type and continue to the next candidate', (field) => {
+			loader = new ConfigLoader();
+			const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync
+				.mockReturnValueOnce(
+					JSON.stringify({
+						persistenceBufferSize: 4,
+						persistenceFlushInterval: 500,
+						persistenceMaxRetries: 2,
+						[field]: 'invalid',
+					})
+				)
+				.mockReturnValueOnce(
+					[
+						'persistenceBufferSize: 8',
+						'persistenceFlushInterval: 765',
+						'persistenceMaxRetries: 3',
+					].join('\n')
+				);
+
+			const config = loader.load();
+
+			expect(consoleSpy).toHaveBeenCalledOnce();
+			expect(config).toMatchObject({
+				persistenceBufferSize: 8,
+				persistenceFlushInterval: 765,
+				persistenceMaxRetries: 3,
+			});
 			consoleSpy.mockRestore();
 		});
 	});
@@ -303,10 +394,20 @@ describe('ConfigLoader', () => {
 			process.env.MAX_HISTORY_SIZE = '999';
 			loader = new ConfigLoader();
 			mockExistsSync.mockReturnValue(true);
-			mockReadFileSync.mockReturnValue(JSON.stringify({ maxHistorySize: 100 }));
+			mockReadFileSync.mockReturnValue(
+				JSON.stringify({
+					maxHistorySize: 100,
+					persistenceBufferSize: 11,
+					persistenceFlushInterval: 654,
+					persistenceMaxRetries: 2,
+				})
+			);
 
 			const config = loader.load();
 			expect(config!.maxHistorySize).toBe(999);
+			expect(config!.persistenceBufferSize).toBe(11);
+			expect(config!.persistenceFlushInterval).toBe(654);
+			expect(config!.persistenceMaxRetries).toBe(2);
 		});
 
 		it('should reject non-numeric values in numeric env vars', () => {
@@ -334,15 +435,21 @@ describe('ConfigLoader', () => {
 				maxHistorySize: 500,
 				maxBranches: 25,
 				maxBranchSize: 200,
+				persistenceBufferSize: 13,
+				persistenceFlushInterval: 987,
+				persistenceMaxRetries: 6,
 				logLevel: 'debug' as const,
 				prettyLog: true,
 			};
 
 			const opts = loader.toServerConfigOptions(config);
-			expect(opts).toEqual({
+			expect(opts).toMatchObject({
 				maxHistorySize: 500,
 				maxBranches: 25,
 				maxBranchSize: 200,
+				persistenceBufferSize: 13,
+				persistenceFlushInterval: 987,
+				persistenceMaxRetries: 6,
 			});
 		});
 
@@ -352,6 +459,9 @@ describe('ConfigLoader', () => {
 			expect(opts.maxHistorySize).toBeUndefined();
 			expect(opts.maxBranches).toBeUndefined();
 			expect(opts.maxBranchSize).toBeUndefined();
+			expect(opts.persistenceBufferSize).toBeUndefined();
+			expect(opts.persistenceFlushInterval).toBeUndefined();
+			expect(opts.persistenceMaxRetries).toBeUndefined();
 		});
 
 		it('should handle partial config', () => {

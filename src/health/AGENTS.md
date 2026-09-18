@@ -1,33 +1,34 @@
-# HEALTH MODULE
+# HEALTH
 
-**Updated:** 2026-05-17
+**Updated:** 2026-09-17
 **Parent:** ../AGENTS.md
 
 ## OVERVIEW
 
-Aggregate liveness and readiness checks. `HealthChecker` accepts a `PersistenceBackend` and checks its `.healthy()` method. Consumed by transport `/health` and `/ready` endpoints.
+One class. Liveness + readiness for HTTP transports.
 
-## STRUCTURE
+## FILE
 
 ```
 health/
-└── HealthChecker.ts   # HealthChecker class + result types (161L)
+└── HealthChecker.ts   # HealthChecker + HealthCheckResult + HealthComponent
 ```
-
-## KEY TYPES
-
-| Symbol | Role |
-|--------|------|
-| `HealthChecker` (class) | `checkLiveness()` (sync, always ok) + `async checkReadiness()` (aggregates backends) |
-| `HealthCheckResult` | `{ status: 'ok'\|'degraded'\|'unhealthy', timestamp, components }` |
-| `HealthComponent` | `{ name, healthy, details?, latencyMs? }` |
 
 ## BEHAVIOR
 
-- `checkLiveness()`: synchronous, always returns `status: 'ok'`. Used by `GET /health`.
-- `checkReadiness()`: calls `persistence.healthy()` (with latency measurement) and aggregates:
-  - All healthy (or none registered) → `'ok'`
-  - Some healthy → `'degraded'`
-  - None healthy → `'unhealthy'`
-- Used by `GET /ready` on `StreamableHttpTransport`.
-- Pass `null` for persistence when no backend is configured — checker skips it.
+- `checkLiveness()` — **sync**, always `status: 'ok'`, empty `components`.
+- `checkReadiness()` — **async**. Only calls `persistence.healthy()` (with latency).
+- Pass `persistence: null` (or omit) to skip — readiness is `ok` with no components.
+- Aggregate: all healthy or none registered → `ok`; some → `degraded`; none healthy → `unhealthy`.
+- With only persistence wired, `degraded` cannot occur.
+
+## CONSUMERS
+
+- `GET /health` → `checkLiveness()` (`BaseTransport`, `StreamableHttpTransport`, `HttpTransport`)
+- `GET /ready` → `checkReadiness()`
+
+## NOTES
+
+- JSDoc mentioning a **pool** is aspirational — **not wired**.
+- Not in DI. Transport options accept an instance.
+- Default logger is an inline no-op.
