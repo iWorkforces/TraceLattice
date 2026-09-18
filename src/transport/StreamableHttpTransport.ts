@@ -91,6 +91,57 @@ export interface StreamableHttpTransportOptions extends TransportOptions {
 	 * @default 30000 (30 seconds)
 	 */
 	requestTimeout?: number;
+
+	/** Maximum retained sessions when idle expiry is enabled. */
+	maxSessions?: number;
+
+	/** Idle duration before an unpinned session expires. */
+	sessionIdleTimeoutMs?: number;
+
+	/** Interval between idle-session sweeps. */
+	sessionSweepIntervalMs?: number;
+}
+
+type SessionRetentionOptions = {
+	readonly maxSessions: number;
+	readonly sessionIdleTimeoutMs: number;
+	readonly sessionSweepIntervalMs: number;
+};
+
+function parseSessionRetentionOptions(
+	options: StreamableHttpTransportOptions
+): SessionRetentionOptions | null {
+	const { maxSessions, sessionIdleTimeoutMs, sessionSweepIntervalMs } = options;
+	if (
+		maxSessions === undefined &&
+		sessionIdleTimeoutMs === undefined &&
+		sessionSweepIntervalMs === undefined
+	) {
+		return null;
+	}
+	if (
+		maxSessions === undefined ||
+		!Number.isFinite(maxSessions) ||
+		!Number.isInteger(maxSessions) ||
+		maxSessions <= 0 ||
+		sessionIdleTimeoutMs === undefined ||
+		!Number.isFinite(sessionIdleTimeoutMs) ||
+		!Number.isInteger(sessionIdleTimeoutMs) ||
+		sessionIdleTimeoutMs <= 0 ||
+		sessionSweepIntervalMs === undefined ||
+		!Number.isFinite(sessionSweepIntervalMs) ||
+		!Number.isInteger(sessionSweepIntervalMs) ||
+		sessionSweepIntervalMs <= 0
+	) {
+		throw new TypeError(
+			'maxSessions, sessionIdleTimeoutMs, and sessionSweepIntervalMs must be provided together as positive integers'
+		);
+	}
+	return {
+		maxSessions,
+		sessionIdleTimeoutMs,
+		sessionSweepIntervalMs,
+	};
 }
 
 /**
@@ -98,19 +149,25 @@ export interface StreamableHttpTransportOptions extends TransportOptions {
  */
 interface SessionState {
 	/** Unique session identifier */
-	id: string;
+	id: SessionId;
 	/** Timestamp when the session was created */
 	createdAt: number;
 	/** Timestamp of the last activity */
 	lastActivityAt: number;
 	/** Active SSE notification streams for this session */
 	notificationStreams: Set<ServerResponse>;
+	acceptedPostCount: number;
 }
 
 type SessionError = {
 	readonly statusCode: number;
 	readonly code: number;
 	readonly message: string;
+};
+
+type AcceptedPostSession = {
+	readonly id: string | undefined;
+	readonly state: SessionState | null;
 };
 
 /**
@@ -167,9 +224,12 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	private _metricsProvider: (() => string) | null;
 	private readonly _lifecycleFailureReporter: LifecycleFailureReporter;
 	private readonly _acceptedWork: AcceptedWorkTracker;
+	private readonly _sessionRetention: SessionRetentionOptions | null;
+	private _sessionSweepIntervalId: NodeJS.Timeout | null = null;
 	private _stopPromise: Promise<void> | null = null;
 
 	constructor(options: StreamableHttpTransportOptions = {}) {
+		const sessionRetention = parseSessionRetentionOptions(options);
 		super(options);
 
 		this._path = options.path ?? '/mcp';
@@ -180,12 +240,20 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		this._requestTimeout = options.requestTimeout ?? 30000;
 		this._metrics = options.metrics;
 		this._metricsProvider = options.metricsProvider ?? null;
+		this._sessionRetention = sessionRetention;
 		this._lifecycleFailureReporter = new LifecycleFailureReporter((error) => {
 			this.log('error', 'Streamable HTTP request lifecycle failed', {
 				error: getErrorMessage(error),
 			});
 		});
 		this._acceptedWork = new AcceptedWorkTracker(this._lifecycleFailureReporter);
+		if (this._stateful && sessionRetention) {
+			this._sessionSweepIntervalId = setInterval(
+				() => this._sweepExpiredSessions(),
+				sessionRetention.sessionSweepIntervalMs
+			);
+			this._sessionSweepIntervalId.unref();
+		}
 	}
 
 	private _requireMcpServer(): McpServer {
@@ -385,6 +453,7 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		this._requestCount++;
 		this._activeRequests++;
 		const responseFinalizer = new ResponseFinalizer(res, this._lifecycleFailureReporter);
+		let acceptedSession: SessionState | null = null;
 
 		const timeout = setTimeout(() => {
 			responseFinalizer.finalize((response) => {
@@ -433,23 +502,9 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 			}
 			const jsonRpcRequest = parseResult.output;
 
-			// Session management (stateful mode)
-			let sessionId: string | undefined;
-			if (this._stateful) {
-				const sessionResult = this._resolveSession(req);
-				if (typeof sessionResult !== 'string') {
-					responseFinalizer.finalize((response) => {
-						this._sendJsonRpcError(
-							response,
-							sessionResult.statusCode,
-							sessionResult.code,
-							sessionResult.message
-						);
-					});
-					return;
-				}
-				sessionId = sessionResult;
-			}
+			const session = this._acceptPostSession(req, responseFinalizer);
+			if (!session) return;
+			acceptedSession = session.state;
 
 			// Check if MCP server is ready
 			if (!this._mcpServer) {
@@ -467,7 +522,7 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 
 			await this._receiveAndFinalize(
 				jsonRpcRequest as Parameters<McpServer['receive']>[0],
-				sessionId,
+				session.id,
 				responseFinalizer
 			);
 		} catch (error) {
@@ -477,9 +532,32 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 				});
 			});
 		} finally {
+			if (acceptedSession) acceptedSession.acceptedPostCount--;
 			clearTimeout(timeout);
 			this._activeRequests--;
 		}
+	}
+
+	private _acceptPostSession(
+		req: IncomingMessage,
+		responseFinalizer: ResponseFinalizer
+	): AcceptedPostSession | null {
+		if (!this._stateful) return { id: undefined, state: null };
+		if (this.isShuttingDown) {
+			responseFinalizer.finalize((response) => {
+				this._sendJsonRpcError(response, 503, -32603, 'Server is shutting down');
+			});
+			return null;
+		}
+		const session = this._resolveSession(req);
+		if (!('state' in session)) {
+			responseFinalizer.finalize((response) => {
+				this._sendJsonRpcError(response, session.statusCode, session.code, session.message);
+			});
+			return null;
+		}
+		session.state.acceptedPostCount++;
+		return { id: session.id, state: session.state };
 	}
 
 	private async _receiveAndFinalize(
@@ -556,6 +634,7 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 			);
 			return;
 		}
+		session.lastActivityAt = Date.now();
 
 		// Set SSE headers
 		res.writeHead(200, {
@@ -573,7 +652,6 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 
 		// Track this notification stream
 		session.notificationStreams.add(res);
-		session.lastActivityAt = Date.now();
 		this._updateSessionMetrics();
 
 		// Handle client disconnect
@@ -588,7 +666,9 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	 *
 	 * @returns Session ID string on success, or the response error to finalize.
 	 */
-	private _resolveSession(req: IncomingMessage): string | SessionError {
+	private _resolveSession(
+		req: IncomingMessage
+	): { readonly id: SessionId; readonly state: SessionState } | SessionError {
 		const headerSessionId = this._getSessionIdFromHeader(req);
 
 		if (headerSessionId) {
@@ -605,7 +685,7 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 			const session = this._sessions.get(asSessionId(headerSessionId));
 			if (session) {
 				session.lastActivityAt = Date.now();
-				return headerSessionId;
+				return { id: session.id, state: session };
 			}
 
 			// Unknown session ID — per spec, return 404
@@ -613,18 +693,59 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		}
 
 		// No session header — create new session
-		const newSessionId = this._sessionIdGenerator();
+		if (this._sessionRetention && this._sessions.size >= this._sessionRetention.maxSessions) {
+			return { statusCode: 503, code: -32000, message: 'Session capacity reached' };
+		}
+		const newSessionId = asSessionId(this._sessionIdGenerator());
+		const now = Date.now();
 		const sessionState: SessionState = {
 			id: newSessionId,
-			createdAt: Date.now(),
-			lastActivityAt: Date.now(),
+			createdAt: now,
+			lastActivityAt: now,
 			notificationStreams: new Set(),
+			acceptedPostCount: 0,
 		};
-		this._sessions.set(asSessionId(newSessionId), sessionState);
+		this._sessions.set(newSessionId, sessionState);
 		this.log('info', `New session created: ${newSessionId}`);
 		this._updateSessionMetrics();
 
-		return newSessionId;
+		return { id: newSessionId, state: sessionState };
+	}
+
+	private _sweepExpiredSessions(): void {
+		if (!this._sessionRetention) return;
+		const now = Date.now();
+		for (const [sessionId, session] of this._sessions) {
+			if (
+				session.acceptedPostCount === 0 &&
+				now - session.lastActivityAt >= this._sessionRetention.sessionIdleTimeoutMs
+			) {
+				this._disposeSession(sessionId);
+			}
+		}
+	}
+
+	private _disposeSession(sessionId: SessionId): void {
+		const session = this._sessions.get(sessionId);
+		if (!session) return;
+		this._sessions.delete(sessionId);
+		for (const stream of session.notificationStreams) {
+			try {
+				stream.end();
+			} catch (error) {
+				this._lifecycleFailureReporter.report(error);
+			}
+		}
+		session.notificationStreams.clear();
+		this._updateSessionMetrics();
+	}
+
+	private _stopSessionSweep(): void {
+		const interval = this._sessionSweepIntervalId;
+		if (!interval) return;
+		interval.unref();
+		clearInterval(interval);
+		this._sessionSweepIntervalId = null;
 	}
 
 	/**
@@ -753,21 +874,13 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		if (this._stopPromise) return this._stopPromise;
 		this._isShuttingDown = true;
 		this._stopRateLimitCleanup();
+		this._stopSessionSweep();
 
 		const shutdownTimeout = timeout ?? 30000;
 
-		// Close all SSE notification streams
-		for (const session of this._sessions.values()) {
-			for (const stream of session.notificationStreams) {
-				try {
-					stream.end();
-				} catch {
-					// Ignore errors
-				}
-			}
-			session.notificationStreams.clear();
+		for (const sessionId of this._sessions.keys()) {
+			this._disposeSession(sessionId);
 		}
-		this._sessions.clear();
 
 		const server = this._server;
 		const serverClosed = new Promise<void>((resolve, reject) => {

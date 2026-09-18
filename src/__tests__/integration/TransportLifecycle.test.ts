@@ -1,4 +1,4 @@
-import { createServer, Server } from 'node:http';
+import { createServer, request as httpRequest, Server, type ClientRequest } from 'node:http';
 import { describe, expect, it, vi } from 'vitest';
 import { HealthChecker } from '../../health/HealthChecker.js';
 import type { Logger } from '../../logger/StructuredLogger.js';
@@ -164,6 +164,10 @@ type RunningLifecycle = {
 	readonly release: () => void;
 };
 
+type RetainedLifecycle = RunningLifecycle & {
+	readonly transport: StreamableHttpTransport;
+};
+
 async function startControlledLifecycle(
 	transportCase: LifecycleCase,
 	failsAfterRelease: boolean,
@@ -193,6 +197,39 @@ async function startControlledLifecycle(
 	};
 }
 
+async function startRetainedStreamableLifecycle(
+	requestTimeout: number
+): Promise<RetainedLifecycle> {
+	const controlled = createControlledProtocolServer();
+	const transport = new StreamableHttpTransport({
+		port: 0,
+		host: '127.0.0.1',
+		enableRateLimit: false,
+		stateful: true,
+		requestTimeout,
+		maxSessions: 1,
+		sessionIdleTimeoutMs: 10,
+		sessionSweepIntervalMs: 5,
+	});
+	await transport.connect(controlled.server);
+	const endpoint = `http://127.0.0.1:${getListeningPort(transport)}/mcp`;
+	const initialized = await postJson(endpoint, {
+		jsonrpc: '2.0',
+		id: 'retained-initialize',
+		method: 'initialize',
+		params: INITIALIZE_PARAMS,
+	});
+	const sessionId = initialized.headers.get('mcp-session-id');
+	if (!sessionId) throw new LifecycleFixtureError('Retained session ID was not returned');
+	return {
+		transport,
+		endpoint,
+		headers: { 'mcp-session-id': sessionId },
+		started: controlled.started,
+		release: controlled.release,
+	};
+}
+
 function controlledCallBody(): string {
 	return JSON.stringify({
 		jsonrpc: '2.0',
@@ -201,6 +238,174 @@ function controlledCallBody(): string {
 		params: { name: 'controlled', arguments: {} },
 	});
 }
+
+function startDelayedBodyRequest(
+	endpoint: string,
+	body: string
+): { readonly request: ClientRequest; readonly response: Promise<{ status: number; body: string }> } {
+	const target = new URL(endpoint);
+	const response = Promise.withResolvers<{ status: number; body: string }>();
+	const request = httpRequest(
+		{
+			hostname: target.hostname,
+			port: Number(target.port),
+			path: target.pathname,
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+		},
+		(incoming) => {
+			let responseBody = '';
+			incoming.on('data', (chunk: Buffer) => {
+				responseBody += chunk.toString();
+			});
+			incoming.once('end', () => {
+				response.resolve({ status: incoming.statusCode ?? 0, body: responseBody });
+			});
+		}
+	);
+	request.once('error', response.reject);
+	request.flushHeaders();
+	request.write(body.slice(0, -1));
+	return { request, response: response.promise };
+}
+
+describe('Streamable HTTP retained session lifecycle', () => {
+	it('rejects a delayed headerless POST that completes after shutdown begins', async () => {
+		const sessionIdGenerator = vi.fn(() => 'delayed-body-session');
+		const protocol = createProtocolServer();
+		const receive = vi.spyOn(protocol.server, 'receive');
+		const transport = new StreamableHttpTransport({
+			port: 0,
+			host: '127.0.0.1',
+			enableRateLimit: false,
+			stateful: true,
+			maxSessions: 1,
+			sessionIdleTimeoutMs: 1_000,
+			sessionSweepIntervalMs: 100,
+			sessionIdGenerator,
+		});
+		await transport.connect(protocol.server);
+		const endpoint = `http://127.0.0.1:${getListeningPort(transport)}/mcp`;
+		const body = JSON.stringify({
+			jsonrpc: '2.0',
+			id: 'delayed-body',
+			method: 'tools/list',
+			params: {},
+		});
+		const responseProbe = observeNextResponse(transport);
+		const delayed = startDelayedBodyRequest(endpoint, body);
+
+		try {
+			await responseProbe;
+			const firstStop = transport.stop(1_000);
+			const secondStop = transport.stop(1_000);
+			expect(secondStop).toBe(firstStop);
+
+			delayed.request.end(body.slice(-1));
+			await expect(delayed.response).resolves.toMatchObject({
+				status: 503,
+				body: expect.stringContaining('Server is shutting down'),
+			});
+			await Promise.all([firstStop, secondStop]);
+
+			expect(sessionIdGenerator).not.toHaveBeenCalled();
+			expect(receive).not.toHaveBeenCalled();
+			expect(transport.clientCount).toBe(0);
+			expect(outstandingWorkCount(transport)).toBe(0);
+			expect(Reflect.get(transport, '_sessionSweepIntervalId')).toBeNull();
+			expect(getTransportServer(transport).listening).toBe(false);
+		} finally {
+			delayed.request.destroy();
+			await transport.stop(1_000);
+		}
+	});
+
+	it('pins a timed-out POST until settlement and expires without a completion refresh', async () => {
+		vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+		vi.setSystemTime(new Date('2026-09-18T00:00:00.000Z'));
+		const lifecycle = await startRetainedStreamableLifecycle(20);
+		await vi.advanceTimersByTimeAsync(5);
+		const pending = startWireRequest(lifecycle.endpoint, controlledCallBody(), lifecycle.headers);
+
+		try {
+			await lifecycle.started;
+			await vi.advanceTimersByTimeAsync(20);
+			expect(await pending.outcome).toMatchObject({ kind: 'response', status: 500 });
+			expect(lifecycle.transport.clientCount).toBe(1);
+
+			lifecycle.release();
+			await nextEventLoopTurn();
+			await vi.advanceTimersByTimeAsync(5);
+			expect(lifecycle.transport.clientCount).toBe(0);
+
+			const expired = await postJson(
+				lifecycle.endpoint,
+				{ jsonrpc: '2.0', id: 'expired-timeout', method: 'tools/list', params: {} },
+				lifecycle.headers
+			);
+			expect(expired.status).toBe(404);
+		} finally {
+			lifecycle.release();
+			pending.disconnect();
+			await lifecycle.transport.stop(1_000);
+			vi.useRealTimers();
+		}
+	});
+
+	it('keeps a disconnected POST pinned until its handler settles', async () => {
+		vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+		vi.setSystemTime(new Date('2026-09-18T00:00:00.000Z'));
+		const lifecycle = await startRetainedStreamableLifecycle(1_000);
+		await vi.advanceTimersByTimeAsync(5);
+		const pending = startWireRequest(lifecycle.endpoint, controlledCallBody(), lifecycle.headers);
+
+		try {
+			await lifecycle.started;
+			pending.disconnect();
+			expect(await pending.outcome).toEqual({ kind: 'closed' });
+			await vi.advanceTimersByTimeAsync(20);
+			expect(lifecycle.transport.clientCount).toBe(1);
+
+			lifecycle.release();
+			await nextEventLoopTurn();
+			await vi.advanceTimersByTimeAsync(5);
+			expect(lifecycle.transport.clientCount).toBe(0);
+		} finally {
+			lifecycle.release();
+			await lifecycle.transport.stop(1_000);
+			vi.useRealTimers();
+		}
+	});
+
+	it('clears retained sessions and joins accepted work across repeated stop calls', async () => {
+		vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+		const lifecycle = await startRetainedStreamableLifecycle(1_000);
+		const pending = startWireRequest(lifecycle.endpoint, controlledCallBody(), lifecycle.headers);
+
+		try {
+			await lifecycle.started;
+			const firstStop = lifecycle.transport.stop(1_000);
+			const secondStop = lifecycle.transport.stop(1_000);
+			expect(secondStop).toBe(firstStop);
+			expect(lifecycle.transport.clientCount).toBe(0);
+			expect(
+				await Promise.race([
+					firstStop.then(() => 'stopped'),
+					nextEventLoopTurn().then(() => 'pending'),
+				])
+			).toBe('pending');
+
+			lifecycle.release();
+			await Promise.all([firstStop, secondStop]);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			lifecycle.release();
+			pending.disconnect();
+			await lifecycle.transport.stop(1_000);
+			vi.useRealTimers();
+		}
+	});
+});
 
 describe.each(LIFECYCLE_CASES)('$name late request lifecycle', (transportCase) => {
 	it(`contains a synchronous ${transportCase.writerFailureMethod} failure from timeout finalization`, async () => {
