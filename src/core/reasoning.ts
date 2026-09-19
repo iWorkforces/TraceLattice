@@ -8,14 +8,7 @@
  */
 
 import type { CalibrationMetrics } from '../contracts/calibrator.js';
-import type {
-	PatternName as ContractPatternName,
-	ThoughtType as ContractThoughtType,
-} from '../contracts/reasoning-types.js';
-
-export type ThoughtType = ContractThoughtType;
-
-export type PatternName = ContractPatternName;
+import type { PatternName, ThoughtType } from '../contracts/reasoning-types.js';
 
 /**
  * A detected reasoning pattern — surfaced as metadata or a warning.

@@ -27,7 +27,7 @@ import type {
 	ICalibrator,
 } from '../../contracts/calibrator.js';
 import type { IOutcomeRecorder, VerificationOutcome } from '../../contracts/interfaces.js';
-import type { ThoughtType } from '../reasoning.js';
+import type { ThoughtType } from '../../contracts/reasoning-types.js';
 import type { SessionId } from '../../contracts/ids.js';
 import {
 	EPSILON,

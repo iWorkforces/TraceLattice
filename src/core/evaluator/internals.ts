@@ -8,7 +8,7 @@
  * @module core/evaluator/internals
  */
 
-import type { ThoughtType } from '../reasoning.js';
+import type { ThoughtType } from '../../contracts/reasoning-types.js';
 import type { ThoughtData } from '../thought.js';
 
 /** All valid thought types for distribution counting. */

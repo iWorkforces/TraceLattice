@@ -80,7 +80,7 @@ Import fan-in (src, tests excluded). No LSP / codegraph in this workspace. Sentr
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
-- No `as SessionId`, no inline `import()` types, no barrels, no `as any` / `@ts-ignore`.
+- No `as SessionId`, no inline `import()` types, no barrels, no `export { } from` / `export * from`, no `as any` / `@ts-ignore`.
 - No mixing `lib.ts` (public API) and `cli.ts` (bin).
 - No stdout logs (MCP). No empty catch. No sync I/O except startup `existsSync`.
 - Forbidden sentrux edges: `transport→core`, `transport→registry`, `watchers→persistence`, `cluster→registry`, `persistence→transport`, `registry→core/HistoryManager.ts`.

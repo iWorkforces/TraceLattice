@@ -88,7 +88,7 @@ export type ThoughtData = Omit<
  * has guaranteed per-type invariants. Allows downstream methods to consume
  * narrowed thoughts without `!` non-null assertions.
  */
-import type { ThoughtType } from './reasoning.js';
+import type { ThoughtType } from '../contracts/reasoning-types.js';
 
 /** A `tool_call` thought with `tool_name` guaranteed by validation. */
 export type ToolCallThought = ThoughtData & {

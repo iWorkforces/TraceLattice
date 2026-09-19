@@ -40,11 +40,13 @@ import { ToolRegistry } from './registry/ToolRegistry.js';
 import { ServerConfig } from './ServerConfig.js';
 import { SkillWatcher } from './watchers/SkillWatcher.js';
 import { ToolWatcher } from './watchers/ToolWatcher.js';
+import { HttpTransport, createHttpTransport } from './transport/HttpTransport.js';
+import type { HttpTransportOptions } from './transport/HttpTransport.js';
+import type { TransportOptions } from './transport/BaseTransport.js';
+import type { ITransport, TransportKind } from './contracts/transport.js';
 
-export { HttpTransport, createHttpTransport } from './transport/HttpTransport.js';
-export type { HttpTransportOptions } from './transport/HttpTransport.js';
-export type { TransportOptions } from './transport/BaseTransport.js';
-export type { ITransport, TransportKind } from './contracts/transport.js';
+export { HttpTransport, createHttpTransport };
+export type { HttpTransportOptions, TransportOptions, ITransport, TransportKind };
 
 export interface ServerOptions {
 	maxHistorySize?: number;

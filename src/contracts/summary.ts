@@ -11,8 +11,6 @@
 import type { Summary } from '../core/compression/Summary.js';
 import type { BranchId, SessionId, SummaryId } from './ids.js';
 
-export type { Summary };
-
 /**
  * Storage and query contract for {@link Summary} records.
  *

@@ -3,7 +3,7 @@ import type {
 	SessionScopedPersistenceBackend,
 } from '../contracts/PersistenceBackend.js';
 import { GLOBAL_SESSION_ID, asSessionId, type BranchId, type SessionId } from '../contracts/ids.js';
-import type { Summary } from '../contracts/summary.js';
+import type { Summary } from './compression/Summary.js';
 import { PersistenceCompatibilityError, PersistenceUnavailableError } from '../errors.js';
 import { requireSessionScopedPersistence } from '../persistence/SessionScopedPersistence.js';
 import {

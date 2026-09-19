@@ -11,7 +11,8 @@
  * @module core/evaluator/SignalComputer
  */
 
-import type { ConfidenceSignals, ThoughtType } from '../reasoning.js';
+import type { ThoughtType } from '../../contracts/reasoning-types.js';
+import type { ConfidenceSignals } from '../reasoning.js';
 import type { ThoughtData } from '../thought.js';
 import { ALL_THOUGHT_TYPES, _computeChainDepth, _countByType } from './internals.js';
 
