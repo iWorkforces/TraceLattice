@@ -1,4 +1,9 @@
-import { asBranchId } from '../../contracts/ids.js';
+import {
+	asBranchId,
+	asEdgeId,
+	asSessionId,
+	asThoughtId,
+} from '../../contracts/ids.js';
 /**
  * End-to-end integration tests for the {@link TreeOfThoughtStrategy}.
  *
@@ -50,11 +55,12 @@ function parseResponse(text: string): ParsedResponse {
 	return JSON.parse(text) as ParsedResponse;
 }
 
-function makeManager(): { manager: HistoryManager; edgeStore: EdgeStore } {
+function makeManager(maxHistorySize = 1000): { manager: HistoryManager; edgeStore: EdgeStore } {
 	const edgeStore = new EdgeStore();
 	const manager = new HistoryManager({
 		edgeStore,
 		dagEdges: true,
+		maxHistorySize,
 		persistence: new MemoryPersistence(),
 		persistenceFlushInterval: 60_000,
 		persistenceBufferSize: 1000,
@@ -75,13 +81,205 @@ describe('TreeOfThoughtStrategy Integration (ThoughtProcessor + ToT + DAG)', () 
 	let formatter: ThoughtFormatter;
 	let evaluator: ThoughtEvaluator;
 	let logger: NullLogger;
+	let edgeStore: EdgeStore;
 
 	beforeEach(() => {
 		const built = makeManager();
 		manager = built.manager;
+		edgeStore = built.edgeStore;
 		formatter = new ThoughtFormatter();
 		evaluator = new ThoughtEvaluator();
 		logger = new NullLogger();
+	});
+
+	it('emits a depth-cap termination strategy_hint from the processor', async () => {
+		// Given
+		const processor = new ThoughtProcessor(
+			manager,
+			formatter,
+			evaluator,
+			logger,
+			new TreeOfThoughtStrategy({ ...TOT_CONFIG, depthCap: 2, plateauWindow: 10 })
+		);
+		for (let number = 1; number < 3; number++) {
+			await processor.process(
+				createTestThought({
+					id: `depth-${number}`,
+					thought: `depth ${number}`,
+					thought_number: number,
+					total_thoughts: 3,
+					next_thought_needed: true,
+					confidence: number / 10,
+				})
+			);
+		}
+
+		// When
+		const result = await processor.process(
+			createTestThought({
+				id: 'depth-3',
+				thought: 'depth 3',
+				thought_number: 3,
+				total_thoughts: 3,
+				next_thought_needed: true,
+				confidence: 0.3,
+			})
+		);
+
+		// Then
+		expect(parseResponse(result.content[0]!.text).strategy_hint).toEqual({
+			action: 'terminate',
+			reason: 'depth cap',
+		});
+	});
+
+	it('measures depth from the retained root after history pruning', async () => {
+		// Given
+		await manager.shutdown();
+		const retained = makeManager(2);
+		manager = retained.manager;
+		edgeStore = retained.edgeStore;
+		const processor = new ThoughtProcessor(
+			manager,
+			formatter,
+			evaluator,
+			logger,
+			new TreeOfThoughtStrategy({ ...TOT_CONFIG, depthCap: 1, plateauWindow: 10 })
+		);
+		for (let number = 1; number < 3; number++) {
+			await processor.process(
+				createTestThought({
+					id: `pruned-${number}`,
+					thought: `pruned ${number}`,
+					thought_number: number,
+					total_thoughts: 3,
+					next_thought_needed: true,
+					confidence: number / 10,
+				})
+			);
+		}
+
+		// When
+		const result = await processor.process(
+			createTestThought({
+				id: 'pruned-3',
+				thought: 'pruned 3',
+				thought_number: 3,
+				total_thoughts: 3,
+				next_thought_needed: true,
+				confidence: 0.3,
+			})
+		);
+
+		// Then
+		expect(manager.getHistory().map((thought) => thought.thought_number)).toEqual([2, 3]);
+		expect(parseResponse(result.content[0]!.text).strategy_hint).toEqual({
+			action: 'terminate',
+			reason: 'depth cap',
+		});
+	});
+
+	it('terminates at the cap when the root-reachable graph contains a cycle', async () => {
+		// Given
+		const processor = new ThoughtProcessor(
+			manager,
+			formatter,
+			evaluator,
+			logger,
+			new TreeOfThoughtStrategy({ ...TOT_CONFIG, depthCap: 3, plateauWindow: 10 })
+		);
+		for (const [id, number] of [
+			['cycle-root', 1],
+			['cycle-a', 2],
+			['cycle-b', 3],
+		] as const) {
+			await processor.process(
+				createTestThought({
+					id,
+					thought: id,
+					thought_number: number,
+					total_thoughts: 4,
+					next_thought_needed: true,
+					confidence: number / 10,
+				})
+			);
+		}
+		edgeStore.addEdge({
+			id: asEdgeId('cycle-back-edge'),
+			from: asThoughtId('cycle-b'),
+			to: asThoughtId('cycle-a'),
+			kind: 'revises',
+			sessionId: asSessionId('__global__'),
+			createdAt: 10,
+		});
+
+		// When
+		const result = await processor.process(
+			createTestThought({
+				id: 'cycle-current',
+				thought: 'cycle current',
+				thought_number: 4,
+				total_thoughts: 4,
+				next_thought_needed: true,
+				confidence: 0.4,
+			})
+		);
+
+		// Then
+		expect(parseResponse(result.content[0]!.text).strategy_hint).toEqual({
+			action: 'terminate',
+			reason: 'depth cap',
+		});
+	});
+
+	it('keeps depth-cap decisions isolated between sessions', async () => {
+		// Given
+		const processor = new ThoughtProcessor(
+			manager,
+			formatter,
+			evaluator,
+			logger,
+			new TreeOfThoughtStrategy({ ...TOT_CONFIG, depthCap: 1, plateauWindow: 10 })
+		);
+		await processor.process(
+			createTestThought({
+				id: 'shared-root',
+				thought: 'session A root',
+				thought_number: 1,
+				total_thoughts: 2,
+				next_thought_needed: true,
+				session_id: 'depth-A',
+			})
+		);
+		const sessionB = await processor.process(
+			createTestThought({
+				id: 'shared-root',
+				thought: 'session B root',
+				thought_number: 1,
+				total_thoughts: 2,
+				next_thought_needed: true,
+				session_id: 'depth-B',
+			})
+		);
+
+		// When
+		const sessionA = await processor.process(
+			createTestThought({
+				id: 'shared-current',
+				thought: 'session A current',
+				thought_number: 2,
+				total_thoughts: 2,
+				next_thought_needed: true,
+				session_id: 'depth-A',
+			})
+		);
+
+		// Then
+		expect(parseResponse(sessionA.content[0]!.text).strategy_hint).toEqual({
+			action: 'terminate',
+			reason: 'depth cap',
+		});
+		expect(parseResponse(sessionB.content[0]!.text).strategy_hint?.action).toBe('continue');
 	});
 
 	afterEach(async () => {

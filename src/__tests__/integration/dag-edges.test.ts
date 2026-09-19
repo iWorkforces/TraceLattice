@@ -25,6 +25,8 @@ import { HistoryManager } from '../../core/HistoryManager.js';
 import { EdgeStore } from '../../core/graph/EdgeStore.js';
 import { GraphView } from '../../core/graph/GraphView.js';
 import { generateUlid } from '../../core/ids.js';
+import { ThoughtEvaluator } from '../../core/ThoughtEvaluator.js';
+import { TreeOfThoughtStrategy } from '../../core/reasoning/strategies/TreeOfThoughtStrategy.js';
 import { MemoryPersistence } from '../../persistence/MemoryPersistence.js';
 import { FilePersistence } from '../../persistence/FilePersistence.js';
 import { SqlitePersistence } from '../../persistence/SqlitePersistence.js';
@@ -512,5 +514,57 @@ describe('DAG edges integration — Scenario 5: restart + GraphView', () => {
 		}
 
 		await fresh.shutdown();
+	});
+
+	it('preserves the ToT depth-cap decision after graph persistence restore', async () => {
+		// Given
+		const persistence = new MemoryPersistence();
+		const { manager, edgeStore } = makeManager({ persistence, dagEdges: true });
+		for (let number = 1; number <= 3; number++) {
+			manager.addThought(makeThought(number, { confidence: number / 10 }));
+		}
+		const strategy = new TreeOfThoughtStrategy({
+			depthCap: 2,
+			terminationConfidence: 1,
+			plateauWindow: 10,
+		});
+		const evaluator = new ThoughtEvaluator();
+		const beforeHistory = manager.getHistory();
+		const beforeCurrent = beforeHistory[2];
+		if (beforeCurrent === undefined) throw new TypeError('Expected current thought before restore');
+		const before = strategy.decide({
+			sessionId: asSessionId(GLOBAL),
+			history: beforeHistory,
+			graph: new GraphView(edgeStore),
+			stats: evaluator.computeReasoningStats(beforeHistory, manager.getBranches()),
+			currentThought: beforeCurrent,
+		});
+		await manager._flushBuffer();
+		await manager.shutdown();
+
+		// When
+		const restoredStore = new EdgeStore();
+		const restored = new HistoryManager({
+			edgeStore: restoredStore,
+			dagEdges: true,
+			persistence,
+			persistenceFlushInterval: 60_000,
+		});
+		await restored.loadFromPersistence();
+		const restoredHistory = restored.getHistory();
+		const restoredCurrent = restoredHistory[2];
+		if (restoredCurrent === undefined) throw new TypeError('Expected current thought after restore');
+		const after = strategy.decide({
+			sessionId: asSessionId(GLOBAL),
+			history: restoredHistory,
+			graph: new GraphView(restoredStore),
+			stats: evaluator.computeReasoningStats(restoredHistory, restored.getBranches()),
+			currentThought: restoredCurrent,
+		});
+		await restored.shutdown();
+
+		// Then
+		expect(before).toEqual({ action: 'terminate', reason: 'depth cap' });
+		expect(after).toEqual(before);
 	});
 });
