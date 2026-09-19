@@ -6,8 +6,8 @@ import {
 	readRequestBody,
 	sendCorsPreflight,
 } from '../transport/HttpHelpers.js';
-import type { IncomingMessage, ServerResponse } from 'node:http';
-import { EventEmitter } from 'node:events';
+import { IncomingMessage, type ServerResponse } from 'node:http';
+import { Socket } from 'node:net';
 
 interface MockServerResponse {
 	statusCode: number;
@@ -30,15 +30,10 @@ function createMockRes(
 	return mock as MockServerResponse & ServerResponse;
 }
 
-function createMockIncomingMessage(chunks: string[] = []): IncomingMessage {
-	const emitter = new EventEmitter();
-	const message = Object.assign(emitter, {
-		[Symbol.asyncIterator]: async function* () {
-			for (const chunk of chunks) {
-				yield Buffer.from(chunk);
-			}
-		},
-	}) as unknown as IncomingMessage;
+function createMockIncomingMessage(chunks: readonly (string | Buffer)[] = []): IncomingMessage {
+	const message = new IncomingMessage(new Socket());
+	for (const chunk of chunks) message.push(chunk);
+	message.push(null);
 	return message;
 }
 
@@ -134,19 +129,52 @@ describe('HttpHelpers', () => {
 			const body = await readRequestBody(req as IncomingMessage, 0);
 			expect(body).toBe('a'.repeat(200));
 		});
-	});
 
+		it('counts encoded bytes below, exactly at, and above the limit while zero stays unlimited', async () => {
+			const encoded = Buffer.from('é');
+			const results = await Promise.all([
+				readRequestBody(createMockIncomingMessage([encoded]), encoded.length + 1),
+				readRequestBody(createMockIncomingMessage([encoded]), encoded.length),
+				readRequestBody(createMockIncomingMessage([encoded]), encoded.length - 1),
+				readRequestBody(createMockIncomingMessage([encoded]), 0),
+			]);
+
+			expect(results).toEqual(['é', 'é', null, 'é']);
+		});
+
+		it('preserves a multibyte code point split across buffer chunks', async () => {
+			const encoded = Buffer.from('before 💡 after');
+			const codePointStart = encoded.indexOf(Buffer.from('💡'));
+			const req = createMockIncomingMessage([
+				encoded.subarray(0, codePointStart + 2),
+				encoded.subarray(codePointStart + 2),
+			]);
+
+			await expect(readRequestBody(req, encoded.length)).resolves.toBe('before 💡 after');
+		});
+
+		it('settles on the first byte-oversized chunk without retaining the unread tail', async () => {
+			const req = createMockIncomingMessage([Buffer.from('€'), Buffer.from('tail')]);
+			req.headers = { 'content-length': '1' };
+
+			await expect(readRequestBody(req, 2)).resolves.toBeNull();
+			expect(req.readableLength).toBe(0);
+		});
+
+		it('does not reject a below-limit stream solely from Content-Length', async () => {
+			const req = createMockIncomingMessage(['ok']);
+			req.headers = { 'content-length': '1000000' };
+
+			await expect(readRequestBody(req, 2)).resolves.toBe('ok');
+		});
+	});
 
 	describe('readRequestBody with string chunks', () => {
 		function createStringChunkMessage(chunks: string[]): IncomingMessage {
-			const emitter = new EventEmitter();
-			const message = Object.assign(emitter, {
-				[Symbol.asyncIterator]: async function* () {
-					for (const chunk of chunks) {
-						yield chunk;
-					}
-				},
-			}) as unknown as IncomingMessage;
+			const message = new IncomingMessage(new Socket());
+			message.setEncoding('utf8');
+			for (const chunk of chunks) message.push(chunk);
+			message.push(null);
 			return message;
 		}
 
