@@ -64,10 +64,12 @@ function createMockContainer() {
 		addTool: vi.fn(),
 		getTool: vi.fn(),
 		discoverAsync: vi.fn().mockResolvedValue(0),
+		refreshAsync: vi.fn().mockResolvedValue(0),
 	};
 
 	const mockSkillRegistry = {
 		discoverAsync: vi.fn().mockResolvedValue(0),
+		refreshAsync: vi.fn().mockResolvedValue(0),
 	};
 
 	container.registerInstance('Logger', mockLogger as unknown as StructuredLogger);
@@ -219,6 +221,109 @@ describe('ToolAwareSequentialThinkingServer', () => {
 			mocks.mockSkillRegistry.discoverAsync.mockResolvedValue(5);
 			const count = await server.discoverSkillsAsync();
 			expect(count).toBe(5);
+		});
+	});
+
+	describe('refreshDiscovery', () => {
+		it('returns the exact filesystem-discovered counts from both registries', async () => {
+			// Given
+			mocks.mockToolRegistry.refreshAsync.mockResolvedValue(2);
+			mocks.mockSkillRegistry.refreshAsync.mockResolvedValue(3);
+
+			// When
+			const result = await server.refreshDiscovery();
+
+			// Then
+			expect(result).toEqual({ tools: 2, skills: 3 });
+			expect(mocks.mockToolRegistry.refreshAsync).toHaveBeenCalledOnce();
+			expect(mocks.mockSkillRegistry.refreshAsync).toHaveBeenCalledOnce();
+		});
+
+		it('returns one shared promise for concurrent public calls', async () => {
+			// Given
+			const toolRefresh = Promise.withResolvers<number>();
+			const skillRefresh = Promise.withResolvers<number>();
+			mocks.mockToolRegistry.refreshAsync.mockReturnValue(toolRefresh.promise);
+			mocks.mockSkillRegistry.refreshAsync.mockReturnValue(skillRefresh.promise);
+
+			try {
+				// When
+				const first = server.refreshDiscovery();
+				const second = server.refreshDiscovery();
+
+				// Then
+				expect(second).toBe(first);
+				expect(mocks.mockToolRegistry.refreshAsync).toHaveBeenCalledOnce();
+				expect(mocks.mockSkillRegistry.refreshAsync).toHaveBeenCalledOnce();
+				toolRefresh.resolve(4);
+				skillRefresh.resolve(5);
+				await expect(first).resolves.toEqual({ tools: 4, skills: 5 });
+			} finally {
+				toolRefresh.resolve(4);
+				skillRefresh.resolve(5);
+			}
+		});
+
+		it('waits for the successful registry before propagating one peer failure', async () => {
+			// Given
+			const failure = new Error('injected tool refresh failure');
+			const toolRefresh = Promise.withResolvers<number>();
+			const skillRefresh = Promise.withResolvers<number>();
+			mocks.mockToolRegistry.refreshAsync.mockReturnValue(toolRefresh.promise);
+			mocks.mockSkillRegistry.refreshAsync.mockReturnValue(skillRefresh.promise);
+			let settled = false;
+
+			try {
+				// When
+				const outcome = server
+					.refreshDiscovery()
+					.then(
+						(value: { tools: number; skills: number }) => ({
+							kind: 'resolved' as const,
+							value,
+						}),
+						(error: unknown) => ({ kind: 'rejected' as const, error })
+					)
+					.finally(() => {
+						settled = true;
+					});
+				toolRefresh.reject(failure);
+				await Promise.resolve();
+
+				// Then
+				expect(settled).toBe(false);
+				skillRefresh.resolve(7);
+					expect(await outcome).toEqual({ kind: 'rejected', error: failure });
+			} finally {
+				toolRefresh.resolve(0);
+				skillRefresh.resolve(7);
+			}
+		});
+
+		it('aggregates failures from both registries in stable tool-skill order', async () => {
+			// Given
+			const toolFailure = new Error('injected tool refresh failure');
+			const skillFailure = new Error('injected skill refresh failure');
+			mocks.mockToolRegistry.refreshAsync.mockRejectedValue(toolFailure);
+			mocks.mockSkillRegistry.refreshAsync.mockRejectedValue(skillFailure);
+
+			// When
+			const outcome = await server.refreshDiscovery().then(
+				(value: { tools: number; skills: number }) => ({
+					kind: 'resolved' as const,
+					value,
+				}),
+				(error: unknown) => ({ kind: 'rejected' as const, error })
+			);
+
+			// Then
+			expect(outcome.kind).toBe('rejected');
+			if (outcome.kind !== 'rejected') throw new TypeError('Expected refresh to reject');
+			expect(outcome.error).toBeInstanceOf(AggregateError);
+			if (!(outcome.error instanceof AggregateError)) {
+				throw new TypeError('Expected aggregate refresh failure');
+			}
+			expect(outcome.error.errors).toEqual([toolFailure, skillFailure]);
 		});
 	});
 
