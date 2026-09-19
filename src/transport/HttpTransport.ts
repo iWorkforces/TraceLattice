@@ -34,7 +34,9 @@ import { runWithContext } from '../context/RequestContext.js';
 import {
 	AcceptedWorkTracker,
 	LifecycleFailureReporter,
+	PreDispatchTracker,
 	ResponseFinalizer,
+	type PreDispatchLease,
 } from './HttpRequestLifecycle.js';
 
 export interface HttpTransportOptions extends TransportOptions {
@@ -112,6 +114,7 @@ export class HttpTransport extends BaseTransport implements ITransport {
 	private _metricsProvider: (() => string) | null;
 	private readonly _lifecycleFailureReporter: LifecycleFailureReporter;
 	private readonly _acceptedWork: AcceptedWorkTracker;
+	private readonly _preDispatch = new PreDispatchTracker();
 	private _stopPromise: Promise<void> | null = null;
 
 	constructor(options: HttpTransportOptions = {}) {
@@ -195,6 +198,43 @@ export class HttpTransport extends BaseTransport implements ITransport {
 		);
 	}
 
+	private _parseJsonRpcRequest(
+		body: string,
+		responseFinalizer: ResponseFinalizer
+	): Parameters<McpServer['receive']>[0] | null {
+		let rawBody: unknown;
+		try {
+			rawBody = JSON.parse(body) as unknown;
+		} catch {
+			this._trackError('parse_error');
+			responseFinalizer.finalize((response) => {
+				sendJsonRpcError(response, 200, -32700, 'Parse error');
+			});
+			return null;
+		}
+
+		const parseResult = safeParse(JsonRpcRequestSchema, rawBody);
+		const rawId =
+			rawBody && typeof rawBody === 'object' && 'id' in rawBody
+				? ((rawBody as { id?: unknown }).id ?? null)
+				: null;
+		if (!parseResult.success) {
+			this._trackError('validation');
+			responseFinalizer.finalize((response) => {
+				sendJsonRpcError(
+					response,
+					200,
+					-32600,
+					'Invalid Request',
+					rawId as string | number | null,
+					parseResult.issues
+				);
+			});
+			return null;
+		}
+		return parseResult.output as Parameters<McpServer['receive']>[0];
+	}
+
 	/**
 	 * Route and handle incoming HTTP requests.
 	 *
@@ -260,7 +300,15 @@ export class HttpTransport extends BaseTransport implements ITransport {
 
 		// MCP endpoint
 		if (req.method === 'POST' && req.url === this._path) {
-			this._acceptedWork.track(this._handlePostRequest(req, res));
+			const lease = this._preDispatch.acquire();
+			if (!lease) {
+				const responseFinalizer = new ResponseFinalizer(res, this._lifecycleFailureReporter);
+				responseFinalizer.finalize((response) => {
+					sendJsonRpcError(response, 503, -32603, 'Server is shutting down');
+				});
+				return;
+			}
+			await this._handlePostRequest(req, res, lease);
 			return;
 		}
 
@@ -275,21 +323,28 @@ export class HttpTransport extends BaseTransport implements ITransport {
 	 * Reads the request body, validates JSON-RPC format, and delegates
 	 * processing to the MCP server.
 	 */
-	private async _handlePostRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	private async _handlePostRequest(
+		req: IncomingMessage,
+		res: ServerResponse,
+		lease: PreDispatchLease
+	): Promise<void> {
 		this._requestCount++;
 		this._activeRequests++;
 		const responseFinalizer = new ResponseFinalizer(res, this._lifecycleFailureReporter);
+		const onAborted = (): void => lease.cancel('peer');
+		req.once('aborted', onAborted);
 
 		const timeout = setTimeout(() => {
 			this._trackError('timeout');
 			responseFinalizer.finalize((response) => {
 				sendJsonRpcError(response, 500, -32603, 'Request timeout');
 			});
+			lease.cancel('timeout');
 		}, this._requestTimeout);
 
 		try {
 			const maxBodySize = this._bodySizeLimitEnabled ? this._maxBodySize : 0;
-			const body = await readRequestBody(req, maxBodySize);
+			const body = await readRequestBody(req, maxBodySize, lease.signal);
 
 			if (body === null) {
 				this._trackError('payload_too_large');
@@ -299,67 +354,67 @@ export class HttpTransport extends BaseTransport implements ITransport {
 				return;
 			}
 
-			let rawBody: unknown;
-			try {
-				rawBody = JSON.parse(body) as unknown;
-			} catch {
-				this._trackError('parse_error');
-				responseFinalizer.finalize((response) => {
-					sendJsonRpcError(response, 200, -32700, 'Parse error');
-				});
-				return;
-			}
-
-			const parseResult = safeParse(JsonRpcRequestSchema, rawBody);
-			const rawId =
-				rawBody && typeof rawBody === 'object' && 'id' in rawBody
-					? ((rawBody as { id?: unknown }).id ?? null)
-					: null;
-			if (!parseResult.success) {
-				this._trackError('validation');
-				responseFinalizer.finalize((response) => {
-					sendJsonRpcError(
-						response,
-						200,
-						-32600,
-						'Invalid Request',
-						rawId as string | number | null,
-						parseResult.issues
-					);
-				});
-				return;
-			}
-			const jsonRpcRequest = parseResult.output;
+			const jsonRpcRequest = this._parseJsonRpcRequest(body, responseFinalizer);
+			if (jsonRpcRequest === null) return;
 
 			if (!this._mcpServer) {
 				this._trackError('server_not_ready');
+				const requestId = 'id' in jsonRpcRequest ? (jsonRpcRequest.id ?? null) : null;
 				responseFinalizer.finalize((response) => {
-					sendJsonRpcError(response, 200, -32603, 'Server not ready', jsonRpcRequest.id ?? null);
+					sendJsonRpcError(response, 200, -32603, 'Server not ready', requestId);
 				});
 				return;
 			}
 
+			req.off('aborted', onAborted);
 			const owner = randomUUID();
-			const response = await runWithContext({ requestId: randomUUID(), owner }, () =>
-				this._requireMcpServer().receive(jsonRpcRequest as Parameters<McpServer['receive']>[0], {
-					sessionInfo: {},
-				})
+			const acceptedWork = this._acceptedWork.transfer(lease, () =>
+				runWithContext({ requestId: randomUUID(), owner }, () =>
+					this._requireMcpServer().receive(jsonRpcRequest, {
+						sessionInfo: {},
+					})
+				)
+					.then((response: Awaited<ReturnType<McpServer['receive']>>) => {
+						responseFinalizer.finalize((httpResponse) => {
+							if (response) {
+								sendJsonRpcResponse(httpResponse, response);
+							} else {
+								httpResponse.writeHead(204);
+								httpResponse.end();
+							}
+						});
+					})
+					.catch((error: unknown) => {
+						this._trackError('internal_error');
+						responseFinalizer.finalize((response) => {
+							sendJsonRpcError(
+								response,
+								200,
+								-32603,
+								'Internal error',
+								null,
+								getErrorMessage(error)
+							);
+						});
+					})
 			);
-
-			responseFinalizer.finalize((httpResponse) => {
-				if (response) {
-					sendJsonRpcResponse(httpResponse, response);
-				} else {
-					httpResponse.writeHead(204);
-					httpResponse.end();
-				}
-			});
+			await acceptedWork;
 		} catch (error) {
+			if (lease.signal.aborted) {
+				if (lease.cancellationReason === 'shutdown') {
+					responseFinalizer.finalize((response) => {
+						sendJsonRpcError(response, 503, -32603, 'Server is shutting down');
+					});
+				}
+				return;
+			}
 			this._trackError('internal_error');
 			responseFinalizer.finalize((response) => {
 				sendJsonRpcError(response, 200, -32603, 'Internal error', null, getErrorMessage(error));
 			});
 		} finally {
+			req.off('aborted', onAborted);
+			lease.release();
 			clearTimeout(timeout);
 			this._activeRequests--;
 		}
@@ -378,6 +433,7 @@ export class HttpTransport extends BaseTransport implements ITransport {
 	stop(): Promise<void> {
 		if (this._stopPromise) return this._stopPromise;
 		this._isShuttingDown = true;
+		this._preDispatch.closeAdmission('shutdown');
 		this._stopRateLimitCleanup();
 
 		const server = this._server;
@@ -392,7 +448,10 @@ export class HttpTransport extends BaseTransport implements ITransport {
 					});
 				})
 			: Promise.resolve();
-		const stopPromise = Promise.all([serverClosed, this._acceptedWork.join()]).then(() => {
+		const stopPromise = Promise.all([
+			serverClosed,
+			this._preDispatch.join().then(() => this._acceptedWork.join()),
+		]).then(() => {
 			this.log('info', 'HTTP transport stopped');
 		});
 		this._stopPromise = stopPromise;
