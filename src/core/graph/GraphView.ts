@@ -2,7 +2,7 @@
  * GraphView — read-only graph traversal queries over an {@link IEdgeStore}.
  *
  * Provides BFS / topological / ancestor / descendant queries over the
- * thought DAG. All methods return arrays of thought ids (ulid strings),
+ * thought DAG. Queries return thought ids or graph distances,
  * never `ThoughtData` objects — the view is intentionally decoupled from
  * `HistoryManager` so it can be reused by strategies that work purely in
  * terms of graph structure.
@@ -69,6 +69,56 @@ export class GraphView {
 		const { nodes, hasIncoming } = this._collectNodes(edges);
 		const roots = this._findRoots(nodes, hasIncoming, edges);
 		return this._bfsFromRoots(sessionId, roots) as readonly ThoughtId[];
+	}
+
+	/**
+	 * Return the shortest directed distance from any retained root to a thought.
+	 *
+	 * Nodes are derived from the current edge store, so isolated thoughts are
+	 * invisible and pruning can expose a retained node as a new root. Every edge
+	 * kind participates in the traversal.
+	 *
+	 * @param sessionId - Session to query
+	 * @param thoughtId - Thought whose root distance to resolve
+	 * @returns Zero for a root, or `undefined` when no root can reach the thought
+	 */
+	depthFromRoots(sessionId: SessionId, thoughtId: ThoughtId): number | undefined {
+		const edges = this._store.edgesForSession(sessionId);
+		if (edges.length === 0) return undefined;
+
+		const nodes = new Set<ThoughtId>();
+		const hasIncoming = new Set<ThoughtId>();
+		const outgoing = new Map<ThoughtId, ThoughtId[]>();
+		for (const edge of edges) {
+			nodes.add(edge.from);
+			nodes.add(edge.to);
+			hasIncoming.add(edge.to);
+			const children = outgoing.get(edge.from);
+			if (children === undefined) outgoing.set(edge.from, [edge.to]);
+			else children.push(edge.to);
+		}
+		if (!nodes.has(thoughtId)) return undefined;
+
+		let frontier: ThoughtId[] = [];
+		for (const node of nodes) {
+			if (!hasIncoming.has(node)) frontier.push(node);
+		}
+		const visited = new Set<ThoughtId>(frontier);
+		let depth = 0;
+		while (frontier.length > 0) {
+			const next: ThoughtId[] = [];
+			for (const node of frontier) {
+				if (node === thoughtId) return depth;
+				for (const child of outgoing.get(node) ?? []) {
+					if (visited.has(child)) continue;
+					visited.add(child);
+					next.push(child);
+				}
+			}
+			frontier = next;
+			depth++;
+		}
+		return undefined;
 	}
 
 	/**

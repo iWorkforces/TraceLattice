@@ -37,6 +37,17 @@ function setup(edges: Edge[]): GraphView {
 	return new GraphView(store);
 }
 
+const ALL_EDGE_KINDS: readonly EdgeKind[] = [
+	'sequence',
+	'branch',
+	'merge',
+	'verifies',
+	'critiques',
+	'derives_from',
+	'tool_invocation',
+	'revises',
+];
+
 describe('GraphView', () => {
 	describe('chronological', () => {
 		it('returns empty array when session has no edges', () => {
@@ -203,6 +214,114 @@ describe('GraphView', () => {
 		it('returns empty for empty session', () => {
 			const view = setup([]);
 			expect(view.leaves(asSessionId('nope'))).toEqual([]);
+		});
+	});
+
+	describe('depthFromRoots', () => {
+		it('counts every edge kind from a zero-incoming root', () => {
+			// Given
+			const edges = ALL_EDGE_KINDS.map((kind, index) =>
+				makeEdge(`t${index}`, `t${index + 1}`, index, kind)
+			);
+			const view = setup(edges);
+
+			// When
+			const distance = view.depthFromRoots(SESSION, asThoughtId('t8'));
+
+			// Then
+			expect(distance).toBe(8);
+		});
+
+		it('assigns depth zero to a root', () => {
+			// Given
+			const view = setup([makeEdge('root', 'child', 1)]);
+
+			// When
+			const distance = view.depthFromRoots(SESSION, asThoughtId('root'));
+
+			// Then
+			expect(distance).toBe(0);
+		});
+
+		it('chooses the shortest path across multiple roots and a merge', () => {
+			// Given
+			const view = setup([
+				makeEdge('long-root', 'a', 1),
+				makeEdge('a', 'b', 2),
+				makeEdge('b', 'current', 3, 'merge'),
+				makeEdge('short-root', 'current', 4, 'merge'),
+			]);
+
+			// When
+			const distance = view.depthFromRoots(SESSION, asThoughtId('current'));
+
+			// Then
+			expect(distance).toBe(1);
+		});
+
+		it('treats a retained node as a new root after pruning removes its parent', () => {
+			// Given
+			const store = new EdgeStore();
+			store.addEdge(makeEdge('evicted', 'retained-root', 1));
+			store.addEdge(makeEdge('retained-root', 'current', 2));
+			store.pruneSession(
+				SESSION,
+				new Set([asThoughtId('retained-root'), asThoughtId('current')])
+			);
+			const view = new GraphView(store);
+
+			// When
+			const distance = view.depthFromRoots(SESSION, asThoughtId('current'));
+
+			// Then
+			expect(distance).toBe(1);
+		});
+
+		it('finds a root-reachable node despite a cycle', () => {
+			// Given
+			const view = setup([
+				makeEdge('root', 'a', 1),
+				makeEdge('a', 'b', 2),
+				makeEdge('b', 'a', 3),
+				makeEdge('b', 'current', 4),
+			]);
+
+			// When
+			const distance = view.depthFromRoots(SESSION, asThoughtId('current'));
+
+			// Then
+			expect(distance).toBe(3);
+		});
+
+		it.each([
+			['an empty graph', [], 'missing'],
+			['a rootless cycle', [makeEdge('a', 'b', 1), makeEdge('b', 'a', 2)], 'a'],
+		] as const)('returns undefined for %s', (_label, edges, target) => {
+			// Given
+			const view = setup([...edges]);
+
+			// When
+			const distance = view.depthFromRoots(SESSION, asThoughtId(target));
+
+			// Then
+			expect(distance).toBeUndefined();
+		});
+
+		it('keeps root distance isolated by session', () => {
+			// Given
+			const otherSession = asSessionId('s2');
+			const view = setup([
+				makeEdge('root', 'current', 1),
+				makeEdge('other-root', 'other-current', 2, 'sequence', otherSession),
+			]);
+
+			// When
+			const localDistance = view.depthFromRoots(SESSION, asThoughtId('current'));
+			const foreignDistance = view.depthFromRoots(SESSION, asThoughtId('other-current'));
+
+			// Then
+			expect(localDistance).toBe(1);
+			expect(foreignDistance).toBeUndefined();
 		});
 	});
 
