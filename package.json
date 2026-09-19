@@ -1,6 +1,6 @@
 {
 	"name": "@iworkforces/tracelattice",
-	"version": "2.0.7",
+	"version": "2.0.8",
 	"description": "Semantic Sequential Thinking Layer For AI Agents.",
 	"type": "module",
 	"main": "dist/lib.js",
@@ -87,7 +87,7 @@
 		"@eslint/js": "^10.0.1",
 		"@rsbuild/core": "^2.2.8",
 		"@rslib/core": "^1.0.1",
-		"@types/node": "^26.6.1",
+		"@types/node": "^26.6.2",
 		"@typescript-eslint/eslint-plugin": "^8.70.0",
 		"@typescript-eslint/parser": "^8.70.0",
 		"@vitest/coverage-v8": "^5.0.1",
