@@ -12,6 +12,7 @@ import {
 	createProtocolServer,
 	getListeningPort,
 	postJson,
+	postJsonChunks,
 	type JsonRpcResponse,
 	type NetworkTransport,
 	type RequestId,
@@ -24,7 +25,7 @@ type AdapterCase = {
 	readonly path: string;
 	readonly notificationStatus: number;
 	readonly stateful: boolean;
-	readonly create: () => NetworkTransport;
+	readonly create: (maxBodySize?: number) => NetworkTransport;
 };
 
 const ADAPTER_CASES = [
@@ -33,19 +34,26 @@ const ADAPTER_CASES = [
 		path: '/messages',
 		notificationStatus: 204,
 		stateful: false,
-		create: () => new HttpTransport({ port: 0, host: '127.0.0.1', enableRateLimit: false }),
+		create: (maxBodySize) =>
+			new HttpTransport({
+				port: 0,
+				host: '127.0.0.1',
+				enableRateLimit: false,
+				...(maxBodySize === undefined ? {} : { maxBodySize }),
+			}),
 	},
 	{
 		name: 'stateful Streamable HTTP',
 		path: '/mcp',
 		notificationStatus: 202,
 		stateful: true,
-		create: () =>
+		create: (maxBodySize) =>
 			new StreamableHttpTransport({
 				port: 0,
 				host: '127.0.0.1',
 				enableRateLimit: false,
 				stateful: true,
+				...(maxBodySize === undefined ? {} : { maxBodySize }),
 			}),
 	},
 ] satisfies readonly AdapterCase[];
@@ -182,6 +190,34 @@ async function runNetworkContract(adapterCase: AdapterCase): Promise<void> {
 describe.each(ADAPTER_CASES)('$name initialized wire contract', (adapterCase) => {
 	it('lists and calls tools while rejecting invalid requests without handler effects', async () => {
 		await runNetworkContract(adapterCase);
+	});
+
+	it('preserves split UTF-8 at an exact encoded-byte limit over chunked HTTP', async () => {
+		const requestId = 'split-💡-boundary';
+		const body = Buffer.from(
+			JSON.stringify({
+				jsonrpc: '2.0',
+				id: requestId,
+				method: 'initialize',
+				params: INITIALIZE_PARAMS,
+			})
+		);
+		const codePointStart = body.indexOf(Buffer.from('💡'));
+		const transport = adapterCase.create(body.length);
+		await transport.connect(createProtocolServer().server);
+		const endpoint = `http://127.0.0.1:${getListeningPort(transport)}${adapterCase.path}`;
+
+		try {
+			const response = await postJsonChunks(endpoint, [
+				body.subarray(0, codePointStart + 2),
+				body.subarray(codePointStart + 2),
+			]);
+
+			expect(response.status).toBe(200);
+			expect(response.body?.id).toBe(requestId);
+		} finally {
+			await transport.stop(1_000);
+		}
 	});
 });
 

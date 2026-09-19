@@ -1,4 +1,4 @@
-import { Server } from 'node:http';
+import { request, Server } from 'node:http';
 import { McpServer } from 'tmcp';
 import { ValibotJsonSchemaAdapter } from '@tmcp/adapter-valibot';
 import * as v from 'valibot';
@@ -144,6 +144,47 @@ export async function postJson(
 		headers: response.headers,
 		body: text.length === 0 ? undefined : parseJsonRpcResponse(text),
 	};
+}
+
+export async function postJsonChunks(
+	url: string,
+	chunks: readonly Buffer[],
+	headers: Readonly<Record<string, string>> = {}
+): Promise<WireResponse> {
+	const target = new URL(url);
+	return new Promise((resolve, reject) => {
+		const clientRequest = request(
+			{
+				hostname: target.hostname,
+				port: Number(target.port),
+				path: target.pathname,
+				method: 'POST',
+				headers: { 'content-type': 'application/json', ...headers },
+			},
+			(response) => {
+				const responseChunks: Buffer[] = [];
+				response.on('data', (chunk: Buffer) => {
+					responseChunks.push(chunk);
+				});
+				response.once('end', () => {
+					const text = Buffer.concat(responseChunks).toString('utf8');
+					resolve({
+						status: response.statusCode ?? 0,
+						headers: new Headers(response.headers as Record<string, string>),
+						body: text.length === 0 ? undefined : parseJsonRpcResponse(text),
+					});
+				});
+			}
+		);
+		clientRequest.once('error', reject);
+		void (async () => {
+			for (const [index, chunk] of chunks.entries()) {
+				if (index > 0) await new Promise<void>((next) => setImmediate(next));
+				clientRequest.write(chunk);
+			}
+			clientRequest.end();
+		})().catch(reject);
+	});
 }
 
 export function parseJsonRpcResponse(text: string): JsonRpcResponse {

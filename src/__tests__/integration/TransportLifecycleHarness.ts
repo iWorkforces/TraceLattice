@@ -1,4 +1,11 @@
-import { request, Server, type ClientRequest, type ServerResponse } from 'node:http';
+import {
+	request,
+	Server,
+	type ClientRequest,
+	type IncomingMessage,
+	type ServerResponse,
+} from 'node:http';
+import { createConnection } from 'node:net';
 import { ValibotJsonSchemaAdapter } from '@tmcp/adapter-valibot';
 import { McpServer } from 'tmcp';
 import { vi } from 'vitest';
@@ -15,6 +22,7 @@ export type Deferred<T> = {
 export type ControlledProtocolServer = {
 	readonly server: McpServer;
 	readonly started: Promise<void>;
+	readonly settled: Promise<void>;
 	readonly release: () => void;
 	readonly rejectReceiveAfterRelease: () => void;
 };
@@ -44,6 +52,17 @@ export type PendingWireRequest = {
 	readonly disconnect: () => void;
 };
 
+export type PendingUpload = PendingWireRequest & {
+	readonly complete: (tail?: string | Buffer) => void;
+};
+
+export type RequestResponseProbe = {
+	readonly request: IncomingMessage;
+	readonly response: ResponseProbe;
+	readonly firstData: Promise<Buffer>;
+	readonly requestSettled: Promise<'aborted' | 'ended'>;
+};
+
 export class LifecycleFixtureError extends Error {
 	override readonly name = 'LifecycleFixtureError';
 }
@@ -62,9 +81,10 @@ export function createDeferred<T>(): Deferred<T> {
 	};
 }
 
-export function createControlledProtocolServer(): ControlledProtocolServer {
+export function createControlledProtocolServer(onHandlerStarted?: () => void): ControlledProtocolServer {
 	const started = createDeferred<void>();
 	const release = createDeferred<void>();
+	const settled = createDeferred<void>();
 	const server = new McpServer(
 		{ name: 'transport-lifecycle', version: '1.0.0' },
 		{
@@ -74,12 +94,18 @@ export function createControlledProtocolServer(): ControlledProtocolServer {
 	);
 	server.tool({ name: 'controlled', description: 'Controlled lifecycle fixture' }, async () => {
 		started.resolve(undefined);
-		await release.promise;
-		return { content: [{ type: 'text', text: 'released' }] };
+		onHandlerStarted?.();
+		try {
+			await release.promise;
+			return { content: [{ type: 'text', text: 'released' }] };
+		} finally {
+			settled.resolve(undefined);
+		}
 	});
 	return {
 		server,
 		started: started.promise,
+		settled: settled.promise,
 		release: () => release.resolve(undefined),
 		rejectReceiveAfterRelease: () => {
 			vi.spyOn(server, 'receive').mockImplementation(async () => {
@@ -102,6 +128,32 @@ export function observeNextResponse(
 	return new Promise((resolve) => {
 		server.prependOnceListener('request', (_request, response) => {
 			resolve(createResponseProbe(response, writerFailureMethod));
+		});
+	});
+}
+
+export function observeNextRequestResponse(
+	transport: LifecycleTransport
+): Promise<RequestResponseProbe> {
+	const server = Reflect.get(transport, '_server');
+	if (!(server instanceof Server)) {
+		throw new LifecycleFixtureError('Transport server is not initialized');
+	}
+	return new Promise((resolve) => {
+		server.prependOnceListener('request', (incomingRequest, response) => {
+			const firstData = createDeferred<Buffer>();
+			const requestSettled = createDeferred<'aborted' | 'ended'>();
+			incomingRequest.once('data', (chunk: Buffer | string) => {
+				firstData.resolve(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+			});
+			incomingRequest.once('aborted', () => requestSettled.resolve('aborted'));
+			incomingRequest.once('end', () => requestSettled.resolve('ended'));
+			resolve({
+				request: incomingRequest,
+				response: createResponseProbe(response),
+				firstData: firstData.promise,
+				requestSettled: requestSettled.promise,
+			});
 		});
 	});
 }
@@ -148,6 +200,110 @@ export function startWireRequest(
 		outcome: outcome.promise,
 		disconnect: () => clientRequest.destroy(),
 	};
+}
+
+export function startIncompleteWireRequest(
+	url: string,
+	initialChunk: string | Buffer,
+	headers: Readonly<Record<string, string>> = {}
+): PendingUpload {
+	const target = new URL(url);
+	let requestCompleted = false;
+	let uploadCompleted = false;
+	const outcome = createDeferred<WireOutcome>();
+	let responseBytes = Buffer.alloc(0);
+	const socket = createConnection({ host: target.hostname, port: Number(target.port) }, () => {
+		const requestHeaders = {
+			host: target.host,
+			'content-type': 'application/json',
+			'transfer-encoding': 'chunked',
+			...headers,
+		};
+		const headerLines = Object.entries(requestHeaders).map(([name, value]) => `${name}: ${value}`);
+		socket.write(
+			`POST ${target.pathname}${target.search} HTTP/1.1\r\n${headerLines.join('\r\n')}\r\n\r\n`
+		);
+		writeChunk(socket, initialChunk);
+	});
+	socket.on('data', (chunk: Buffer) => {
+		responseBytes = Buffer.concat([responseBytes, chunk]);
+		const response = parseHttpResponse(responseBytes);
+		if (!response || requestCompleted) return;
+		requestCompleted = true;
+		outcome.resolve(response);
+	});
+	socket.once('close', () => {
+		if (!requestCompleted) outcome.resolve({ kind: 'closed' });
+	});
+	socket.once('error', () => {
+		if (!requestCompleted) outcome.resolve({ kind: 'closed' });
+	});
+	return {
+		outcome: outcome.promise,
+		disconnect: () => socket.destroy(),
+		complete: (tail = '') => {
+			if (uploadCompleted || socket.destroyed) return;
+			uploadCompleted = true;
+			if (Buffer.byteLength(tail) > 0) writeChunk(socket, tail);
+			socket.write('0\r\n\r\n');
+		},
+	};
+}
+
+function writeChunk(socket: ReturnType<typeof createConnection>, chunk: string | Buffer): void {
+	const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+	socket.write(`${bytes.length.toString(16)}\r\n`);
+	socket.write(bytes);
+	socket.write('\r\n');
+}
+
+function parseHttpResponse(bytes: Buffer): WireOutcome | null {
+	const headerEnd = bytes.indexOf('\r\n\r\n');
+	if (headerEnd < 0) return null;
+	const headerLines = bytes.subarray(0, headerEnd).toString('latin1').split('\r\n');
+	const statusMatch = /^HTTP\/1\.1 (\d{3})/.exec(headerLines[0] ?? '');
+	if (!statusMatch) throw new LifecycleFixtureError('Raw HTTP response omitted its status line');
+	const responseHeaders = new Map<string, string>();
+	for (const line of headerLines.slice(1)) {
+		const separator = line.indexOf(':');
+		if (separator > 0) {
+			responseHeaders.set(line.slice(0, separator).toLowerCase(), line.slice(separator + 1).trim());
+		}
+	}
+	const bodyBytes = bytes.subarray(headerEnd + 4);
+	const contentLength = responseHeaders.get('content-length');
+	if (contentLength !== undefined) {
+		const length = Number(contentLength);
+		if (bodyBytes.length < length) return null;
+		return {
+			kind: 'response',
+			status: Number(statusMatch[1]),
+			body: bodyBytes.subarray(0, length).toString('utf8'),
+		};
+	}
+	if (responseHeaders.get('transfer-encoding') === 'chunked') {
+		const body = parseChunkedBody(bodyBytes);
+		if (body === null) return null;
+		return { kind: 'response', status: Number(statusMatch[1]), body };
+	}
+	return null;
+}
+
+function parseChunkedBody(bytes: Buffer): string | null {
+	const chunks: Buffer[] = [];
+	let offset = 0;
+	while (offset < bytes.length) {
+		const sizeEnd = bytes.indexOf('\r\n', offset);
+		if (sizeEnd < 0) return null;
+		const size = Number.parseInt(bytes.subarray(offset, sizeEnd).toString('ascii'), 16);
+		if (!Number.isFinite(size)) throw new LifecycleFixtureError('Invalid response chunk size');
+		offset = sizeEnd + 2;
+		if (size === 0) return Buffer.concat(chunks).toString('utf8');
+		if (bytes.length < offset + size + 2) return null;
+		chunks.push(bytes.subarray(offset, offset + size));
+		offset += size + 2;
+	}
+	return null;
 }
 
 export function activeRequestCount(transport: LifecycleTransport): number {
