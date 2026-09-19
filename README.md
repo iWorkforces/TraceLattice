@@ -204,6 +204,33 @@ Set `TRANSPORT_TYPE` to pick one:
 
 The Streamable HTTP endpoint defaults to `POST /mcp` for JSON-RPC requests and supports stateful sessions via the `Mcp-Session-Id` header. In stateful mode, `GET /mcp` may expose `text/event-stream` notifications for that session. The library also exposes `HttpTransport` for stateless JSON-RPC over HTTP, but the CLI does not select it with `TRANSPORT_TYPE`.
 
+### Stateless HTTP library API
+
+Import the stateless transport from the package root. The package does not expose transport internals or deep import paths.
+
+```typescript
+import {
+	createHttpTransport,
+	type HttpTransportOptions,
+	type ITransport,
+} from '@iworkforces/tracelattice';
+import type { McpServer } from 'tmcp';
+
+const options: HttpTransportOptions = {
+	host: '127.0.0.1',
+	port: 9108,
+	path: '/messages',
+};
+
+export async function startHttpTransport(mcpServer: McpServer): Promise<ITransport> {
+	const transport = createHttpTransport(options);
+	await transport.connect(mcpServer);
+	return transport;
+}
+```
+
+Call and await `transport.stop()` during application shutdown.
+
 ## Development
 
 ```bash

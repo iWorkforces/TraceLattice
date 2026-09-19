@@ -72,4 +72,69 @@ describe('compression coordinator persistence', () => {
 		expect(summaryStore.forSession(sessionId)).toHaveLength(2);
 		expect(afterDrain.map(({ id }) => id).sort()).toEqual([first.id, second.id].sort());
 	});
+
+	it('scoped reset clears one live and durable summary namespace without sibling leakage', async () => {
+		// Given
+		const resetSessionId = createTestSessionId('compression-reset-target');
+		const siblingSessionId = createTestSessionId('compression-reset-sibling');
+		const resetRootId = createTestThoughtId('compression-reset-root');
+		const siblingRootId = createTestThoughtId('compression-sibling-root');
+		server = await createServer({
+			config: new ServerConfig({
+				persistence: { enabled: true, backend: 'memory' },
+				persistenceBufferSize: 1000,
+				persistenceFlushInterval: 60_000,
+				features: { compression: true, dagEdges: true, toolInterleave: false },
+			}),
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		const container = server.getContainer();
+		const persistence = container.resolve('Persistence');
+		if (!(persistence instanceof MemoryPersistence)) {
+			throw new TypeError('Expected container-owned MemoryPersistence');
+		}
+		const compressionService = container.resolve('compressionService');
+		const summaryStore = container.resolve('summaryStore');
+		server.history.addThought(
+			createTestThought({
+				id: resetRootId,
+				session_id: resetSessionId,
+				thought: 'summary cleared by scoped reset',
+			})
+		);
+		server.history.addThought(
+			createTestThought({
+				id: siblingRootId,
+				session_id: siblingSessionId,
+				thought: 'summary retained in sibling session',
+			})
+		);
+		const resetSummary = compressionService.compressBranch(
+			resetSessionId,
+			asBranchId('compression-reset-branch'),
+			resetRootId
+		);
+		const siblingSummary = compressionService.compressBranch(
+			siblingSessionId,
+			asBranchId('compression-sibling-branch'),
+			siblingRootId
+		);
+		await server.history.drainSession(resetSessionId);
+		await server.history.drainSession(siblingSessionId);
+
+		// When
+		await server.resetSession(resetSessionId);
+
+		// Then
+		expect(summaryStore.forSession(resetSessionId)).toEqual([]);
+		expect(summaryStore.forSession(siblingSessionId).map(({ id }) => id)).toEqual([
+			siblingSummary.id,
+		]);
+		expect(await persistence.loadSummaries(resetSessionId)).toEqual([]);
+		expect((await persistence.loadSummaries(siblingSessionId)).map(({ id }) => id)).toEqual([
+			siblingSummary.id,
+		]);
+		expect(resetSummary.id).not.toBe(siblingSummary.id);
+	});
 });

@@ -16,7 +16,7 @@
 import type { ISummaryStore, Summary } from '../../contracts/summary.js';
 import type { IEdgeStore } from '../../contracts/interfaces.js';
 import type { Logger } from '../../logger/StructuredLogger.js';
-import type { IHistoryManager } from '../IHistoryManager.js';
+import type { HistorySessionSnapshot, IHistoryManager } from '../IHistoryManager.js';
 import type { ThoughtData } from '../thought.js';
 import type { ConfidenceSignals } from '../reasoning.js';
 import { GraphView } from '../graph/GraphView.js';
@@ -76,8 +76,12 @@ export class CompressionService {
 		const existing = this._findExistingForRoot(sessionId, branchId, rootThoughtId);
 		if (existing) return existing;
 
-		const coveredIds = this._collectCovered(sessionId, rootThoughtId);
-		const thoughts = this._lookupThoughts(sessionId, coveredIds);
+		const snapshot = this._deps.historyManager.inspectSession(sessionId);
+		const candidateIds = this._collectCovered(sessionId, rootThoughtId);
+		const thoughts = this._resolveThoughts(snapshot, candidateIds);
+		const coveredIds = thoughts.flatMap((thought) =>
+			thought.id === undefined ? [] : [thought.id]
+		);
 		const summary: Summary = {
 			id: generateUlid(),
 			sessionId,
@@ -121,21 +125,34 @@ export class CompressionService {
 	}
 
 	/**
-	 * Resolve covered ids to {@link ThoughtData}, dropping any not found in
-	 * the history (defensive — graph may reference evicted thoughts).
+	 * Resolve candidate ids against one stable session snapshot. Main-history
+	 * records take precedence over branch copies; branch-only records are added
+	 * in declared branch order. Graph ids absent from the snapshot are omitted.
 	 */
-	private _lookupThoughts(sessionId: SessionId, coveredIds: readonly ThoughtId[]): ThoughtData[] {
-		const history = this._deps.historyManager.getHistory(sessionId);
-		const byId = new Map<string, ThoughtData>();
-		for (const t of history) {
-			if (t.id !== undefined) byId.set(t.id, t);
+	private _resolveThoughts(
+		snapshot: HistorySessionSnapshot,
+		candidateIds: readonly ThoughtId[]
+	): ThoughtData[] {
+		const byId = new Map<ThoughtId, ThoughtData>();
+		for (const thought of snapshot.history) {
+			if (thought.id !== undefined && !byId.has(thought.id)) byId.set(thought.id, thought);
 		}
-		const out: ThoughtData[] = [];
-		for (const id of coveredIds) {
-			const t = byId.get(id);
-			if (t) out.push(t);
+		for (const branchId of snapshot.branchIds) {
+			for (const thought of snapshot.branches[branchId] ?? []) {
+				if (thought.id !== undefined && !byId.has(thought.id)) byId.set(thought.id, thought);
+			}
 		}
-		return out;
+
+		const resolved: ThoughtData[] = [];
+		const seen = new Set<ThoughtId>();
+		for (const id of candidateIds) {
+			if (seen.has(id)) continue;
+			const thought = byId.get(id);
+			if (thought === undefined) continue;
+			seen.add(id);
+			resolved.push(thought);
+		}
+		return resolved;
 	}
 
 	/**

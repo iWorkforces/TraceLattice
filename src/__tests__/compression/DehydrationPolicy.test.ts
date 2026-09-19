@@ -15,6 +15,7 @@ let summaryCounter = 0;
 
 function makeThought(n: number, overrides?: Partial<ThoughtData>): ThoughtData {
 	return {
+		id: asThoughtId(`t-${n}`),
 		thought: `t${n}`,
 		thought_number: n,
 		total_thoughts: 100,
@@ -36,7 +37,12 @@ function makeSummary(overrides: Partial<Omit<Summary, 'sessionId' | 'rootThought
 		sessionId: overrides.sessionId ? asSessionId(overrides.sessionId) : SID,
 		branchId: overrides.branchId,
 		rootThoughtId: asThoughtId(overrides.rootThoughtId ?? `t-root-${summaryCounter}`),
-		coveredIds: overrides.coveredIds ?? [],
+		coveredIds:
+			overrides.coveredIds ??
+			Array.from(
+				{ length: overrides.coveredRange[1] - overrides.coveredRange[0] + 1 },
+				(_, index) => asThoughtId(`t-${overrides.coveredRange[0] + index}`)
+			),
 		coveredRange: overrides.coveredRange,
 		topics: overrides.topics ?? [],
 		aggregateConfidence: overrides.aggregateConfidence ?? 0.5,
@@ -114,6 +120,72 @@ describe('DehydrationPolicy', () => {
 		const refs = result.filter(isRef);
 		expect(refs).toHaveLength(1);
 		expect(refs[0]!.summaryId).toBe('S1');
+	});
+
+	it('leaves an uncovered duplicate-number thought untouched', () => {
+		const covered = makeThought(1, { id: asThoughtId('covered-id') });
+		const duplicate = makeThought(1, { id: asThoughtId('uncovered-id'), thought: 'duplicate' });
+		store.add(
+			makeSummary({
+				id: 'S1',
+				coveredIds: [asThoughtId('covered-id')],
+				coveredRange: [1, 1],
+			})
+		);
+
+		const result = policy.apply([covered, duplicate], SID, { keepLastK: 0 });
+
+		expect(result).toEqual([{ kind: 'summary', summaryId: 'S1', coveredRange: [1, 1] }, duplicate]);
+	});
+
+	it('leaves idless cold thoughts untouched even when their number is in a summary range', () => {
+		const idless: ThoughtData = {
+			thought: 'idless duplicate',
+			thought_number: 1,
+			total_thoughts: 1,
+			next_thought_needed: false,
+		};
+		store.add(
+			makeSummary({
+				id: 'S1',
+				coveredIds: [asThoughtId('different-id')],
+				coveredRange: [1, 1],
+			})
+		);
+
+		const result = policy.apply([idless], SID, { keepLastK: 0 });
+
+		expect(result).toEqual([idless]);
+		expect(result[0]).toBe(idless);
+	});
+
+	it('uses the first summary when coveredIds overlap', () => {
+		const history = [makeThought(1)];
+		store.add(makeSummary({ id: 'S1', coveredRange: [1, 3] }));
+		store.add(makeSummary({ id: 'S2', coveredIds: [asThoughtId('t-1')], coveredRange: [1, 1] }));
+
+		const result = policy.apply(history, SID, { keepLastK: 0 });
+
+		expect(result).toEqual([{ kind: 'summary', summaryId: 'S1', coveredRange: [1, 3] }]);
+	});
+
+	it('re-emits one summary after an uncovered identity gap', () => {
+		const history = makeHistory(3);
+		store.add(
+			makeSummary({
+				id: 'S1',
+				coveredIds: [asThoughtId('t-1'), asThoughtId('t-3')],
+				coveredRange: [1, 3],
+			})
+		);
+
+		const result = policy.apply(history, SID, { keepLastK: 0 });
+
+		expect(result).toEqual([
+			{ kind: 'summary', summaryId: 'S1', coveredRange: [1, 3] },
+			history[1],
+			{ kind: 'summary', summaryId: 'S1', coveredRange: [1, 3] },
+		]);
 	});
 
 	it('emits separate refs for different non-overlapping summaries', () => {

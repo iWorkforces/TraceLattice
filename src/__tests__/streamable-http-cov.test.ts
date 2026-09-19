@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { request } from 'node:http';
 import { McpServer } from 'tmcp';
 import { ValibotJsonSchemaAdapter } from '@tmcp/adapter-valibot';
@@ -533,6 +533,85 @@ describe('StreamableHttpTransport — coverage gaps', () => {
 	// _updateSessionMetrics with multiple sessions
 	// ═══════════════════════════════════════════════════════════════════
 	describe('session metrics tracking', () => {
+		it('expires an idle SSE session at the boundary and updates every observable count', async () => {
+			vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+			vi.setSystemTime(new Date('2026-09-18T00:00:00.000Z'));
+			const metrics = createMockMetrics();
+			await startTransport({
+				metrics,
+				stateful: true,
+				maxSessions: 1,
+				sessionIdleTimeoutMs: 50,
+				sessionSweepIntervalMs: 10,
+			});
+
+			const postRes = await httpRequest({
+				port,
+				headers: { 'content-type': 'application/json' },
+				body: jsonRpcBody(1, 'tools/list'),
+			});
+			const sessionId = postRes.headers['mcp-session-id'] as string;
+			await vi.advanceTimersByTimeAsync(40);
+
+			let resolveSseEnd: () => void;
+			const sseEnded = new Promise<void>((resolve) => {
+				resolveSseEnd = resolve;
+			});
+			const sseConnected = new Promise<void>((resolve, reject) => {
+				const sseRequest = request(
+					{
+						hostname: '127.0.0.1',
+						port,
+						path: '/mcp',
+						method: 'GET',
+						headers: { 'mcp-session-id': sessionId },
+					},
+					(response) => {
+						response.once('data', () => resolve());
+						response.once('end', () => resolveSseEnd());
+					}
+				);
+				sseRequest.on('error', reject);
+				sseRequest.end();
+			});
+
+			try {
+				await sseConnected;
+				await vi.advanceTimersByTimeAsync(49);
+				expect(transport.clientCount).toBe(1);
+
+				transport.broadcastToSession(sessionId, 'outbound', { ignored: true });
+				await vi.advanceTimersByTimeAsync(1);
+				expect(transport.clientCount).toBe(0);
+				await sseEnded;
+				const health = await httpRequest({ port, method: 'GET', path: '/health' });
+				expect(JSON.parse(health.body).sessions).toBe(0);
+
+				const activeSessionCalls = metrics.calls.filter(
+					(call) => call.method === 'gauge' && call.args[0] === 'streamable_http_active_sessions'
+				);
+				const streamCalls = metrics.calls.filter(
+					(call) =>
+						call.method === 'gauge' && call.args[0] === 'streamable_http_notification_streams'
+				);
+				expect(activeSessionCalls.at(-1)?.args[1]).toBe(0);
+				expect(streamCalls.at(-1)?.args[1]).toBe(0);
+
+				const expired = await httpRequest({
+					port,
+					headers: {
+						'content-type': 'application/json',
+						'mcp-session-id': sessionId,
+					},
+					body: jsonRpcBody(2, 'tools/list'),
+				});
+				expect(expired.statusCode).toBe(404);
+			} finally {
+				await transport.stop(1_000);
+				vi.useRealTimers();
+			}
+		});
+
 		it('tracks multiple sessions in gauge', async () => {
 			const metrics = createMockMetrics();
 			await startTransport({ metrics, stateful: true });

@@ -9,16 +9,15 @@
  * Pure and **non-mutating**: the input history array is never modified, and
  * neither the summary store nor any thought record is altered. When a cold
  * thought has no matching summary, the original {@link ThoughtData} is emitted
- * unchanged. Consecutive cold thoughts that fall within the same summary's
- * `coveredRange` are deduplicated to a single `SummaryRef`.
+ * unchanged. Consecutive cold thoughts listed in the same summary's stable
+ * `coveredIds` are deduplicated to a single `SummaryRef`.
  *
  * @module core/compression/DehydrationPolicy
  */
 
 import type { ISummaryStore, Summary } from '../../contracts/summary.js';
 import type { ThoughtData } from '../thought.js';
-import type { SessionId } from '../../contracts/ids.js';
-
+import type { SessionId, ThoughtId } from '../../contracts/ids.js';
 
 /** Default value for {@link DehydrationOptions.keepLastK}. */
 const DEFAULT_KEEP_LAST_K = 50;
@@ -65,8 +64,8 @@ export class DehydrationPolicy {
 	 *
 	 * Returns a new array of `(ThoughtData | SummaryRef)` where:
 	 * - The last `keepLastK` thoughts are preserved verbatim.
-	 * - Older thoughts whose `thought_number` falls within an existing
-	 *   summary's `coveredRange` are replaced by a single {@link SummaryRef}.
+	 * - Older thoughts whose stable `id` appears in an existing summary's
+	 *   `coveredIds` are replaced by a single {@link SummaryRef}.
 	 * - Consecutive cold thoughts covered by the same summary collapse to one
 	 *   `SummaryRef`.
 	 * - Cold thoughts with no matching summary are emitted verbatim.
@@ -97,7 +96,8 @@ export class DehydrationPolicy {
 		let lastEmittedSummaryId: string | undefined;
 
 		for (const thought of cold) {
-			const match = findCoveringSummary(summaries, thought.thought_number);
+			const match =
+				thought.id === undefined ? undefined : findCoveringSummary(summaries, thought.id);
 			if (match === undefined) {
 				out.push(thought);
 				lastEmittedSummaryId = undefined;
@@ -118,16 +118,15 @@ export class DehydrationPolicy {
 }
 
 /**
- * Find the first summary whose `coveredRange` includes the given thought
- * number (inclusive on both ends). Returns `undefined` when none match.
+ * Find the first summary whose stable `coveredIds` includes the thought.
+ * Returns `undefined` when none match.
  */
 function findCoveringSummary(
 	summaries: readonly Summary[],
-	thoughtNumber: number
+	thoughtId: ThoughtId
 ): Summary | undefined {
 	for (const s of summaries) {
-		const [lo, hi] = s.coveredRange;
-		if (thoughtNumber >= lo && thoughtNumber <= hi) return s;
+		if (s.coveredIds.includes(thoughtId)) return s;
 	}
 	return undefined;
 }

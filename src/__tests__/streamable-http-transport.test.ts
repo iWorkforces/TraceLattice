@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { request } from 'node:http';
 import { McpServer } from 'tmcp';
 import { ValibotJsonSchemaAdapter } from '@tmcp/adapter-valibot';
@@ -330,6 +330,41 @@ describe('StreamableHttpTransport', () => {
 	// Session management (stateful mode)
 	// ═══════════════════════════════════════════════════════════════════
 	describe('session management (stateful)', () => {
+		it('admits at most maxSessions concurrent headerless POSTs while preserving reuse', async () => {
+			const sessionIdGenerator = vi.fn(() => 'bounded-session');
+			await startTransport({
+				stateful: true,
+				maxSessions: 1,
+				sessionIdleTimeoutMs: 60_000,
+				sessionSweepIntervalMs: 10_000,
+				sessionIdGenerator,
+			});
+
+			const responses = await Promise.all(
+				[1, 2].map((id) =>
+					httpRequest({
+						port,
+						headers: { 'content-type': 'application/json' },
+						body: jsonRpcBody(id, 'tools/list'),
+					})
+				)
+			);
+
+			expect(responses.map((response) => response.statusCode).sort()).toEqual([200, 503]);
+			expect(sessionIdGenerator).toHaveBeenCalledTimes(1);
+			expect(transport.clientCount).toBe(1);
+
+			const reused = await httpRequest({
+				port,
+				headers: {
+					'content-type': 'application/json',
+					'mcp-session-id': 'bounded-session',
+				},
+				body: jsonRpcBody(3, 'tools/list'),
+			});
+			expect(reused.statusCode).toBe(200);
+		});
+
 		it('first POST /mcp creates a new session — Mcp-Session-Id in response', async () => {
 			await startTransport({ stateful: true });
 			const res = await httpRequest({
@@ -738,7 +773,60 @@ describe('StreamableHttpTransport', () => {
 	// ═══════════════════════════════════════════════════════════════════
 	// Constructor / factory
 	// ═══════════════════════════════════════════════════════════════════
-	describe('constructor and factory', () => {
+		describe('constructor and factory', () => {
+		it.each([
+			[{ maxSessions: 1 }, 'partial retention options'],
+			[{ maxSessions: 0, sessionIdleTimeoutMs: 10, sessionSweepIntervalMs: 10 }, 'zero capacity'],
+			[{ maxSessions: -1, sessionIdleTimeoutMs: 10, sessionSweepIntervalMs: 10 }, 'negative capacity'],
+			[{ maxSessions: 1, sessionIdleTimeoutMs: Number.NaN, sessionSweepIntervalMs: 10 }, 'NaN timeout'],
+			[
+				{ maxSessions: 1, sessionIdleTimeoutMs: 1.5, sessionSweepIntervalMs: 10 },
+				'fractional timeout',
+			],
+			[
+				{
+					maxSessions: 1,
+					sessionIdleTimeoutMs: 10,
+					sessionSweepIntervalMs: Number.POSITIVE_INFINITY,
+				},
+				'non-finite sweep interval',
+			],
+		])(
+			'rejects invalid retention options before starting base resources',
+			(retentionOptions, _description) => {
+				vi.useFakeTimers();
+				expect(
+					() =>
+						new StreamableHttpTransport({
+							enableRateLimit: true,
+							...retentionOptions,
+						})
+			).toThrow(
+				'maxSessions, sessionIdleTimeoutMs, and sessionSweepIntervalMs must be provided together as positive integers'
+			);
+				expect(vi.getTimerCount()).toBe(0);
+				vi.useRealTimers();
+			}
+		);
+
+		it('starts no retention sweep when options are omitted or transport is stateless', async () => {
+			vi.useFakeTimers();
+			transport = new StreamableHttpTransport({ enableRateLimit: false });
+			expect(vi.getTimerCount()).toBe(0);
+			await transport.stop();
+
+			transport = new StreamableHttpTransport({
+				enableRateLimit: false,
+				stateful: false,
+				maxSessions: 1,
+				sessionIdleTimeoutMs: 10,
+				sessionSweepIntervalMs: 5,
+			});
+			expect(vi.getTimerCount()).toBe(0);
+			await transport.stop();
+			vi.useRealTimers();
+		});
+
 		it('constructor with default options uses expected defaults', () => {
 			transport = new StreamableHttpTransport();
 			// Verify it can be instantiated with no options

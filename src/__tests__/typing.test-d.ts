@@ -13,13 +13,7 @@
  *  4. DI ServiceRegistry — every service key resolved in `lib.ts` exists in the registry.
  */
 
-import type {
-	BranchId,
-	EdgeId,
-	SessionId,
-	SuspensionToken,
-	ThoughtId,
-} from '../contracts/ids.js';
+import type { BranchId, EdgeId, SessionId, SuspensionToken, ThoughtId } from '../contracts/ids.js';
 import {
 	asBranchId,
 	asEdgeId,
@@ -40,6 +34,18 @@ import type {
 	VerificationThought,
 } from '../core/thought.js';
 import type { SchemaOutput } from '../schema.js';
+import type * as PublicApi from '../lib.js';
+import {
+	HttpTransport,
+	ToolAwareSequentialThinkingServer,
+	createHttpTransport,
+	createServer,
+	initializeServer,
+	type HttpTransportOptions,
+	type ITransport,
+	type TransportKind,
+	type TransportOptions,
+} from '../lib.js';
 
 // ─── 1. Branded type assignability ──────────────────────────────────────────
 //
@@ -172,3 +178,37 @@ void _v5;
 void _v6;
 void _v7;
 void _bad6;
+
+// ─── 5. Package-root transport API ─────────────────────────────────────────
+
+const _transportOptions: TransportOptions = {
+	port: 0,
+	host: '127.0.0.1',
+	enableRateLimit: false,
+};
+const _httpTransportOptions: HttpTransportOptions = {
+	..._transportOptions,
+	path: '/messages',
+};
+const _classTransport: ITransport = new HttpTransport(_httpTransportOptions);
+const _factoryTransport: ITransport = createHttpTransport(_httpTransportOptions);
+const _transportKind: TransportKind = _factoryTransport.kind;
+const _serverClass: typeof ToolAwareSequentialThinkingServer = ToolAwareSequentialThinkingServer;
+const _serverFactory: typeof createServer = createServer;
+const _serverInitializer: typeof initializeServer = initializeServer;
+
+type _ForbiddenRootExports = Extract<
+	'Container' | 'ServerConfig' | 'ToolRegistry' | 'SkillRegistry',
+	keyof typeof PublicApi
+>;
+type _AssertNever<T extends never> = T;
+type _NoForbiddenRootExports = _AssertNever<_ForbiddenRootExports>;
+const _noForbiddenRootExports: [_NoForbiddenRootExports] extends [never] ? true : false = true;
+
+void _classTransport;
+void _factoryTransport;
+void _transportKind;
+void _serverClass;
+void _serverFactory;
+void _serverInitializer;
+void _noForbiddenRootExports;
