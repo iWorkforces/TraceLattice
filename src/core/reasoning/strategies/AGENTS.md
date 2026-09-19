@@ -33,16 +33,17 @@ Terminates when `next_thought_needed === false`. Otherwise **continue**. Not “
 
 ## TOT
 
-`decide`:
+`decide` order:
 
 - No `ctx.graph` → **`continue`** (no snapshot, no search).
+- `graph.depthFromRoots(current) >= depthCap` (default **8**) → terminate (`reason: 'depth cap'`). Isolated thoughts are invisible → no cap.
 - Frontier = **`graph.leaves()`**, **not** `breadthFirstFrontier` (`totScoring` helper is unused on this path).
 - Score ≥ `terminationConfidence` (default 0.85) → terminate.
-- `detectPlateau` on recent scores → terminate.
+- `detectPlateau` on **recent history scores** (not frontier) → terminate.
 - Current thought outside top-`beamWidth` leaves → `branch`.
 - Else continue.
 
-Config lives in a **module `WeakMap`**, not on `this`.
+Config lives in a **module `WeakMap`**, not on `this`. Defaults: `beamWidth=3`, `depthCap=8`, `terminationConfidence=0.85`, plateau 3/0.02.
 
 ## SCORING
 

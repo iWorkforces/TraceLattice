@@ -1,6 +1,6 @@
 # SRC
 
-**Updated:** 2026-09-17 | **Parent:** ../AGENTS.md
+**Updated:** 2026-09-19 | **Parent:** ../AGENTS.md
 
 ## OVERVIEW
 
@@ -27,9 +27,11 @@ src/
 | Need | File |
 |------|------|
 | Public API / DI graph | `lib.ts` (`_createContainerCore`) |
+| HTTP library surface | `lib.ts` re-exports `HttpTransport` / `createHttpTransport` |
+| Discovery rescan | `lib.ts` `refreshDiscovery()` — coalesced; rejects after shutdown |
 | Add a service | `di/ServiceRegistry.ts` + `lib.ts` |
 | Add a feature flag | `contracts/features.ts` + `ServerConfig.ts` + `TRACELATTICE_FEATURES_*` |
-| Add an error | `errors.ts` (`ERROR_CODES` ~41) or module `*Errors.ts` |
+| Add an error | `errors.ts` (`ERROR_CODES` 41) or module `*Errors.ts` |
 | MCP input schema / tool prompt | `schema.ts` (`SEQUENTIAL_THINKING_TOOL`) |
 | Request owner / requestId | `context/RequestContext.ts` (`runWithContext`, `getOwner`, `getRequestId`) |
 | Exhaustiveness | `utils.ts:assertNever` |
@@ -38,7 +40,7 @@ src/
 
 - **Entry split**: `lib.ts` = published API. `cli.ts` = bin. Don't mix.
 - **20 DI keys** (not 19): extra is `sessionLifecycle`.
-- Flags gate **writes**. Exception: `suspensionStore` registered only if `toolInterleave`.
-- `HttpTransport` + `ConnectionPool` are off the CLI path.
+- Flags gate **writes**. Exception: `suspensionStore` registered only if `toolInterleave`. `DEFAULT_FLAGS` is all **on** (processor JSDoc saying off is stale).
+- `HttpTransport` is a library export; CLI never selects it. `ConnectionPool` is off CLI/DI. `StreamableHttpTransport` is CLI-only (dynamic import) — not a lib export.
 - Child AGENTS.md: `core/` (+ 5 subdirs), `persistence/`, `contracts/`, `di/`, `transport/`, `registry/`, `pool/`, `config/`, `logger/`, `cache/`, `metrics/`, `watchers/`, `health/`, `types/`, `__tests__/` (+ `integration/`, `eval/`).
 - Do **not** add `context/AGENTS.md` or `cluster/` (cluster does not exist).
