@@ -1,4 +1,4 @@
-import { asBranchId } from '../../contracts/ids.js';
+import { asBranchId, asSessionId, asThoughtId } from '../../contracts/ids.js';
 /**
  * Strategy Contract Tests — enforces purity constraints on all
  * {@link IReasoningStrategy} implementations (Oracle review concern C2).
@@ -16,14 +16,13 @@ import { asBranchId } from '../../contracts/ids.js';
  * @module __tests__/strategies/StrategyContract.test
  */
 
-import { asSessionId } from '../../contracts/ids.js';
 import { describe, it, expect } from 'vitest';
 import type { IReasoningStrategy, StrategyContext } from '../../contracts/strategy.js';
 import { SequentialStrategy } from '../../core/reasoning/strategies/SequentialStrategy.js';
 import { TreeOfThoughtStrategy } from '../../core/reasoning/strategies/TreeOfThoughtStrategy.js';
 import { EdgeStore } from '../../core/graph/EdgeStore.js';
 import { GraphView } from '../../core/graph/GraphView.js';
-import { createTestThought } from '../helpers/factories.js';
+import { createTestEdgeId, createTestThought } from '../helpers/factories.js';
 import type { ThoughtData } from '../../core/thought.js';
 import type { ReasoningStats } from '../../core/reasoning.js';
 
@@ -191,4 +190,50 @@ describe('IReasoningStrategy contract (purity guarantees)', () => {
 			});
 		});
 	}
+
+	it('keeps ToT depth-cap decisions deterministic, consistent, and side-effect free', () => {
+		// Given
+		const root = createTestThought({
+			id: 'depth-root',
+			thought_number: 1,
+			next_thought_needed: true,
+			confidence: 0.1,
+		});
+		const current = createTestThought({
+			id: 'depth-current',
+			thought_number: 2,
+			next_thought_needed: true,
+			confidence: 0.2,
+		});
+		const store = new EdgeStore();
+		store.addEdge({
+			id: createTestEdgeId('depth-edge'),
+			from: asThoughtId('depth-root'),
+			to: asThoughtId('depth-current'),
+			kind: 'sequence',
+			sessionId: asSessionId('contract-depth-session'),
+			createdAt: 1,
+		});
+		const context: StrategyContext = {
+			sessionId: asSessionId('contract-depth-session'),
+			history: [root, current],
+			graph: new GraphView(store),
+			stats: makeStats(),
+			currentThought: current,
+		};
+		const snapshot = structuredClone({ history: context.history, stats: context.stats });
+		const first = new TreeOfThoughtStrategy({ depthCap: 1 });
+		const second = new TreeOfThoughtStrategy({ depthCap: 1 });
+
+		// When
+		const decisions = Array.from({ length: 100 }, () => first.decide(context));
+
+		// Then
+		for (const decision of decisions) expect(decision).toEqual(decisions[0]);
+		expect(decisions[0]).toEqual({ action: 'terminate', reason: 'depth cap' });
+		expect(second.decide(context)).toEqual(decisions[0]);
+		expect(first.shouldTerminate(context)).toBe(true);
+		expect(first.shouldBranch(context)).toBe(false);
+		expect({ history: context.history, stats: context.stats }).toEqual(snapshot);
+	});
 });

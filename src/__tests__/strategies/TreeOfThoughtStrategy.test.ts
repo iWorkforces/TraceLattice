@@ -14,17 +14,18 @@ import { createTestThought } from '../helpers/factories.js';
 import type { StrategyContext } from '../../contracts/strategy.js';
 import type { ThoughtData } from '../../core/thought.js';
 import type { ReasoningStats } from '../../core/reasoning.js';
+import type { EdgeKind } from '../../core/graph/Edge.js';
 import { asSessionId, asThoughtId, type EdgeId, type SessionId } from '../../contracts/ids.js';
 
 const SID: SessionId = asSessionId('tot-session');
 
-function makeStats(): ReasoningStats {
+function makeStats(chainDepth = 0): ReasoningStats {
 	return {
 		total_thoughts: 0,
 		total_branches: 0,
 		total_revisions: 0,
 		total_merges: 0,
-		chain_depth: 0,
+		chain_depth: chainDepth,
 		thought_type_counts: {
 			regular: 0,
 			hypothesis: 0,
@@ -46,12 +47,12 @@ function makeStats(): ReasoningStats {
 }
 
 let edgeSeq = 0;
-function addEdge(store: EdgeStore, from: string, to: string): void {
+function addEdge(store: EdgeStore, from: string, to: string, kind: EdgeKind = 'sequence'): void {
 	store.addEdge({
 		id: `e-${++edgeSeq}` as EdgeId,
 		from: asThoughtId(from),
 		to: asThoughtId(to),
-		kind: 'sequence',
+		kind,
 		sessionId: SID,
 		createdAt: edgeSeq,
 	});
@@ -60,17 +61,18 @@ function addEdge(store: EdgeStore, from: string, to: string): void {
 interface CtxOpts {
 	readonly history: readonly ThoughtData[];
 	readonly current: ThoughtData;
-	readonly edges?: ReadonlyArray<readonly [string, string]>;
+	readonly edges?: ReadonlyArray<readonly [string, string, EdgeKind?]>;
+	readonly stats?: ReasoningStats;
 }
 
 function makeCtx(opts: CtxOpts): StrategyContext {
 	const store = new EdgeStore();
-	for (const [from, to] of opts.edges ?? []) addEdge(store, from, to);
+	for (const [from, to, kind] of opts.edges ?? []) addEdge(store, from, to, kind);
 	return {
 		sessionId: SID,
 		history: opts.history,
 		graph: new GraphView(store),
-		stats: makeStats(),
+		stats: opts.stats ?? makeStats(),
 		currentThought: opts.current,
 	};
 }
@@ -99,6 +101,17 @@ describe('TreeOfThoughtStrategy', () => {
 	});
 
 	describe('config', () => {
+		it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+			'rejects invalid depthCap %s',
+			(depthCap) => {
+				// Given
+				const construct = (): TreeOfThoughtStrategy => new TreeOfThoughtStrategy({ depthCap });
+
+				// When / Then
+				expect(construct).toThrow(TypeError);
+			}
+		);
+
 		it('applies default config when none provided', () => {
 			// 5 leaves > default beamWidth (3) → branch when current outside beam
 			const t1 = tot('t1', 1, 0.1);
@@ -136,6 +149,168 @@ describe('TreeOfThoughtStrategy', () => {
 			});
 			const strategy = new TreeOfThoughtStrategy({ beamWidth: 10 });
 			expect(strategy.decide(ctx).action).toBe('continue');
+		});
+	});
+
+	describe('depth cap', () => {
+		it('terminates at the default cap of eight', () => {
+			// Given
+			const history = Array.from({ length: 9 }, (_unused, index) =>
+				tot(`t${index}`, index + 1, index / 20)
+			);
+			const edges = Array.from(
+				{ length: 8 },
+				(_unused, index) => [`t${index}`, `t${index + 1}`] as const
+			);
+			const current = history[8];
+			if (current === undefined) throw new TypeError('Expected current thought');
+			const ctx = makeCtx({ history, current, edges });
+
+			// When
+			const decision = new TreeOfThoughtStrategy().decide(ctx);
+
+			// Then
+			expect(decision).toEqual({ action: 'terminate', reason: 'depth cap' });
+		});
+
+		it('terminates a root when depthCap is zero', () => {
+			// Given
+			const root = tot('root', 1, 0.1);
+			const child = tot('child', 2, 0.2);
+			const ctx = makeCtx({ history: [root, child], current: root, edges: [['root', 'child']] });
+
+			// When
+			const decision = new TreeOfThoughtStrategy({ depthCap: 0 }).decide(ctx);
+
+			// Then
+			expect(decision).toEqual({ action: 'terminate', reason: 'depth cap' });
+		});
+
+		it('terminates beyond the configured cap', () => {
+			// Given
+			const root = tot('root', 1, 0.1);
+			const a = tot('a', 2, 0.2);
+			const b = tot('b', 3, 0.3);
+			const current = tot('current', 4, 0.4);
+			const ctx = makeCtx({
+				history: [root, a, b, current],
+				current,
+				edges: [
+					['root', 'a'],
+					['a', 'b'],
+					['b', 'current'],
+				],
+			});
+
+			// When
+			const decision = new TreeOfThoughtStrategy({ depthCap: 2 }).decide(ctx);
+
+			// Then
+			expect(decision).toEqual({ action: 'terminate', reason: 'depth cap' });
+		});
+
+		it('gives depth termination precedence over confidence and plateau', () => {
+			// Given
+			const root = tot('root', 1, 0.95);
+			const current = tot('current', 2, 0.95);
+			const ctx = makeCtx({ history: [root, current], current, edges: [['root', 'current']] });
+
+			// When
+			const decision = new TreeOfThoughtStrategy({ depthCap: 1, plateauWindow: 2 }).decide(ctx);
+
+			// Then
+			expect(decision).toEqual({ action: 'terminate', reason: 'depth cap' });
+		});
+
+		it('keeps decide and predicates in agreement at the cap', () => {
+			// Given
+			const root = tot('root', 1, 0.05);
+			const current = tot('current', 2, 0.1);
+			const ctx = makeCtx({
+				history: [root, current, tot('a', 3, 0.2), tot('b', 4, 0.3)],
+				current,
+				edges: [
+					['root', 'current'],
+					['root', 'a'],
+					['root', 'b'],
+				],
+			});
+			const strategy = new TreeOfThoughtStrategy({ depthCap: 1, beamWidth: 1 });
+
+			// When
+			const decision = strategy.decide(ctx);
+			const shouldTerminate = strategy.shouldTerminate(ctx);
+			const shouldBranch = strategy.shouldBranch(ctx);
+
+			// Then
+			expect(decision).toEqual({ action: 'terminate', reason: 'depth cap' });
+			expect(shouldTerminate).toBe(true);
+			expect(shouldBranch).toBe(false);
+		});
+
+		it('does not substitute a high reasoning_stats.chain_depth for graph depth', () => {
+			// Given
+			const root = tot('root', 1, 0.1);
+			const current = tot('current', 2, 0.2);
+			const ctx = makeCtx({
+				history: [root, current],
+				current,
+				edges: [['root', 'current']],
+				stats: makeStats(99),
+			});
+
+			// When
+			const decision = new TreeOfThoughtStrategy({ depthCap: 8 }).decide(ctx);
+
+			// Then
+			expect(decision).toEqual({ action: 'continue', nextHint: 'explore frontier' });
+		});
+
+		it.each([
+			['missing graph', undefined],
+			['empty graph', new GraphView(new EdgeStore())],
+		] as const)('does not invent depth termination for a %s', (_label, graph) => {
+			// Given
+			const current = tot('current', 1, 0.1);
+			const ctx: StrategyContext = { ...makeCtx({ history: [current], current }), graph };
+
+			// When
+			const decision = new TreeOfThoughtStrategy({ depthCap: 0 }).decide(ctx);
+
+			// Then
+			expect(decision.action).toBe('continue');
+		});
+
+		it('does not terminate a current thought unreachable from every root', () => {
+			// Given
+			const root = tot('root', 1, 0.1);
+			const leaf = tot('leaf', 2, 0.2);
+			const current = tot('current', 3, 0.3);
+			const ctx = makeCtx({ history: [root, leaf, current], current, edges: [['root', 'leaf']] });
+
+			// When
+			const decision = new TreeOfThoughtStrategy({ depthCap: 0 }).decide(ctx);
+
+			// Then
+			expect(decision.action).toBe('continue');
+		});
+
+		it('does not mutate context while deciding at the cap', () => {
+			// Given
+			const root = tot('root', 1, 0.1);
+			const current = tot('current', 2, 0.2);
+			const history = [root, current];
+			const ctx = makeCtx({ history, current, edges: [['root', 'current']] });
+			const historySnapshot = structuredClone(history);
+			const statsSnapshot = structuredClone(ctx.stats);
+
+			// When
+			const decision = new TreeOfThoughtStrategy({ depthCap: 1 }).decide(ctx);
+
+			// Then
+			expect(decision).toEqual({ action: 'terminate', reason: 'depth cap' });
+			expect(history).toEqual(historySnapshot);
+			expect(ctx.stats).toEqual(statsSnapshot);
 		});
 	});
 

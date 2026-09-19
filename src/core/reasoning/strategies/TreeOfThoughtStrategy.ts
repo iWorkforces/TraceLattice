@@ -3,8 +3,8 @@
  *
  * Observes the frontier (graph leaves), scores each leaf via
  * {@link scoreThought}, and decides whether to continue, branch (when the
- * current thought falls outside the beam), or terminate (on confidence
- * threshold or score plateau).
+ * current thought falls outside the beam), or terminate (on depth cap,
+ * confidence threshold, or score plateau).
  *
  * Pure policy: configuration lives in a module-level {@link WeakMap}, not
  * on the instance, so `Object.getOwnPropertyNames(strategy)` only ever
@@ -19,6 +19,7 @@ import type {
 	StrategyContext,
 	StrategyDecision,
 } from '../../../contracts/strategy.js';
+import { asThoughtId, type ThoughtId } from '../../../contracts/ids.js';
 import type { ThoughtData } from '../../thought.js';
 import { scoreThought, selectBeam, type ScoredCandidate } from './totScoring.js';
 import { detectPlateau } from './plateau.js';
@@ -61,8 +62,8 @@ function configOf(s: TreeOfThoughtStrategy): Required<TotConfig> {
 }
 
 /** Stable identifier for a thought: `id` if present, else its sequence number. */
-function thoughtKey(t: ThoughtData): string {
-	return t.id ?? String(t.thought_number);
+function thoughtKey(t: ThoughtData): ThoughtId {
+	return t.id ?? asThoughtId(String(t.thought_number));
 }
 
 /** Index history by stable key for O(1) leaf-id → ThoughtData lookup. */
@@ -102,6 +103,12 @@ function recentScores(history: readonly ThoughtData[], window: number): number[]
 	return out;
 }
 
+/** Whether the current graph-visible thought has reached the configured depth cap. */
+function isAtDepthCap(ctx: StrategyContext, depthCap: number): boolean {
+	const depth = ctx.graph?.depthFromRoots(ctx.sessionId, thoughtKey(ctx.currentThought));
+	return depth !== undefined && depth >= depthCap;
+}
+
 /**
  * Tree-of-Thought strategy: beam search over the thought DAG. Pure policy.
  *
@@ -116,19 +123,26 @@ export class TreeOfThoughtStrategy implements IReasoningStrategy {
 
 	/** @param config - See {@link TotConfig}. */
 	constructor(config?: TotConfig) {
-		CONFIGS.set(this, { ...DEFAULTS, ...(config ?? {}) });
+		const depthCap = config?.depthCap ?? DEFAULTS.depthCap;
+		if (!Number.isFinite(depthCap) || !Number.isInteger(depthCap) || depthCap < 0) {
+			throw new TypeError('depthCap must be a finite nonnegative integer');
+		}
+		CONFIGS.set(this, { ...DEFAULTS, ...config, depthCap });
 	}
 
 	/**
 	 * Compute the next action for the chain.
 	 *
-	 * Order of checks: termination by confidence → termination by plateau →
-	 * branch when the current thought is outside the beam → continue.
+	 * Order of checks: depth cap → confidence → plateau → branch when the
+	 * current thought is outside the beam → continue. Missing graphs continue.
 	 */
 	decide(ctx: StrategyContext): StrategyDecision {
 		const cfg = configOf(this);
 		if (!ctx.graph) {
 			return { action: 'continue' };
+		}
+		if (isAtDepthCap(ctx, cfg.depthCap)) {
+			return { action: 'terminate', reason: 'depth cap' };
 		}
 		const frontier = ctx.graph.leaves(ctx.sessionId);
 		const byKey = indexHistory(ctx.history);
@@ -158,18 +172,20 @@ export class TreeOfThoughtStrategy implements IReasoningStrategy {
 		return { action: 'continue', nextHint: 'explore frontier' };
 	}
 
-	/** True when the frontier is wider than the beam (diverse exploration). */
+	/** True below the depth cap when the frontier is wider than the beam. */
 	shouldBranch(ctx: StrategyContext): boolean {
 		const cfg = configOf(this);
 		if (!ctx.graph) return false;
+		if (isAtDepthCap(ctx, cfg.depthCap)) return false;
 		const frontier = ctx.graph.leaves(ctx.sessionId);
 		return frontier.length > cfg.beamWidth;
 	}
 
-	/** True when the best frontier score crosses the threshold OR scores plateau. */
+	/** True at the depth cap, confidence threshold, or score plateau. */
 	shouldTerminate(ctx: StrategyContext): boolean {
 		const cfg = configOf(this);
 		if (!ctx.graph) return false;
+		if (isAtDepthCap(ctx, cfg.depthCap)) return true;
 		const frontier = ctx.graph.leaves(ctx.sessionId);
 		const byKey = indexHistory(ctx.history);
 		const scored = scoreFrontier(frontier, byKey);
