@@ -1,12 +1,8 @@
 /**
  * Streamable HTTP Transport implementation (MCP spec recommended transport).
  *
- * This transport implements the MCP Streamable HTTP specification, which replaces
- * the deprecated SSE transport as the recommended HTTP-based transport since March 2025.
- *
  * Key features:
  * - POST /mcp for JSON-RPC requests (main MCP endpoint)
- * - GET /mcp for optional SSE server-to-client notifications
  * - Session management via Mcp-Session-Id header
  * - Supports both stateful (session-based) and stateless (per-request) modes
  * - Health endpoints (/health, /ready)
@@ -37,7 +33,9 @@ import { runWithContext } from '../context/RequestContext.js';
 import {
 	AcceptedWorkTracker,
 	LifecycleFailureReporter,
+	PreDispatchTracker,
 	ResponseFinalizer,
+	type PreDispatchLease,
 } from './HttpRequestLifecycle.js';
 
 /**
@@ -154,8 +152,6 @@ interface SessionState {
 	createdAt: number;
 	/** Timestamp of the last activity */
 	lastActivityAt: number;
-	/** Active SSE notification streams for this session */
-	notificationStreams: Set<ServerResponse>;
 	acceptedPostCount: number;
 }
 
@@ -174,8 +170,7 @@ type AcceptedPostSession = {
  * Streamable HTTP Transport for MCP server.
  *
  * This transport implements the MCP Streamable HTTP specification,
- * providing JSON-RPC over HTTP with optional session management
- * and server-to-client SSE notification streams.
+ * providing JSON-RPC over HTTP with optional session management.
  *
  * @remarks
  * **Security Features (inherited from BaseTransport):**
@@ -187,13 +182,11 @@ type AcceptedPostSession = {
  *
  * **MCP Streamable HTTP Spec Compliance:**
  * - POST /mcp — JSON-RPC method calls
- * - GET /mcp — SSE notification stream (server-to-client)
  * - Mcp-Session-Id header for session management
  * - Content-Type: application/json for JSON-RPC responses
- * - Content-Type: text/event-stream for SSE notification streams
  *
  * **HTTP Status Code Mapping:**
- * - 200: Success (JSON-RPC response or SSE stream)
+ * - 200: Success (JSON-RPC response)
  * - 202: Accepted (JSON-RPC notification, no response body)
  * - 204: CORS Preflight (empty body)
  * - 400: Bad Request (invalid JSON, invalid session ID)
@@ -224,6 +217,7 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	private _metricsProvider: (() => string) | null;
 	private readonly _lifecycleFailureReporter: LifecycleFailureReporter;
 	private readonly _acceptedWork: AcceptedWorkTracker;
+	private readonly _preDispatch = new PreDispatchTracker();
 	private readonly _sessionRetention: SessionRetentionOptions | null;
 	private _sessionSweepIntervalId: NodeJS.Timeout | null = null;
 	private _stopPromise: Promise<void> | null = null;
@@ -323,10 +317,7 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		});
 	}
 
-	/**
-	 * Route and handle incoming HTTP requests.
-	 */
-	private async _handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	private _recordRequestMetrics(res: ServerResponse): void {
 		const startTime = Date.now();
 		this._metrics?.counter(
 			'streamable_http_requests_total',
@@ -338,6 +329,13 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 			const durationSeconds = (Date.now() - startTime) / 1000;
 			this._metrics?.histogram('streamable_http_request_duration_seconds', durationSeconds, {});
 		});
+	}
+
+	/**
+	 * Route and handle incoming HTTP requests.
+	 */
+	private async _handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+		this._recordRequestMetrics(res);
 
 		// Host validation
 		if (!this.validateHostHeader(req)) {
@@ -399,14 +397,18 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		// MCP endpoint routing
 		if (urlPath === this._path) {
 			if (req.method === 'POST') {
-				this._acceptedWork.track(this._handleMcpPost(req, res));
+				const lease = this._preDispatch.acquire();
+				if (!lease) {
+					const responseFinalizer = new ResponseFinalizer(res, this._lifecycleFailureReporter);
+					responseFinalizer.finalize((response) => {
+						this._sendJsonRpcError(response, 503, -32603, 'Server is shutting down');
+					});
+					return;
+				}
+				await this._handleMcpPost(req, res, lease);
 				return;
 			}
-			if (req.method === 'GET') {
-				this._handleMcpGet(req, res);
-				return;
-			}
-			res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'GET, POST' });
+			res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' });
 			res.end(
 				JSON.stringify({
 					jsonrpc: '2.0',
@@ -440,6 +442,41 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 		res.end(JSON.stringify({ jsonrpc: '2.0', id, error }));
 	}
 
+	private _parseJsonRpcRequest(
+		body: string,
+		responseFinalizer: ResponseFinalizer
+	): Parameters<McpServer['receive']>[0] | null {
+		let rawBody: unknown;
+		try {
+			rawBody = JSON.parse(body) as unknown;
+		} catch {
+			responseFinalizer.finalize((response) => {
+				this._sendJsonRpcError(response, 200, -32700, 'Parse error');
+			});
+			return null;
+		}
+
+		const parseResult = safeParse(JsonRpcRequestSchema, rawBody);
+		const rawId =
+			rawBody && typeof rawBody === 'object' && 'id' in rawBody
+				? ((rawBody as { id?: unknown }).id ?? null)
+				: null;
+		if (!parseResult.success) {
+			responseFinalizer.finalize((response) => {
+				this._sendJsonRpcError(
+					response,
+					200,
+					-32600,
+					'Invalid Request',
+					rawId as string | number | null,
+					{ data: parseResult.issues }
+				);
+			});
+			return null;
+		}
+		return parseResult.output as Parameters<McpServer['receive']>[0];
+	}
+
 	/**
 	 * Handle POST /mcp — JSON-RPC method calls.
 	 *
@@ -449,20 +486,31 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	 * - Validates Mcp-Session-Id for existing sessions (stateful mode)
 	 * - Content-Type: application/json for responses
 	 */
-	private async _handleMcpPost(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	private async _handleMcpPost(
+		req: IncomingMessage,
+		res: ServerResponse,
+		lease: PreDispatchLease
+	): Promise<void> {
 		this._requestCount++;
 		this._activeRequests++;
 		const responseFinalizer = new ResponseFinalizer(res, this._lifecycleFailureReporter);
 		let acceptedSession: SessionState | null = null;
+		const onAborted = (): void => lease.cancel('peer');
+		req.once('aborted', onAborted);
 
 		const timeout = setTimeout(() => {
 			responseFinalizer.finalize((response) => {
 				this._sendJsonRpcError(response, 500, -32603, 'Request timeout');
 			});
+			lease.cancel('timeout');
 		}, this._requestTimeout);
 		try {
 			// Read request body with size limit
-			const body = await readRequestBody(req, this._bodySizeLimitEnabled ? this._maxBodySize : 0);
+			const body = await readRequestBody(
+				req,
+				this._bodySizeLimitEnabled ? this._maxBodySize : 0,
+				lease.signal
+			);
 			if (body === null) {
 				responseFinalizer.finalize((response) => {
 					this._sendJsonRpcError(response, 413, -32000, 'Request body too large');
@@ -470,37 +518,8 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 				return;
 			}
 
-			// Parse JSON
-			let rawBody: unknown;
-			try {
-				rawBody = JSON.parse(body) as unknown;
-			} catch {
-				responseFinalizer.finalize((response) => {
-					this._sendJsonRpcError(response, 200, -32700, 'Parse error');
-				});
-				return;
-			}
-
-			// Validate JSON-RPC schema
-			const parseResult = safeParse(JsonRpcRequestSchema, rawBody);
-			const rawId =
-				rawBody && typeof rawBody === 'object' && 'id' in rawBody
-					? ((rawBody as { id?: unknown }).id ?? null)
-					: null;
-			if (!parseResult.success) {
-				responseFinalizer.finalize((response) => {
-					this._sendJsonRpcError(
-						response,
-						200,
-						-32600,
-						'Invalid Request',
-						rawId as string | number | null,
-						{ data: parseResult.issues }
-					);
-				});
-				return;
-			}
-			const jsonRpcRequest = parseResult.output;
+			const jsonRpcRequest = this._parseJsonRpcRequest(body, responseFinalizer);
+			if (jsonRpcRequest === null) return;
 
 			const session = this._acceptPostSession(req, responseFinalizer);
 			if (!session) return;
@@ -508,30 +527,43 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 
 			// Check if MCP server is ready
 			if (!this._mcpServer) {
+				const requestId = 'id' in jsonRpcRequest ? (jsonRpcRequest.id ?? null) : null;
 				responseFinalizer.finalize((response) => {
-					this._sendJsonRpcError(
-						response,
-						503,
-						-32603,
-						'Server not ready',
-						jsonRpcRequest?.id ?? null
-					);
+					this._sendJsonRpcError(response, 503, -32603, 'Server not ready', requestId);
 				});
 				return;
 			}
 
-			await this._receiveAndFinalize(
-				jsonRpcRequest as Parameters<McpServer['receive']>[0],
-				session.id,
-				responseFinalizer
+			req.off('aborted', onAborted);
+			const acceptedWork = this._acceptedWork.transfer(lease, () =>
+				this._receiveAndFinalize(jsonRpcRequest, session.id, responseFinalizer).catch(
+					(error: unknown) => {
+						responseFinalizer.finalize((response) => {
+							this._sendJsonRpcError(response, 200, -32603, 'Internal error', null, {
+								data: getErrorMessage(error),
+							});
+						});
+					}
+				)
 			);
+			await acceptedWork;
 		} catch (error) {
+			if (lease.signal.aborted) {
+				if (lease.cancellationReason === 'shutdown') {
+					responseFinalizer.finalize((response) => {
+						this._sendJsonRpcError(response, 503, -32603, 'Server is shutting down');
+					});
+				}
+				return;
+			}
 			responseFinalizer.finalize((response) => {
 				this._sendJsonRpcError(response, 200, -32603, 'Internal error', null, {
 					data: getErrorMessage(error),
 				});
 			});
 		} finally {
+			req.off('aborted', onAborted);
+			lease.release();
 			if (acceptedSession) acceptedSession.acceptedPostCount--;
 			clearTimeout(timeout);
 			this._activeRequests--;
@@ -585,83 +617,6 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	}
 
 	/**
-	 * Handle GET /mcp — Optional SSE notification stream.
-	 *
-	 * Per the MCP Streamable HTTP spec, clients may open a GET request
-	 * to receive server-initiated notifications as SSE events.
-	 * Requires a valid Mcp-Session-Id in stateful mode.
-	 */
-	private _handleMcpGet(req: IncomingMessage, res: ServerResponse): void {
-		if (!this._stateful) {
-			// SSE notification streams require stateful mode
-			res.writeHead(405, {
-				'Content-Type': 'application/json',
-				Allow: 'POST',
-			});
-			res.end(
-				JSON.stringify({
-					jsonrpc: '2.0',
-					id: null,
-					error: { code: -32601, message: 'GET not supported in stateless mode' },
-				})
-			);
-			return;
-		}
-
-		// Require Mcp-Session-Id for GET requests
-		const sessionId = this._getSessionIdFromHeader(req);
-		if (!sessionId) {
-			res.writeHead(400, { 'Content-Type': 'application/json' });
-			res.end(
-				JSON.stringify({
-					jsonrpc: '2.0',
-					id: null,
-					error: { code: -32600, message: 'Missing Mcp-Session-Id header' },
-				})
-			);
-			return;
-		}
-
-		const session = this._sessions.get(asSessionId(sessionId));
-		if (!session) {
-			res.writeHead(404, { 'Content-Type': 'application/json' });
-			res.end(
-				JSON.stringify({
-					jsonrpc: '2.0',
-					id: null,
-					error: { code: -32001, message: 'Session not found' },
-				})
-			);
-			return;
-		}
-		session.lastActivityAt = Date.now();
-
-		// Set SSE headers
-		res.writeHead(200, {
-			'Content-Type': 'text/event-stream',
-			'Cache-Control': 'no-cache',
-			Connection: 'keep-alive',
-			'Mcp-Session-Id': sessionId,
-		});
-
-		// Send initial connected event
-		this._sendSseEvent(res, 'connected', {
-			sessionId,
-			timestamp: Date.now(),
-		});
-
-		// Track this notification stream
-		session.notificationStreams.add(res);
-		this._updateSessionMetrics();
-
-		// Handle client disconnect
-		req.on('close', () => {
-			session.notificationStreams.delete(res);
-			this._updateSessionMetrics();
-		});
-	}
-
-	/**
 	 * Resolve or create a session for a stateful request.
 	 *
 	 * @returns Session ID string on success, or the response error to finalize.
@@ -702,7 +657,6 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 			id: newSessionId,
 			createdAt: now,
 			lastActivityAt: now,
-			notificationStreams: new Set(),
 			acceptedPostCount: 0,
 		};
 		this._sessions.set(newSessionId, sessionState);
@@ -726,17 +680,7 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	}
 
 	private _disposeSession(sessionId: SessionId): void {
-		const session = this._sessions.get(sessionId);
-		if (!session) return;
-		this._sessions.delete(sessionId);
-		for (const stream of session.notificationStreams) {
-			try {
-				stream.end();
-			} catch (error) {
-				this._lifecycleFailureReporter.report(error);
-			}
-		}
-		session.notificationStreams.clear();
+		if (!this._sessions.delete(sessionId)) return;
 		this._updateSessionMetrics();
 	}
 
@@ -757,36 +701,6 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 			return value;
 		}
 		return undefined;
-	}
-
-	/**
-	 * Send an SSE event to a specific client response stream.
-	 */
-	private _sendSseEvent(res: ServerResponse, event: string, data: unknown): void {
-		try {
-			res.write(`event: ${event}\n`);
-			res.write(`data: ${JSON.stringify(data)}\n\n`);
-		} catch {
-			// Client disconnected — ignore
-		}
-	}
-
-	/**
-	 * Broadcast a notification to all SSE streams in a given session.
-	 *
-	 * @param sessionId - Target session ID
-	 * @param event - SSE event name
-	 * @param data - Event payload
-	 */
-	broadcastToSession(sessionId: string, event: string, data: unknown): void {
-		const session = this._sessions.get(asSessionId(sessionId));
-		if (!session) {
-			return;
-		}
-
-		for (const stream of session.notificationStreams) {
-			this._sendSseEvent(stream, event, data);
-		}
 	}
 
 	/**
@@ -852,17 +766,6 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 			{},
 			'Active Streamable HTTP sessions'
 		);
-
-		let totalStreams = 0;
-		for (const session of this._sessions.values()) {
-			totalStreams += session.notificationStreams.size;
-		}
-		this._metrics?.gauge(
-			'streamable_http_notification_streams',
-			totalStreams,
-			{},
-			'Active SSE notification streams'
-		);
 	}
 
 	/**
@@ -873,6 +776,7 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 	stop(timeout?: number): Promise<void> {
 		if (this._stopPromise) return this._stopPromise;
 		this._isShuttingDown = true;
+		this._preDispatch.closeAdmission('shutdown');
 		this._stopRateLimitCleanup();
 		this._stopSessionSweep();
 
@@ -910,7 +814,10 @@ export class StreamableHttpTransport extends BaseTransport implements ITransport
 				resolve();
 			}, shutdownTimeout);
 		});
-		const stopPromise = Promise.all([serverClosed, this._acceptedWork.join()]).then(() => {
+		const stopPromise = Promise.all([
+			serverClosed,
+			this._preDispatch.join().then(() => this._acceptedWork.join()),
+		]).then(() => {
 			this.log('info', 'Streamable HTTP transport stopped');
 		});
 		this._stopPromise = stopPromise;

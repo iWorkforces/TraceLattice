@@ -74,7 +74,15 @@ export class HttpTransport {
   }
 }
 export function createHttpTransport(options = {}) { return new HttpTransport(options); }
-export class ToolAwareSequentialThinkingServer { async stop() {} async dispose() {} }
+export class ToolAwareSequentialThinkingServer {
+  constructor() { this.refresh = undefined; }
+  refreshDiscovery() {
+    this.refresh ??= Promise.resolve({ tools: 1, skills: 1 });
+    return this.refresh;
+  }
+  async stop() {}
+  async dispose() {}
+}
 export async function createServer() { return new ToolAwareSequentialThinkingServer(); }
 export async function initializeServer() { return createServer(); }
 `;
@@ -104,8 +112,14 @@ export declare class HttpTransport implements ITransport {
 }
 export declare function createHttpTransport(options?: HttpTransportOptions): HttpTransport;
 export interface ServerOptions { readonly autoDiscover?: boolean; readonly loadFromPersistence?: boolean; }
-export declare class ToolAwareSequentialThinkingServer {
+export interface IToolAwareSequentialThinkingServer {
+  refreshDiscovery(): Promise<{ tools: number; skills: number }>;
+  stop(): Promise<void>;
+  dispose(): Promise<void>;
+}
+export declare class ToolAwareSequentialThinkingServer implements IToolAwareSequentialThinkingServer {
   static create(options?: ServerOptions): Promise<ToolAwareSequentialThinkingServer>;
+  refreshDiscovery(): Promise<{ tools: number; skills: number }>;
   stop(): Promise<void>;
   dispose(): Promise<void>;
 }

@@ -14,11 +14,14 @@ import {
 import {
 	activeRequestCount,
 	createControlledProtocolServer,
+	createDeferred,
 	lifecycleReportingFailureCount,
 	makeServerNotReady,
 	nextEventLoopTurn,
 	observeNextResponse,
+	observeNextRequestResponse,
 	outstandingWorkCount,
+	startIncompleteWireRequest,
 	startWireRequest,
 	LifecycleFixtureError,
 	type LifecycleTransport,
@@ -30,8 +33,11 @@ type TransportName = 'HTTP' | 'Streamable HTTP';
 type LifecycleOptions = {
 	readonly healthChecker?: HealthChecker;
 	readonly logger?: Logger;
+	readonly maxBodySize?: number;
 	readonly port?: number;
 	readonly requestTimeout?: number;
+	readonly sessionIdGenerator?: () => string;
+	readonly stateful?: boolean;
 };
 
 type LifecycleCase = {
@@ -58,7 +64,7 @@ const LIFECYCLE_CASES = [
 				host: '127.0.0.1',
 				enableRateLimit: false,
 				requestTimeout: options.requestTimeout,
-				maxBodySize: 256,
+				maxBodySize: options.maxBodySize ?? 256,
 				...(options.healthChecker ? { healthChecker: options.healthChecker } : {}),
 				...(options.logger ? { logger: options.logger } : {}),
 			}),
@@ -75,9 +81,12 @@ const LIFECYCLE_CASES = [
 				port: options.port ?? 0,
 				host: '127.0.0.1',
 				enableRateLimit: false,
-				stateful: true,
+				stateful: options.stateful ?? true,
 				requestTimeout: options.requestTimeout,
-				maxBodySize: 256,
+				maxBodySize: options.maxBodySize ?? 256,
+				...(options.sessionIdGenerator
+					? { sessionIdGenerator: options.sessionIdGenerator }
+					: {}),
 				...(options.healthChecker ? { healthChecker: options.healthChecker } : {}),
 				...(options.logger ? { logger: options.logger } : {}),
 			}),
@@ -268,6 +277,272 @@ function startDelayedBodyRequest(
 	request.write(body.slice(0, -1));
 	return { request, response: response.promise };
 }
+
+function predispatchBody(): Buffer {
+	return Buffer.from(
+		JSON.stringify({
+			jsonrpc: '2.0',
+			id: 'predispatch-💡',
+			method: 'tools/list',
+			params: {},
+		})
+	);
+}
+
+describe.each(LIFECYCLE_CASES)('$name accepted-work transfer', (transportCase) => {
+	it('keeps shutdown pending when the handler starts it synchronously', async () => {
+		let transport: LifecycleTransport | null = null;
+		const stopState: { promise: Promise<void> | null } = { promise: null };
+		const controlled = createControlledProtocolServer(() => {
+			if (!transport) throw new LifecycleFixtureError('Transport is not initialized');
+			stopState.promise = transport.stop(1_000);
+		});
+		transport = transportCase.create({ requestTimeout: 1_000, stateful: false });
+		await transport.connect(controlled.server);
+		const endpoint = `http://127.0.0.1:${getListeningPort(transport)}${transportCase.path}`;
+		const server = getTransportServer(transport);
+		const pending = startWireRequest(endpoint, controlledCallBody());
+
+		try {
+			await controlled.started;
+			const capturedStop = stopState.promise;
+			if (!capturedStop) throw new LifecycleFixtureError('Handler did not start shutdown');
+			pending.disconnect();
+			await expect(pending.outcome).resolves.toEqual({ kind: 'closed' });
+			expect(server.listening).toBe(false);
+			await nextEventLoopTurn();
+
+			expect(
+				await Promise.race([
+					capturedStop.then(() => 'stopped' as const),
+					nextEventLoopTurn().then(() => 'pending' as const),
+				])
+			).toBe('pending');
+			expect(activeRequestCount(transport)).toBe(1);
+			expect(outstandingWorkCount(transport)).toBe(1);
+
+			controlled.release();
+			await controlled.settled;
+			await capturedStop;
+			await nextEventLoopTurn();
+
+			expect(activeRequestCount(transport)).toBe(0);
+			expect(outstandingWorkCount(transport)).toBe(0);
+		} finally {
+			controlled.release();
+			pending.disconnect();
+			await (stopState.promise ?? transport.stop(1_000));
+		}
+	});
+
+	it('does not dispatch when a later request end listener starts shutdown', async () => {
+		const controlled = createControlledProtocolServer();
+		const receive = vi.spyOn(controlled.server, 'receive');
+		const transport = transportCase.create({ requestTimeout: 1_000, stateful: false });
+		const endListenerRan = createDeferred<void>();
+		const stopState: { promise: Promise<void> | null } = { promise: null };
+		await transport.connect(controlled.server);
+		const server = getTransportServer(transport);
+		server.once('request', (request) => {
+			request.once('end', () => {
+				stopState.promise = transport.stop(1_000);
+				endListenerRan.resolve(undefined);
+			});
+		});
+		const endpoint = `http://127.0.0.1:${getListeningPort(transport)}${transportCase.path}`;
+		const pending = startWireRequest(endpoint, controlledCallBody());
+
+		try {
+			await endListenerRan.promise;
+			const capturedStop = stopState.promise;
+			if (!capturedStop) throw new LifecycleFixtureError('End listener did not start shutdown');
+			const stateAtStop = capturedStop.then(() => ({
+				receiveCount: receive.mock.calls.length,
+				activeRequests: activeRequestCount(transport),
+				acceptedWork: outstandingWorkCount(transport),
+			}));
+			pending.disconnect();
+			await pending.outcome;
+
+			expect(await stateAtStop).toEqual({
+				receiveCount: 0,
+				activeRequests: 0,
+				acceptedWork: 0,
+			});
+		} finally {
+			controlled.release();
+			pending.disconnect();
+			await (stopState.promise ?? transport.stop(1_000));
+			if (receive.mock.calls.length > 0) {
+				await controlled.settled;
+				await nextEventLoopTurn();
+			}
+		}
+	});
+});
+
+describe.each(LIFECYCLE_CASES)('$name pre-dispatch request lifecycle', (transportCase) => {
+	it('returns one 413 before a chunked oversized upload ends and never dispatches it', async () => {
+		const protocol = createProtocolServer();
+		const receive = vi.spyOn(protocol.server, 'receive');
+		const sessionIdGenerator = vi.fn(() => 'oversized-session');
+		const body = predispatchBody();
+		const transport = transportCase.create({
+			maxBodySize: body.length - 1,
+			requestTimeout: 1_000,
+			sessionIdGenerator,
+		});
+		await transport.connect(protocol.server);
+		const endpoint = `http://127.0.0.1:${getListeningPort(transport)}${transportCase.path}`;
+		const exchangePromise = observeNextRequestResponse(transport);
+		const pending = startIncompleteWireRequest(endpoint, body);
+
+		try {
+			const exchange = await exchangePromise;
+			await exchange.firstData;
+			await nextEventLoopTurn();
+
+			expect(exchange.request.headers['transfer-encoding']).toBe('chunked');
+			expect(exchange.request.headers['content-length']).toBeUndefined();
+			expect(exchange.response.writeHeadCount).toBe(1);
+			expect(exchange.response.endCount).toBe(1);
+			await expect(pending.outcome).resolves.toMatchObject({
+				kind: 'response',
+				status: 413,
+				body: expect.stringContaining('"code":-32000'),
+			});
+			pending.complete();
+			await exchange.requestSettled;
+			await nextEventLoopTurn();
+			expect(receive).not.toHaveBeenCalled();
+			expect(activeRequestCount(transport)).toBe(0);
+			expect(outstandingWorkCount(transport)).toBe(0);
+			if (transportCase.stateful) {
+				expect(sessionIdGenerator).not.toHaveBeenCalled();
+				expect(transport.clientCount).toBe(0);
+			}
+		} finally {
+			pending.complete();
+			pending.disconnect();
+			await transport.stop(1_000);
+		}
+	});
+
+	it('cancels a timed-out upload before dispatch and ignores a later body tail', async () => {
+		const protocol = createProtocolServer();
+		const receive = vi.spyOn(protocol.server, 'receive');
+		const sessionIdGenerator = vi.fn(() => 'timeout-session');
+		const body = predispatchBody();
+		const transport = transportCase.create({ requestTimeout: 20, sessionIdGenerator });
+		await transport.connect(protocol.server);
+		const endpoint = `http://127.0.0.1:${getListeningPort(transport)}${transportCase.path}`;
+		const exchangePromise = observeNextRequestResponse(transport);
+		const pending = startIncompleteWireRequest(endpoint, body.subarray(0, -1));
+
+		try {
+			const exchange = await exchangePromise;
+			await exchange.firstData;
+			await expect(pending.outcome).resolves.toMatchObject({ kind: 'response', status: 500 });
+			expect(exchange.response.writeHeadCount).toBe(1);
+			expect(exchange.response.endCount).toBe(1);
+
+			pending.complete(body.subarray(-1));
+			await exchange.requestSettled;
+			await nextEventLoopTurn();
+			expect(receive).not.toHaveBeenCalled();
+			expect(activeRequestCount(transport)).toBe(0);
+			expect(outstandingWorkCount(transport)).toBe(0);
+			if (transportCase.stateful) {
+				expect(sessionIdGenerator).not.toHaveBeenCalled();
+				expect(transport.clientCount).toBe(0);
+			}
+		} finally {
+			pending.complete(body.subarray(-1));
+			pending.disconnect();
+			await transport.stop(1_000);
+		}
+	});
+
+	it('cleans up an aborted upload without dispatch or stranded tracked work', async () => {
+		const protocol = createProtocolServer();
+		const receive = vi.spyOn(protocol.server, 'receive');
+		const sessionIdGenerator = vi.fn(() => 'aborted-session');
+		const body = predispatchBody();
+		const transport = transportCase.create({ requestTimeout: 1_000, sessionIdGenerator });
+		await transport.connect(protocol.server);
+		const endpoint = `http://127.0.0.1:${getListeningPort(transport)}${transportCase.path}`;
+		const exchangePromise = observeNextRequestResponse(transport);
+		const pending = startIncompleteWireRequest(endpoint, body.subarray(0, -1));
+
+		try {
+			const exchange = await exchangePromise;
+			await exchange.firstData;
+			const trackedBeforeAbort = outstandingWorkCount(transport);
+			pending.disconnect();
+			await expect(pending.outcome).resolves.toEqual({ kind: 'closed' });
+			await exchange.response.closed;
+			await nextEventLoopTurn();
+
+			expect(exchange.request.readableAborted).toBe(true);
+			expect(trackedBeforeAbort).toBe(0);
+			expect(receive).not.toHaveBeenCalled();
+			expect(activeRequestCount(transport)).toBe(0);
+			expect(outstandingWorkCount(transport)).toBe(0);
+			if (transportCase.stateful) {
+				expect(sessionIdGenerator).not.toHaveBeenCalled();
+				expect(transport.clientCount).toBe(0);
+			}
+		} finally {
+			pending.disconnect();
+			await transport.stop(1_000);
+		}
+	});
+
+	it(
+		'settles pre-dispatch body work when shutdown starts and never dispatches the late tail',
+		async () => {
+			const protocol = createProtocolServer();
+			const receive = vi.spyOn(protocol.server, 'receive');
+			const sessionIdGenerator = vi.fn(() => 'shutdown-session');
+			const body = predispatchBody();
+			const transport = transportCase.create({ requestTimeout: 1_000, sessionIdGenerator });
+			await transport.connect(protocol.server);
+			const endpoint = `http://127.0.0.1:${getListeningPort(transport)}${transportCase.path}`;
+			const exchangePromise = observeNextRequestResponse(transport);
+			const pending = startIncompleteWireRequest(endpoint, body.subarray(0, -1));
+			let stopPromise: Promise<void> | null = null;
+
+			try {
+				const exchange = await exchangePromise;
+				await exchange.firstData;
+				stopPromise = transport.stop(1_000);
+				await nextEventLoopTurn();
+				const activeBeforeTail = activeRequestCount(transport);
+				const trackedBeforeTail = outstandingWorkCount(transport);
+
+				pending.complete(body.subarray(-1));
+				await exchange.requestSettled;
+				await nextEventLoopTurn();
+				pending.disconnect();
+				await stopPromise;
+
+				expect(activeBeforeTail).toBe(0);
+				expect(trackedBeforeTail).toBe(0);
+				expect(receive).not.toHaveBeenCalled();
+				expect(activeRequestCount(transport)).toBe(0);
+				expect(outstandingWorkCount(transport)).toBe(0);
+				if (transportCase.stateful) {
+					expect(sessionIdGenerator).not.toHaveBeenCalled();
+					expect(transport.clientCount).toBe(0);
+				}
+			} finally {
+				pending.complete(body.subarray(-1));
+				pending.disconnect();
+				await (stopPromise ?? transport.stop(1_000));
+			}
+		}
+	);
+});
 
 describe('Streamable HTTP retained session lifecycle', () => {
 	it('rejects a delayed headerless POST that completes after shutdown begins', async () => {

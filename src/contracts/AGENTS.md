@@ -13,7 +13,7 @@ Cross-module type hub. No barrel. Import the specific file.
 |------|---------|
 | `interfaces.ts` | `IMetrics`, `IDiscoveryCache`, `IEdgeStore` (+ `pruneSession`/`clearAll`), `IOutcomeRecorder`, `IToolRegistry`, `ISessionLock` (`withLock`/`isActive`/`size`) |
 | `strategy.ts` | `IReasoningStrategy.decide` (not `decideNext`), `shouldBranch`, `shouldTerminate` |
-| `summary.ts` | `ISummaryStore` (`add`/`get`/`forSession`/`forBranch`/`clearSession`); re-exports `Summary` from core |
+| `summary.ts` | `ISummaryStore` (`add`/`get`/`forSession`/`forBranch`/`clearSession`). `Summary` value type stays in `core/compression/Summary.ts` |
 | `calibrator.ts` | `ICalibrator`, metrics/result types |
 | `suspension.ts` | `ISuspensionStore` (`suspend`/`resume`→null/`compareAndAdmit`/`peek`/`expireOlderThan`) |
 | `ids.ts` | branded IDs. Only `asSessionId()` validates. `asBranchId()` does **not**. |

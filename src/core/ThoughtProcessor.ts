@@ -52,7 +52,8 @@ import type {
 } from './thought.js';
 import type { ThoughtEvaluator } from './ThoughtEvaluator.js';
 import type { ThoughtFormatter } from './ThoughtFormatter.js';
-import type { PatternName, PatternSignal } from './reasoning.js';
+import type { PatternName } from '../contracts/reasoning-types.js';
+import type { PatternSignal } from './reasoning.js';
 import { SequentialStrategy } from './reasoning/strategies/SequentialStrategy.js';
 import type { CompressionService } from './compression/CompressionService.js';
 import { validateThoughtCrossReferences } from './CrossReferenceValidator.js';

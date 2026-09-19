@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { scoreThought } from '../../../../core/reasoning/strategies/totScoring.js';
 import type { ThoughtData } from '../../../../core/thought.js';
-import type { ThoughtType } from '../../../../core/reasoning.js';
+import type { ThoughtType } from '../../../../contracts/reasoning-types.js';
 
 function thoughtOf(
 	type: ThoughtType | undefined,

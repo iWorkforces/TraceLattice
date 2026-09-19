@@ -42,6 +42,7 @@ import {
 	createServer,
 	initializeServer,
 	type HttpTransportOptions,
+	type IToolAwareSequentialThinkingServer,
 	type ITransport,
 	type TransportKind,
 	type TransportOptions,
@@ -197,6 +198,28 @@ const _serverClass: typeof ToolAwareSequentialThinkingServer = ToolAwareSequenti
 const _serverFactory: typeof createServer = createServer;
 const _serverInitializer: typeof initializeServer = initializeServer;
 
+type _Exact<Left, Right> =
+	(<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2
+		? (<Value>() => Value extends Right ? 1 : 2) extends <Value>() => Value extends Left ? 1 : 2
+			? true
+			: false
+		: false;
+type _ExpectedDiscoveryRefresh = Promise<{ tools: number; skills: number }>;
+type _InterfaceDiscoveryRefresh = ReturnType<
+	IToolAwareSequentialThinkingServer['refreshDiscovery']
+>;
+type _ClassDiscoveryRefresh = ReturnType<
+	ToolAwareSequentialThinkingServer['refreshDiscovery']
+>;
+const _exactInterfaceDiscoveryRefresh: _Exact<
+	_InterfaceDiscoveryRefresh,
+	_ExpectedDiscoveryRefresh
+> = true;
+const _exactClassDiscoveryRefresh: _Exact<
+	_ClassDiscoveryRefresh,
+	_ExpectedDiscoveryRefresh
+> = true;
+
 type _ForbiddenRootExports = Extract<
 	'Container' | 'ServerConfig' | 'ToolRegistry' | 'SkillRegistry',
 	keyof typeof PublicApi
@@ -211,4 +234,6 @@ void _transportKind;
 void _serverClass;
 void _serverFactory;
 void _serverInitializer;
+void _exactInterfaceDiscoveryRefresh;
+void _exactClassDiscoveryRefresh;
 void _noForbiddenRootExports;

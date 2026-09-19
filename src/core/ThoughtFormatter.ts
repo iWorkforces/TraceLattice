@@ -10,7 +10,7 @@
 
 import chalk from 'chalk';
 import type { IThoughtFormatter } from './IThoughtFormatter.js';
-import type { ThoughtType } from './reasoning.js';
+import type { ThoughtType } from '../contracts/reasoning-types.js';
 import type { StepRecommendation } from './step.js';
 import type { ThoughtData } from './thought.js';
 import { assertNever } from '../utils.js';

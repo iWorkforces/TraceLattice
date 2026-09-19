@@ -14,7 +14,8 @@ import type {
 	ICalibrator,
 } from '../contracts/calibrator.js';
 import { GLOBAL_SESSION_ID, type SessionId } from '../contracts/ids.js';
-import type { ConfidenceSignals, PatternSignal, ReasoningStats, ThoughtType } from './reasoning.js';
+import type { ThoughtType } from '../contracts/reasoning-types.js';
+import type { ConfidenceSignals, PatternSignal, ReasoningStats } from './reasoning.js';
 import type { ThoughtData } from './thought.js';
 import { Aggregator } from './evaluator/Aggregator.js';
 import { PatternDetector } from './evaluator/PatternDetector.js';

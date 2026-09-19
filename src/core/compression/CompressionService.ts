@@ -13,7 +13,8 @@
  * @module core/compression/CompressionService
  */
 
-import type { ISummaryStore, Summary } from '../../contracts/summary.js';
+import type { ISummaryStore } from '../../contracts/summary.js';
+import type { Summary } from './Summary.js';
 import type { IEdgeStore } from '../../contracts/interfaces.js';
 import type { Logger } from '../../logger/StructuredLogger.js';
 import type { HistorySessionSnapshot, IHistoryManager } from '../IHistoryManager.js';

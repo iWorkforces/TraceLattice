@@ -36,7 +36,7 @@ Not `listForBranch`. Also `clearAll` / `size` on the contract.
 - **Idempotent** on `(branchId, rootThoughtId)` — existing summary returned unchanged.
 - **Additive**: writes a `Summary`; does **not** dehydrate or mutate history. Caller dehydrates.
 - Covered set = root + `GraphView.descendants` (all edge kinds).
-- Lookup is `historyManager.getHistory()` **only**. Branch-only nodes (not on main history) **drop out**.
+- Lookup is `historyManager.inspectSession()` — main history first, then branch copies. Branch-only nodes can be covered.
 
 Deterministic reducers:
 
@@ -48,5 +48,5 @@ Deterministic reducers:
 `keepLastK` (default **50**) over the **main history array** — not frontier distance.
 
 - Last K thoughts stay verbatim.
-- Cold prefix: thoughts whose `thought_number` sits in a summary `coveredRange` collapse to one `SummaryRef` per summary.
+- Cold prefix: thoughts whose `id` is in a summary `coveredIds` collapse to one `SummaryRef` per summary. Match by **id**, not `coveredRange`.
 - Uncovered cold thoughts stay verbatim. Non-mutating. `Date.now()` is not a policy input.

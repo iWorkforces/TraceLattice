@@ -24,7 +24,7 @@ import {
 	createMetaThought,
 } from '../helpers/factories.js';
 import type { ThoughtData } from '../../core/thought.js';
-import type { ThoughtType } from '../../core/reasoning.js';
+import type { ThoughtType } from '../../contracts/reasoning-types.js';
 
 // === Fixture builders =====================================================
 

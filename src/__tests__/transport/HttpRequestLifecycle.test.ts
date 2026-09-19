@@ -1,8 +1,28 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
+	AcceptedWorkTracker,
 	LIFECYCLE_REPORTING_FAILURE_CAPACITY,
 	LifecycleFailureReporter,
+	PreDispatchTracker,
 } from '../../transport/HttpRequestLifecycle.js';
+
+describe('AcceptedWorkTracker', () => {
+	it('refuses canceled pre-dispatch work without leaving a reservation', async () => {
+		const preDispatch = new PreDispatchTracker();
+		const acceptedWork = new AcceptedWorkTracker(new LifecycleFailureReporter(() => undefined));
+		const lease = preDispatch.acquire();
+		if (!lease) throw new TypeError('Pre-dispatch lease was not acquired');
+		lease.cancel('shutdown');
+		const start = vi.fn(() => Promise.resolve());
+
+		expect(() => acceptedWork.transfer(lease, start)).toThrowError(DOMException);
+		expect(start).not.toHaveBeenCalled();
+		await expect(acceptedWork.join()).resolves.toBeUndefined();
+
+		lease.release();
+		await preDispatch.join();
+	});
+});
 
 describe('LifecycleFailureReporter', () => {
 	it('retains only the newest reporting failures after capacity is exceeded', () => {

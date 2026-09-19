@@ -343,6 +343,101 @@ describe('Discovery refresh integration', () => {
 		expect(server.skills.getSkill('stable-skill')?.description).toBe('stable');
 		expect(server.tools.getTool('stable-tool')?.description).toBe('stable');
 	});
+
+	it('refreshes real files with lazy startup and watchers disabled', async () => {
+		// Given
+		const skillDir = join(rootDir, 'lazy-skills');
+		const toolDir = join(rootDir, 'lazy-tools');
+		await Promise.all([mkdir(skillDir), mkdir(toolDir)]);
+		await Promise.all([
+			writeFile(join(skillDir, 'filesystem.md'), skillDocument('filesystem-skill', 'fresh'), 'utf8'),
+			writeFile(
+				join(toolDir, 'filesystem.tool.md'),
+				toolDocument('filesystem-tool', 'fresh'),
+				'utf8'
+			),
+		]);
+		const server = await createServer({
+			config: new ServerConfig({
+				skillDirs: [skillDir],
+				toolDirs: [toolDir],
+				features: { toolInterleave: false },
+			}),
+			enableWatcher: false,
+			autoDiscover: true,
+			lazyDiscovery: true,
+			loadFromPersistence: false,
+		});
+		activeServers.push(server);
+		expect(server.skills.hasSkill('filesystem-skill')).toBe(false);
+		expect(server.tools.hasTool('filesystem-tool')).toBe(false);
+
+		// When
+		const result = await server.refreshDiscovery();
+
+		// Then
+		expect(result).toEqual({ tools: 1, skills: 1 });
+		expect(server.skills.getSkill('filesystem-skill')?.description).toBe('fresh');
+		expect(server.tools.getTool('filesystem-tool')?.description).toBe('fresh');
+	});
+
+	it('preserves last-known-good, manual precedence, and the built-in while reporting file counts', async () => {
+		// Given
+		const skillDir = join(rootDir, 'precedence-skills');
+		const toolDir = join(rootDir, 'precedence-tools');
+		const stableSkillPath = join(skillDir, 'stable.md');
+		const stableToolPath = join(toolDir, 'stable.tool.md');
+		await Promise.all([mkdir(skillDir), mkdir(toolDir)]);
+		await Promise.all([
+			writeFile(stableSkillPath, skillDocument('stable-skill', 'stable'), 'utf8'),
+			writeFile(join(skillDir, 'manual.md'), skillDocument('manual-skill', 'filesystem'), 'utf8'),
+			writeFile(stableToolPath, toolDocument('stable-tool', 'stable'), 'utf8'),
+			writeFile(
+				join(toolDir, 'manual.tool.md'),
+				toolDocument('manual-tool', 'filesystem'),
+				'utf8'
+			),
+			writeFile(
+				join(toolDir, 'built-in.tool.md'),
+				toolDocument('sequentialthinking_tools', 'filesystem'),
+				'utf8'
+			),
+		]);
+		const server = await createServer({
+			config: new ServerConfig({
+				skillDirs: [skillDir],
+				toolDirs: [toolDir],
+				features: { toolInterleave: false },
+			}),
+			enableWatcher: false,
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		activeServers.push(server);
+		server.skills.addSkill({
+			name: 'manual-skill',
+			description: 'manual',
+			user_invocable: false,
+		});
+		server.tools.addTool({ name: 'manual-tool', description: 'manual', inputSchema: {} });
+		await expect(server.refreshDiscovery()).resolves.toEqual({ tools: 1, skills: 1 });
+		await Promise.all([
+			writeFile(stableSkillPath, '---\n: invalid: [yaml\n---\n# Body', 'utf8'),
+			writeFile(stableToolPath, '---\n: invalid: [yaml\n---\n# Body', 'utf8'),
+		]);
+
+		// When
+		const result = await server.refreshDiscovery();
+
+		// Then
+		expect(result).toEqual({ tools: 1, skills: 1 });
+		expect(server.skills.getSkill('stable-skill')?.description).toBe('stable');
+		expect(server.tools.getTool('stable-tool')?.description).toBe('stable');
+		expect(server.skills.getSkill('manual-skill')?.description).toBe('manual');
+		expect(server.tools.getTool('manual-tool')?.description).toBe('manual');
+		expect(server.tools.hasTool('sequentialthinking_tools')).toBe(true);
+		expect(server.tools.getTool('sequentialthinking_tools')?.description).not.toBe('filesystem');
+	});
 });
 
 async function waitForEvent(watcher: FSWatcher, event: 'add'): Promise<void> {

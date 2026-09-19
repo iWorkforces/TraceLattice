@@ -9,7 +9,7 @@ import { asBranchId } from '../../contracts/ids.js';
  * break the thought pipeline.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import { ThoughtProcessor } from '../../core/ThoughtProcessor.js';
 import { ThoughtFormatter } from '../../core/ThoughtFormatter.js';
@@ -19,6 +19,7 @@ import { EdgeStore } from '../../core/graph/EdgeStore.js';
 import { CompressionService } from '../../core/compression/CompressionService.js';
 import { InMemorySummaryStore } from '../../core/compression/InMemorySummaryStore.js';
 import { DehydrationPolicy } from '../../core/compression/DehydrationPolicy.js';
+import { TreeOfThoughtStrategy } from '../../core/reasoning/strategies/TreeOfThoughtStrategy.js';
 import { NullLogger } from '../../logger/NullLogger.js';
 import type {
 	IReasoningStrategy,
@@ -265,6 +266,199 @@ describe('Compression Auto-Trigger Integration', () => {
 		};
 		expect(parsed.thought_number).toBe(2);
 		expect(parsed.next_thought_needed).toBe(false);
+	});
+
+	it('compresses a branch when ToT reaches its depth cap and compression is enabled', async () => {
+		// Given
+		const processor = new ThoughtProcessor(
+			deps.history,
+			deps.formatter,
+			deps.evaluator,
+			deps.logger,
+			new TreeOfThoughtStrategy({
+				depthCap: 1,
+				terminationConfidence: 1,
+				plateauWindow: 10,
+			}),
+			deps.compression
+		);
+		await processor.process(
+			createTestThought({
+				thought: 'depth root',
+				thought_number: 1,
+				total_thoughts: 2,
+				next_thought_needed: true,
+				confidence: 0.1,
+			})
+		);
+
+		// When
+		const result = await processor.process(
+			createTestThought({
+				thought: 'depth branch terminal',
+				thought_number: 2,
+				total_thoughts: 2,
+				next_thought_needed: true,
+				branch_from_thought: 1,
+				branch_id: asBranchId('depth-enabled'),
+				confidence: 0.2,
+			})
+		);
+
+		// Then
+		const parsed = JSON.parse(result.content[0]!.text) as {
+			readonly strategy_hint?: StrategyDecision;
+		};
+		expect(parsed.strategy_hint).toEqual({ action: 'terminate', reason: 'depth cap' });
+		expect(deps.summaryStore.forBranch(GLOBAL_SESSION_ID, asBranchId('depth-enabled'))).toHaveLength(
+			1
+		);
+	});
+
+	it('does not compress a depth-capped branch when compression is disabled', async () => {
+		// Given
+		const processor = new ThoughtProcessor(
+			deps.history,
+			deps.formatter,
+			deps.evaluator,
+			deps.logger,
+			new TreeOfThoughtStrategy({
+				depthCap: 1,
+				terminationConfidence: 1,
+				plateauWindow: 10,
+			})
+		);
+		await processor.process(
+			createTestThought({
+				thought: 'disabled depth root',
+				thought_number: 1,
+				total_thoughts: 2,
+				next_thought_needed: true,
+			})
+		);
+
+		// When
+		const result = await processor.process(
+			createTestThought({
+				thought: 'disabled depth branch',
+				thought_number: 2,
+				total_thoughts: 2,
+				next_thought_needed: true,
+				branch_from_thought: 1,
+				branch_id: asBranchId('depth-disabled'),
+			})
+		);
+
+		// Then
+		const parsed = JSON.parse(result.content[0]!.text) as {
+			readonly strategy_hint?: StrategyDecision;
+		};
+		expect(parsed.strategy_hint).toEqual({ action: 'terminate', reason: 'depth cap' });
+		expect(deps.summaryStore.size()).toBe(0);
+	});
+
+	it('keeps ToT depth-cap auto-compression idempotent for the same branch root', async () => {
+		// Given
+		const branchId = asBranchId('depth-idempotent');
+		const processor = new ThoughtProcessor(
+			deps.history,
+			deps.formatter,
+			deps.evaluator,
+			deps.logger,
+			new TreeOfThoughtStrategy({
+				depthCap: 1,
+				terminationConfidence: 1,
+				plateauWindow: 10,
+			}),
+			deps.compression
+		);
+		await processor.process(
+			createTestThought({
+				thought: 'idempotent root',
+				thought_number: 1,
+				total_thoughts: 3,
+				next_thought_needed: true,
+			})
+		);
+		await processor.process(
+			createTestThought({
+				thought: 'idempotent branch one',
+				thought_number: 2,
+				total_thoughts: 3,
+				next_thought_needed: true,
+				branch_from_thought: 1,
+				branch_id: branchId,
+			})
+		);
+		const firstSummary = deps.summaryStore.forBranch(GLOBAL_SESSION_ID, branchId)[0];
+
+		// When
+		await processor.process(
+			createTestThought({
+				thought: 'idempotent branch two',
+				thought_number: 3,
+				total_thoughts: 3,
+				next_thought_needed: true,
+				branch_from_thought: 2,
+				branch_id: branchId,
+			})
+		);
+
+		// Then
+		const summaries = deps.summaryStore.forBranch(GLOBAL_SESSION_ID, branchId);
+		expect(summaries).toHaveLength(1);
+		expect(summaries[0]?.id).toBe(firstSummary?.id);
+	});
+
+	it('contains compression failure after a ToT depth-cap termination', async () => {
+		// Given
+		const compressBranch = vi
+			.spyOn(deps.compression, 'compressBranch')
+			.mockImplementation(() => {
+				throw new Error('depth compression failure');
+			});
+		const processor = new ThoughtProcessor(
+			deps.history,
+			deps.formatter,
+			deps.evaluator,
+			deps.logger,
+			new TreeOfThoughtStrategy({
+				depthCap: 1,
+				terminationConfidence: 1,
+				plateauWindow: 10,
+			}),
+			deps.compression
+		);
+		await processor.process(
+			createTestThought({
+				thought: 'failure root',
+				thought_number: 1,
+				total_thoughts: 2,
+				next_thought_needed: true,
+			})
+		);
+
+		// When
+		const result = await processor.process(
+			createTestThought({
+				thought: 'failure branch',
+				thought_number: 2,
+				total_thoughts: 2,
+				next_thought_needed: true,
+				branch_from_thought: 1,
+				branch_id: asBranchId('depth-failure'),
+			})
+		);
+
+		// Then
+		const parsed = JSON.parse(result.content[0]!.text) as {
+			readonly thought_number: number;
+			readonly strategy_hint?: StrategyDecision;
+		};
+		expect(compressBranch).toHaveBeenCalledOnce();
+		expect(result.isError).toBeUndefined();
+		expect(parsed.thought_number).toBe(2);
+		expect(parsed.strategy_hint).toEqual({ action: 'terminate', reason: 'depth cap' });
 	});
 });
 

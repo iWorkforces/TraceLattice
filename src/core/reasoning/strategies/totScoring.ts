@@ -15,7 +15,8 @@
  */
 
 import type { ThoughtData } from '../../thought.js';
-import type { ConfidenceSignals, ThoughtType } from '../../reasoning.js';
+import type { ThoughtType } from '../../../contracts/reasoning-types.js';
+import type { ConfidenceSignals } from '../../reasoning.js';
 import type { GraphView } from '../../graph/GraphView.js';
 import type { SessionId, ThoughtId } from '../../../contracts/ids.js';
 import { assertNever } from '../../../utils.js';

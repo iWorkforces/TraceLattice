@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import type { ThoughtType, ConfidenceSignals, ReasoningStats } from '../core/reasoning.js';
+import type { ThoughtType } from '../contracts/reasoning-types.js';
+import type { ConfidenceSignals, ReasoningStats } from '../core/reasoning.js';
 
 describe('Reasoning Types', () => {
 	describe('ThoughtType', () => {

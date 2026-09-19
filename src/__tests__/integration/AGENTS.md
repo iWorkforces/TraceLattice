@@ -4,7 +4,7 @@
 
 ## OVERVIEW
 
-Cross-module + child-process harnesses. 34 files. New multi-module work goes HERE, not suite root. Unit facets stay in `core/`, `compression/`, `strategies/`. Battle scoring stays in `eval/`.
+Cross-module + child-process harnesses. 35 files. New multi-module work goes HERE, not suite root. Unit facets stay in `core/`, `compression/`, `strategies/`. Battle scoring stays in `eval/`.
 
 ## CLUSTERS
 

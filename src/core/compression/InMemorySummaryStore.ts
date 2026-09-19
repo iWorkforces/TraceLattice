@@ -13,7 +13,8 @@
  */
 
 import { SequentialThinkingError } from '../../errors.js';
-import type { ISummaryStore, Summary } from '../../contracts/summary.js';
+import type { ISummaryStore } from '../../contracts/summary.js';
+import type { Summary } from './Summary.js';
 import {
 	asBranchId,
 	asSessionId,

@@ -23,6 +23,7 @@ graph/
 | New kind | `Edge.ts` + emit arm in `EdgeEmitter` |
 | Mutate graph | `EdgeEmitter` → `EdgeStore.addEdge` |
 | Walk / frontier | `GraphView` |
+| Root distance | `GraphView.depthFromRoots` — ToT `depthCap` |
 | Retention prune | `EdgeStore.pruneSession` |
 
 ## EDGE KINDS (8)
@@ -47,7 +48,8 @@ Read-only. Returns **ids only**. Live / uncached (no snapshot).
 
 - Isolated thoughts (zero edges) are **invisible** — nodes come from edges.
 - `branchThoughts` follows `kind === 'branch'` only (includes root).
-- `descendants` / `ancestors` follow **all** kinds (excludes start).
+- `descendants` / `ancestors` / `depthFromRoots` follow **all** kinds.
+- `depthFromRoots`: 0 at a root; `undefined` if unreachable or isolated. Used by ToT `depthCap` (default 8).
 - `leaves` = nodes with no outgoing. Empty store → `[]`.
 - `topological` = Kahn; leftover nodes → `CycleDetectedError`.
 

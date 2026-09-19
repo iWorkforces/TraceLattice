@@ -15,7 +15,8 @@
  * @module core/compression/DehydrationPolicy
  */
 
-import type { ISummaryStore, Summary } from '../../contracts/summary.js';
+import type { ISummaryStore } from '../../contracts/summary.js';
+import type { Summary } from './Summary.js';
 import type { ThoughtData } from '../thought.js';
 import type { SessionId, ThoughtId } from '../../contracts/ids.js';
 

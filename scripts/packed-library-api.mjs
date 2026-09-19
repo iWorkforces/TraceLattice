@@ -8,7 +8,10 @@ const FORCE_CLOSE_MS = 5_000;
 const STAGE = { packSucceeded: true, installSucceeded: true };
 
 const runtimeConsumer = `import { strict as assert } from 'node:assert';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer as createNodeServer, request } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import * as PublicApi from '@iworkforces/tracelattice';
 
 assert.equal(typeof PublicApi.HttpTransport, 'function');
@@ -37,6 +40,54 @@ try {
   deepImportBlocked = true;
 }
 assert.equal(deepImportBlocked, true);
+
+const discoveryRoot = await mkdtemp(join(tmpdir(), 'tracelattice-packed-discovery-'));
+const skillDir = join(discoveryRoot, 'skills');
+const toolDir = join(discoveryRoot, 'tools');
+const silentLogger = {
+  info() {},
+  warn() {},
+  error() {},
+  debug() {},
+  setLevel() {},
+  getLevel() { return 'info'; },
+};
+let discoveryServer;
+try {
+  await Promise.all([mkdir(skillDir), mkdir(toolDir)]);
+  await Promise.all([
+    writeFile(
+      join(skillDir, 'packed.md'),
+      '---\\nname: packed-skill\\ndescription: installed runtime\\n---\\n# Body',
+      'utf8'
+    ),
+    writeFile(
+      join(toolDir, 'packed.tool.md'),
+      '---\\nname: packed-tool\\ndescription: installed runtime\\ninputSchema:\\n  type: object\\n---\\n# Body',
+      'utf8'
+    ),
+  ]);
+  discoveryServer = await PublicApi.createServer({
+    logger: silentLogger,
+    fileConfig: {
+      skillDirs: [skillDir],
+      toolDirs: [toolDir],
+      features: { toolInterleave: false },
+    },
+    enableWatcher: false,
+    autoDiscover: false,
+    lazyDiscovery: true,
+    loadFromPersistence: false,
+  });
+  assert.equal(typeof discoveryServer.refreshDiscovery, 'function');
+  const firstRefresh = discoveryServer.refreshDiscovery();
+  const concurrentRefresh = discoveryServer.refreshDiscovery();
+  assert.equal(concurrentRefresh, firstRefresh);
+  assert.deepEqual(await firstRefresh, { tools: 1, skills: 1 });
+} finally {
+  if (discoveryServer) await discoveryServer.dispose();
+  await rm(discoveryRoot, { recursive: true, force: true });
+}
 
 const reservation = createNodeServer();
 await new Promise((resolve, reject) => {
@@ -126,6 +177,7 @@ const declarationConsumer = `import {
   createServer,
   initializeServer,
   type HttpTransportOptions,
+  type IToolAwareSequentialThinkingServer,
   type ITransport,
   type TransportKind,
   type TransportOptions,
@@ -143,12 +195,37 @@ const kind: TransportKind = factoryTransport.kind;
 const serverClass: typeof ToolAwareSequentialThinkingServer = ToolAwareSequentialThinkingServer;
 const serverFactory: typeof createServer = createServer;
 const serverInitializer: typeof initializeServer = initializeServer;
+type Exact<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends
+  (<Value>() => Value extends Right ? 1 : 2)
+    ? (<Value>() => Value extends Right ? 1 : 2) extends
+      (<Value>() => Value extends Left ? 1 : 2)
+      ? true
+      : false
+    : false;
+type ExpectedDiscoveryRefresh = Promise<{ tools: number; skills: number }>;
+type InterfaceDiscoveryRefresh = ReturnType<
+  IToolAwareSequentialThinkingServer['refreshDiscovery']
+>;
+type ClassDiscoveryRefresh = ReturnType<
+  ToolAwareSequentialThinkingServer['refreshDiscovery']
+>;
+const exactInterfaceDiscoveryRefresh: Exact<
+  InterfaceDiscoveryRefresh,
+  ExpectedDiscoveryRefresh
+> = true;
+const exactClassDiscoveryRefresh: Exact<
+  ClassDiscoveryRefresh,
+  ExpectedDiscoveryRefresh
+> = true;
 
 void classTransport;
 void kind;
 void serverClass;
 void serverFactory;
 void serverInitializer;
+void exactInterfaceDiscoveryRefresh;
+void exactClassDiscoveryRefresh;
 `;
 
 async function runCommand(command, args, options) {

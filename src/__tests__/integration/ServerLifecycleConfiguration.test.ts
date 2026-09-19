@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConfigLoader } from '../../config/ConfigLoader.js';
+import { SessionLifecycleClosedError } from '../../core/SessionErrors.js';
 import { InMemorySuspensionStore } from '../../core/tools/InMemorySuspensionStore.js';
 import { Container } from '../../di/Container.js';
 import { ConfigurationError, PersistenceUnavailableError } from '../../errors.js';
@@ -374,6 +375,130 @@ describe('watcher cleanup ownership', () => {
 
 		expect(skillReady).not.toHaveBeenCalled();
 		expect(toolReady).not.toHaveBeenCalled();
+	});
+
+	it('closes public refresh admission and joins accepted work before idempotent cleanup', async () => {
+		// Given
+		const toolRefresh = Promise.withResolvers<number>();
+		const skillRefresh = Promise.withResolvers<number>();
+		const server = await createServer({
+			config: new ServerConfig({
+				skillDirs: [],
+				toolDirs: [],
+				persistence: { enabled: true, backend: 'memory' },
+				features: { toolInterleave: false },
+			}),
+			enableWatcher: true,
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		vi.spyOn(server.tools, 'refreshAsync').mockReturnValue(toolRefresh.promise);
+		vi.spyOn(server.skills, 'refreshAsync').mockReturnValue(skillRefresh.promise);
+		const skillStop = vi.spyOn(SkillWatcher.prototype, 'stop');
+		const toolStop = vi.spyOn(ToolWatcher.prototype, 'stop');
+		const historyShutdown = vi.spyOn(server.history, 'shutdownWithinLifecycle');
+		const persistence = server.getContainer().resolve('Persistence');
+		if (persistence === null) throw new TypeError('Expected configured memory persistence');
+		const persistenceClose = vi.spyOn(persistence, 'close');
+		const clearLiveState = vi.spyOn(server.history, 'clearLiveStateAfterShutdown');
+		const containerDispose = vi.spyOn(server.getContainer(), 'dispose');
+
+		try {
+			// When
+			const acceptedRefresh = server.refreshDiscovery();
+			const firstStop = server.stop();
+			const secondStop = server.stop();
+			const firstDispose = server.dispose();
+			const secondDispose = server.dispose();
+			let stopSettled = false;
+			let disposeSettled = false;
+			void firstStop.then(() => {
+				stopSettled = true;
+			});
+			void firstDispose.then(() => {
+				disposeSettled = true;
+			});
+			const rejectedRefresh = server.refreshDiscovery();
+			await Promise.resolve();
+
+			// Then
+			expect(secondStop).toBe(firstStop);
+			expect(secondDispose).toBe(firstDispose);
+			expect(stopSettled).toBe(false);
+			expect(disposeSettled).toBe(false);
+			await expect(rejectedRefresh).rejects.toBeInstanceOf(SessionLifecycleClosedError);
+			await expect(rejectedRefresh).rejects.toMatchObject({ phase: 'shutting_down' });
+			expect(server.tools.refreshAsync).toHaveBeenCalledOnce();
+			expect(server.skills.refreshAsync).toHaveBeenCalledOnce();
+
+			toolRefresh.resolve(2);
+			skillRefresh.resolve(3);
+			await expect(acceptedRefresh).resolves.toEqual({ tools: 2, skills: 3 });
+			await firstStop;
+			await firstDispose;
+
+			expect(skillStop).toHaveBeenCalledOnce();
+			expect(toolStop).toHaveBeenCalledOnce();
+			expect(historyShutdown).toHaveBeenCalledOnce();
+			expect(persistenceClose).toHaveBeenCalledOnce();
+			expect(clearLiveState).toHaveBeenCalledOnce();
+			expect(containerDispose).toHaveBeenCalledOnce();
+		} finally {
+			toolRefresh.resolve(2);
+			skillRefresh.resolve(3);
+			await server.dispose();
+		}
+	});
+
+	it('finishes remaining shutdown cleanup after an accepted refresh fails', async () => {
+		// Given
+		const failure = new Error('injected accepted refresh failure');
+		const toolRefresh = Promise.withResolvers<number>();
+		const skillRefresh = Promise.withResolvers<number>();
+		const server = await createServer({
+			config: new ServerConfig({
+				skillDirs: [],
+				toolDirs: [],
+				persistence: { enabled: true, backend: 'memory' },
+				features: { toolInterleave: false },
+			}),
+			enableWatcher: false,
+			autoDiscover: false,
+			loadFromPersistence: false,
+		});
+		vi.spyOn(server.tools, 'refreshAsync').mockReturnValue(toolRefresh.promise);
+		vi.spyOn(server.skills, 'refreshAsync').mockReturnValue(skillRefresh.promise);
+		const historyShutdown = vi.spyOn(server.history, 'shutdownWithinLifecycle');
+		const persistence = server.getContainer().resolve('Persistence');
+		if (persistence === null) throw new TypeError('Expected configured memory persistence');
+		const persistenceClose = vi.spyOn(persistence, 'close');
+		const clearLiveState = vi.spyOn(server.history, 'clearLiveStateAfterShutdown');
+
+		try {
+			// When
+			const refreshOutcome = server.refreshDiscovery().then(
+				(value: { tools: number; skills: number }) => ({ kind: 'resolved' as const, value }),
+				(error: unknown) => ({ kind: 'rejected' as const, error })
+			);
+			const stopping = server.stop();
+			toolRefresh.reject(failure);
+			await Promise.resolve();
+
+			// Then
+			expect(historyShutdown).not.toHaveBeenCalled();
+			skillRefresh.resolve(1);
+			expect(await refreshOutcome).toEqual({ kind: 'rejected', error: failure });
+			await expect(stopping).rejects.toMatchObject({
+				errors: [failure],
+			});
+			expect(historyShutdown).toHaveBeenCalledOnce();
+			expect(persistenceClose).toHaveBeenCalledOnce();
+			expect(clearLiveState).not.toHaveBeenCalled();
+		} finally {
+			toolRefresh.resolve(0);
+			skillRefresh.resolve(1);
+			await expect(server.dispose()).rejects.toBeInstanceOf(AggregateError);
+		}
 	});
 
 	it('starts and stops with explicitly empty watcher roots', async () => {

@@ -46,6 +46,7 @@ Reasoning engine: ingest → graph mutation → quality signals → strategy. `H
 - Backtrack is append-only (`retracted: true`). Evaluator filters retracted.
 - `clear()` throws `AsyncResetRequiredError` if persistence is on or a lock is held.
 - Restored sessions (`provenance: 'restored'`) deny owner-aware access.
-- Processor constructor `DEFAULT_FLAGS` are **off**; production flags come from `ServerConfig` (on).
-- Hint cooldown `Map<SessionId, Map<PatternName, number>>` **survives** `reset_state`.
+- Processor ctor default is imported `DEFAULT_FLAGS` — **all on**. JSDoc saying “off” is stale. Tests that need off must pass explicit flags.
+- Hint cooldown `Map<SessionId, Map<PatternName, number>>` is wiped by production exclusive reset via `clearSessionAuxiliaryState`. Survives only mocks that skip that callback.
 - `ISessionLock` is `withLock` / `isActive` / `size` — not acquire/release. `@internal` — only HM / processor / DI.
+- ToT `depthCap` (default 8) uses `GraphView.depthFromRoots`. Isolated thoughts are invisible to the graph.

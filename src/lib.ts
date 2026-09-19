@@ -28,6 +28,7 @@ import { createReasoningStrategy } from './core/reasoning/strategies/StrategyFac
 import { ThoughtFormatter } from './core/ThoughtFormatter.js';
 import { ThoughtProcessor, type CallToolResult } from './core/ThoughtProcessor.js';
 import { SessionLock } from './core/SessionLock.js';
+import { SessionLifecycleClosedError } from './core/SessionErrors.js';
 import { SessionLifecycleCoordinator } from './core/SessionLifecycleCoordinator.js';
 import { Container } from './di/Container.js';
 import { StructuredLogger } from './logger/StructuredLogger.js';
@@ -39,11 +40,13 @@ import { ToolRegistry } from './registry/ToolRegistry.js';
 import { ServerConfig } from './ServerConfig.js';
 import { SkillWatcher } from './watchers/SkillWatcher.js';
 import { ToolWatcher } from './watchers/ToolWatcher.js';
+import { HttpTransport, createHttpTransport } from './transport/HttpTransport.js';
+import type { HttpTransportOptions } from './transport/HttpTransport.js';
+import type { TransportOptions } from './transport/BaseTransport.js';
+import type { ITransport, TransportKind } from './contracts/transport.js';
 
-export { HttpTransport, createHttpTransport } from './transport/HttpTransport.js';
-export type { HttpTransportOptions } from './transport/HttpTransport.js';
-export type { TransportOptions } from './transport/BaseTransport.js';
-export type { ITransport, TransportKind } from './contracts/transport.js';
+export { HttpTransport, createHttpTransport };
+export type { HttpTransportOptions, TransportOptions, ITransport, TransportKind };
 
 export interface ServerOptions {
 	maxHistorySize?: number;
@@ -129,6 +132,9 @@ export interface IToolAwareSequentialThinkingServer extends IDisposable {
 	 * @returns The number of skills discovered
 	 */
 	discoverSkillsAsync(): Promise<number>;
+
+	/** Rescan configured tool and skill directories. */
+	refreshDiscovery(): Promise<{ tools: number; skills: number }>;
 
 	/**
 	 * Get all branches from the history manager.
@@ -260,6 +266,8 @@ export class ToolAwareSequentialThinkingServer
 	private _skillWatcher: SkillWatcher | null = null;
 	private _toolWatcher: ToolWatcher | null = null;
 	private _config: ServerConfig;
+	private _acceptingDiscoveryRefreshes = true;
+	private _refreshPromise: Promise<{ tools: number; skills: number }> | null = null;
 	private _stopPromise: Promise<void> | null = null;
 	private _disposePromise: Promise<void> | null = null;
 
@@ -628,6 +636,37 @@ export class ToolAwareSequentialThinkingServer
 		return discovered;
 	}
 
+	/** Rescan configured tool and skill directories. */
+	public refreshDiscovery(): Promise<{ tools: number; skills: number }> {
+		if (!this._acceptingDiscoveryRefreshes) {
+			return Promise.reject(new SessionLifecycleClosedError(undefined, 'shutting_down'));
+		}
+		if (this._refreshPromise !== null) return this._refreshPromise;
+
+		const refreshPromise = Promise.allSettled([
+			this.tools.refreshAsync(),
+			this.skills.refreshAsync(),
+		]).then(([toolResult, skillResult]) => {
+			if (toolResult.status === 'rejected') {
+				if (skillResult.status === 'rejected') {
+					throw new AggregateError(
+						[toolResult.reason, skillResult.reason],
+						'Failed to refresh tool and skill discovery'
+					);
+				}
+				throw toolResult.reason;
+			}
+			if (skillResult.status === 'rejected') throw skillResult.reason;
+			return { tools: toolResult.value, skills: skillResult.value };
+		});
+		this._refreshPromise = refreshPromise;
+		const clearRefreshPromise = (): void => {
+			if (this._refreshPromise === refreshPromise) this._refreshPromise = null;
+		};
+		void refreshPromise.then(clearRefreshPromise, clearRefreshPromise);
+		return refreshPromise;
+	}
+
 	/**
 	 * Get all branches from the history manager
 	 * @returns Record<string, ThoughtData[]> - Map of branch IDs to thought arrays
@@ -654,14 +693,17 @@ export class ToolAwareSequentialThinkingServer
 	 * Closes persistence backend gracefully to ensure data is flushed.
 	 */
 	public stop(): Promise<void> {
+		this._acceptingDiscoveryRefreshes = false;
 		if (this._stopPromise) return this._stopPromise;
+		const acceptedRefresh = this._refreshPromise;
 		this._stopPromise = this._container.resolve('sessionLifecycle').shutdown(async () => {
 			const failures: unknown[] = [];
-			const watcherResults = await Promise.allSettled([
+			const [skillWatcherResult, toolWatcherResult, refreshResult] = await Promise.allSettled([
 				this._skillWatcher?.stop() ?? Promise.resolve(),
 				this._toolWatcher?.stop() ?? Promise.resolve(),
+				acceptedRefresh ?? Promise.resolve(),
 			]);
-			for (const result of watcherResults) {
+			for (const result of [skillWatcherResult, toolWatcherResult]) {
 				switch (result.status) {
 					case 'fulfilled':
 						break;
@@ -674,6 +716,18 @@ export class ToolAwareSequentialThinkingServer
 					default:
 						assertNever(result);
 				}
+			}
+			switch (refreshResult.status) {
+				case 'fulfilled':
+					break;
+				case 'rejected':
+					appendCleanupFailure(failures, refreshResult.reason);
+					this._logger.error('Error refreshing discovery during shutdown', {
+						error: getErrorMessage(refreshResult.reason),
+					});
+					break;
+				default:
+					assertNever(refreshResult);
 			}
 
 			// Stop suspension store sweeper if registered

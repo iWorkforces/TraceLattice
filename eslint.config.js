@@ -23,7 +23,21 @@ export default [
 			'@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
 			'@typescript-eslint/no-explicit-any': 'warn',
 			'@typescript-eslint/consistent-type-imports': ['error', { prefer: 'type-imports', fixStyle: 'separate-type-imports' }],
-			'no-restricted-syntax': ['error', { selector: "TSAsExpression[typeAnnotation.typeName.name='SessionId']", message: 'Use asSessionId() from contracts/ids.ts instead of raw as SessionId cast.' }],
+			'no-restricted-syntax': [
+				'error',
+				{
+					selector: "TSAsExpression[typeAnnotation.typeName.name='SessionId']",
+					message: 'Use asSessionId() from contracts/ids.ts instead of raw as SessionId cast.',
+				},
+				{
+					selector: 'ExportAllDeclaration',
+					message: 'Do not re-export. Import the canonical module instead.',
+				},
+				{
+					selector: 'ExportNamedDeclaration[source]',
+					message: 'Do not re-export. Import the canonical module, then export local bindings.',
+				},
+			],
 		},
 	},
 	{

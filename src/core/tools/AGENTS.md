@@ -31,7 +31,7 @@ Contract: `src/contracts/suspension.ts`.
 
 ## DEFAULTS
 
-- TTL **300_000** ms.
+- Direct construct TTL **300_000** ms. Wired `ServerConfig` defaults TTL/sweep **60_000** ms.
 - Sweep **60_000** ms.
 - Per-record TTL, not per-session.
 

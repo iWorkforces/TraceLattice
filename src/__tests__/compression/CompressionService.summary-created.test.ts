@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { asBranchId } from '../../contracts/ids.js';
-import type { Summary } from '../../contracts/summary.js';
+import type { Summary } from '../../core/compression/Summary.js';
 import { CompressionService } from '../../core/compression/CompressionService.js';
 import { InMemorySummaryStore } from '../../core/compression/InMemorySummaryStore.js';
 import { EdgeStore } from '../../core/graph/EdgeStore.js';

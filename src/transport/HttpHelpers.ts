@@ -9,6 +9,11 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { StringDecoder } from 'node:string_decoder';
+
+export class RequestBodyAbortedError extends Error {
+	override readonly name = 'RequestBodyAbortedError';
+}
 
 /**
  * Send a JSON-RPC 2.0 error response.
@@ -89,21 +94,62 @@ export function sendCorsPreflight(res: ServerResponse, extraAllowHeaders?: strin
  */
 export async function readRequestBody(
 	req: IncomingMessage,
-	maxBodySize: number
+	maxBodySize: number,
+	signal?: AbortSignal
 ): Promise<string | null> {
-	let body = '';
-	let bodySize = 0;
+	return new Promise((resolve, reject) => {
+		let body = '';
+		let bodySize = 0;
+		let settled = false;
+		const decoder = new StringDecoder('utf8');
 
-	for await (const chunk of req) {
-		const chunkStr = typeof chunk === 'string' ? chunk : (chunk as Buffer).toString();
-		bodySize += chunkStr.length;
+		const cleanup = (): void => {
+			req.off('data', onData);
+			req.off('end', onEnd);
+			req.off('aborted', onAborted);
+			req.off('close', onAborted);
+			req.off('error', onError);
+			signal?.removeEventListener('abort', onAborted);
+		};
+		const onData = (chunk: Buffer | string): void => {
+			if (settled) return;
+			const chunkSize = typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.byteLength;
+			bodySize += chunkSize;
+			if (maxBodySize > 0 && bodySize > maxBodySize) {
+				settled = true;
+				cleanup();
+				req.resume();
+				resolve(null);
+				return;
+			}
+			body += typeof chunk === 'string' ? chunk : decoder.write(chunk);
+		};
+		const onEnd = (): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve(body + decoder.end());
+		};
+		const onAborted = (): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			req.resume();
+			reject(new RequestBodyAbortedError());
+		};
+		const onError = (error: Error): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(error);
+		};
 
-		if (maxBodySize > 0 && bodySize > maxBodySize) {
-			return null;
-		}
-
-		body += chunkStr;
-	}
-
-	return body;
+		req.on('data', onData);
+		req.once('end', onEnd);
+		req.once('aborted', onAborted);
+		req.once('close', onAborted);
+		req.once('error', onError);
+		signal?.addEventListener('abort', onAborted, { once: true });
+		if (signal?.aborted) onAborted();
+	});
 }

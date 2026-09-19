@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { Calibrator } from '../../core/evaluator/Calibrator.js';
 import { ALL_THOUGHT_TYPES } from '../../core/evaluator/internals.js';
 import type { IOutcomeRecorder, VerificationOutcome } from '../../contracts/interfaces.js';
-import type { ThoughtType } from '../../core/reasoning.js';
+import type { ThoughtType } from '../../contracts/reasoning-types.js';
 import { asSessionId, asThoughtId, GLOBAL_SESSION_ID } from '../../contracts/ids.js';
 import type { SessionId, ThoughtId } from '../../contracts/ids.js';
 
