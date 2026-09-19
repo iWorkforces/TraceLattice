@@ -312,7 +312,7 @@ describe('StreamableHttpTransport', () => {
 			expect(res.statusCode).toBe(405);
 			const parsed = JSON.parse(res.body);
 			expect(parsed.error.code).toBe(-32601);
-			expect(res.headers['allow']).toBe('GET, POST');
+			expect(res.headers['allow']).toBe('POST');
 		});
 
 		it('DELETE on /mcp returns 405 method not allowed', async () => {
@@ -499,96 +499,42 @@ describe('StreamableHttpTransport', () => {
 				path: '/mcp',
 			});
 			expect(res.statusCode).toBe(405);
+			expect(res.headers.allow).toBe('POST');
 			const parsed = JSON.parse(res.body);
-			expect(parsed.error.message).toBe('GET not supported in stateless mode');
+			expect(parsed.error.message).toBe('Method not allowed');
 		});
 	});
 
-	// ═══════════════════════════════════════════════════════════════════
-	// SSE notification stream (GET /mcp in stateful mode)
-	// ═══════════════════════════════════════════════════════════════════
-	describe('SSE notification stream (stateful GET /mcp)', () => {
-		it('GET /mcp without session ID returns 400', async () => {
+	describe('GET /mcp is not allowed', () => {
+		it('GET /mcp without session ID returns 405', async () => {
 			await startTransport({ stateful: true });
 			const res = await httpRequest({
 				port,
 				method: 'GET',
 				path: '/mcp',
 			});
-			expect(res.statusCode).toBe(400);
+			expect(res.statusCode).toBe(405);
+			expect(res.headers.allow).toBe('POST');
 			const parsed = JSON.parse(res.body);
-			expect(parsed.error.message).toBe('Missing Mcp-Session-Id header');
+			expect(parsed.error.message).toBe('Method not allowed');
 		});
 
-		it('GET /mcp with nonexistent session ID returns 404', async () => {
+		it('GET /mcp with a session ID returns 405', async () => {
 			await startTransport({ stateful: true });
-			const res = await httpRequest({
-				port,
-				method: 'GET',
-				path: '/mcp',
-				headers: { 'mcp-session-id': 'nonexistent-session' },
-			});
-			expect(res.statusCode).toBe(404);
-			const parsed = JSON.parse(res.body);
-			expect(parsed.error.code).toBe(-32001);
-		});
-
-		it('GET /mcp with valid session ID returns SSE stream', async () => {
-			await startTransport({ stateful: true });
-
-			// First create a session
 			const postRes = await httpRequest({
 				port,
 				headers: { 'content-type': 'application/json' },
 				body: jsonRpcBody(1, 'tools/list'),
 			});
 			const sessionId = postRes.headers['mcp-session-id'] as string;
-
-			// Now open SSE stream with a timeout so it doesn't hang
-			const sseResult = await new Promise<{
-				statusCode: number;
-				headers: Record<string, string | string[] | undefined>;
-				body: string;
-			}>((resolve, reject) => {
-				const req = request(
-					{
-						hostname: '127.0.0.1',
-						port,
-						path: '/mcp',
-						method: 'GET',
-						headers: { 'mcp-session-id': sessionId },
-					},
-					(res) => {
-						let body = '';
-						res.on('data', (chunk) => {
-							body += chunk.toString();
-						});
-						// Close the connection after receiving initial data
-						setTimeout(() => {
-							req.destroy();
-							resolve({
-								statusCode: res.statusCode ?? 0,
-								headers: res.headers,
-								body,
-							});
-						}, 200);
-					}
-				);
-				req.on('error', (err) => {
-					// Ignore abort errors from our destroy
-					if ((err as NodeJS.ErrnoException).code === 'ECONNRESET') {
-						return;
-					}
-					reject(err);
-				});
-				req.end();
+			const res = await httpRequest({
+				port,
+				method: 'GET',
+				path: '/mcp',
+				headers: { 'mcp-session-id': sessionId },
 			});
-
-			expect(sseResult.statusCode).toBe(200);
-			expect(sseResult.headers['content-type']).toBe('text/event-stream');
-			expect(sseResult.headers['cache-control']).toBe('no-cache');
-			expect(sseResult.headers['mcp-session-id']).toBe(sessionId);
-			expect(sseResult.body).toContain('event: connected');
+			expect(res.statusCode).toBe(405);
+			expect(res.headers.allow).toBe('POST');
 		});
 	});
 
@@ -878,17 +824,6 @@ describe('StreamableHttpTransport', () => {
 				body: jsonRpcBody(1, 'tools/list'),
 			});
 			expect(res200.statusCode).toBe(200);
-		});
-	});
-
-	// ═══════════════════════════════════════════════════════════════════
-	// broadcastToSession
-	// ═══════════════════════════════════════════════════════════════════
-	describe('broadcastToSession', () => {
-		it('does nothing for unknown session ID', async () => {
-			await startTransport({ stateful: true });
-			// Should not throw
-			transport.broadcastToSession('nonexistent', 'test-event', { data: 'hello' });
 		});
 	});
 

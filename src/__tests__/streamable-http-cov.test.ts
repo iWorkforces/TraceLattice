@@ -226,162 +226,6 @@ describe('StreamableHttpTransport — coverage gaps', () => {
 			// Should report 1 active session
 			expect(gaugeCalls[gaugeCalls.length - 1]!.args[1]).toBe(1);
 		});
-
-		it('records notification streams gauge on SSE connection', async () => {
-			const metrics = createMockMetrics();
-			await startTransport({ metrics, stateful: true });
-
-			// Create a session first
-			const postRes = await httpRequest({
-				port,
-				headers: { 'content-type': 'application/json' },
-				body: jsonRpcBody(1, 'tools/list'),
-			});
-			const sessionId = postRes.headers['mcp-session-id'] as string;
-
-			// Open SSE stream
-			await new Promise<void>((resolve, reject) => {
-				const req = request(
-					{
-						hostname: '127.0.0.1',
-						port,
-						path: '/mcp',
-						method: 'GET',
-						headers: { 'mcp-session-id': sessionId },
-					},
-					(_res) => {
-						// Close after receiving initial data
-						setTimeout(() => {
-							req.destroy();
-							resolve();
-						}, 150);
-					}
-				);
-				req.on('error', (err) => {
-					if ((err as NodeJS.ErrnoException).code === 'ECONNRESET') return;
-					reject(err);
-				});
-				req.end();
-			});
-
-			const streamGaugeCalls = metrics.calls.filter(
-				(c) => c.method === 'gauge' && c.args[0] === 'streamable_http_notification_streams'
-			);
-			expect(streamGaugeCalls.length).toBeGreaterThanOrEqual(1);
-		});
-	});
-
-	// ═══════════════════════════════════════════════════════════════════
-	// broadcastToSession with active SSE streams
-	// ═══════════════════════════════════════════════════════════════════
-	describe('broadcastToSession with active streams', () => {
-		it('broadcasts event to connected SSE clients', async () => {
-			await startTransport({ stateful: true });
-
-			// Create a session
-			const postRes = await httpRequest({
-				port,
-				headers: { 'content-type': 'application/json' },
-				body: jsonRpcBody(1, 'tools/list'),
-			});
-			const sessionId = postRes.headers['mcp-session-id'] as string;
-
-			// Open SSE stream and capture broadcast
-			const sseData = await new Promise<string>((resolve, reject) => {
-				const req = request(
-					{
-						hostname: '127.0.0.1',
-						port,
-						path: '/mcp',
-						method: 'GET',
-						headers: { 'mcp-session-id': sessionId },
-					},
-					(res) => {
-						let body = '';
-						res.on('data', (chunk) => {
-							body += chunk.toString();
-						});
-
-						// Wait for initial connected event, then broadcast
-						setTimeout(() => {
-							transport.broadcastToSession(sessionId, 'test-broadcast', {
-								hello: 'world',
-							});
-						}, 100);
-
-						// Close after receiving broadcast
-						setTimeout(() => {
-							req.destroy();
-							resolve(body);
-						}, 300);
-					}
-				);
-				req.on('error', (err) => {
-					if ((err as NodeJS.ErrnoException).code === 'ECONNRESET') return;
-					reject(err);
-				});
-				req.end();
-			});
-
-			expect(sseData).toContain('event: connected');
-			expect(sseData).toContain('event: test-broadcast');
-			expect(sseData).toContain('"hello":"world"');
-		});
-	});
-
-	// ═══════════════════════════════════════════════════════════════════
-	// SSE disconnect cleanup
-	// ═══════════════════════════════════════════════════════════════════
-	describe('SSE stream disconnect cleanup', () => {
-		it('removes notification stream when client disconnects', async () => {
-			const metrics = createMockMetrics();
-			await startTransport({ metrics, stateful: true });
-
-			// Create a session
-			const postRes = await httpRequest({
-				port,
-				headers: { 'content-type': 'application/json' },
-				body: jsonRpcBody(1, 'tools/list'),
-			});
-			const sessionId = postRes.headers['mcp-session-id'] as string;
-
-			// Open and close SSE stream
-			await new Promise<void>((resolve, reject) => {
-				const req = request(
-					{
-						hostname: '127.0.0.1',
-						port,
-						path: '/mcp',
-						method: 'GET',
-						headers: { 'mcp-session-id': sessionId },
-					},
-					() => {
-						// Destroy after initial data received
-						setTimeout(() => {
-							req.destroy();
-							resolve();
-						}, 150);
-					}
-				);
-				req.on('error', (err) => {
-					if ((err as NodeJS.ErrnoException).code === 'ECONNRESET') return;
-					reject(err);
-				});
-				req.end();
-			});
-
-			// Wait for close event to propagate
-			await new Promise((r) => setTimeout(r, 100));
-
-			// After disconnect, the notification_streams gauge should be updated to 0
-			const streamGaugeCalls = metrics.calls.filter(
-				(c) => c.method === 'gauge' && c.args[0] === 'streamable_http_notification_streams'
-			);
-			// The last gauge call should show 0 streams after disconnect
-			const lastStreamGauge = streamGaugeCalls[streamGaugeCalls.length - 1];
-			expect(lastStreamGauge).toBeDefined();
-			expect(lastStreamGauge!.args[1]).toBe(0);
-		});
 	});
 
 	// ═══════════════════════════════════════════════════════════════════
@@ -391,37 +235,28 @@ describe('StreamableHttpTransport — coverage gaps', () => {
 		it('stop() resolves even if server.close() is slow (force timeout)', async () => {
 			await startTransport({ stateful: true });
 
-			// Open an SSE stream to keep a connection alive and potentially delay close
-			const postRes = await httpRequest({
-				port,
-				headers: { 'content-type': 'application/json' },
-				body: jsonRpcBody(1, 'tools/list'),
-			});
-			const sessionId = postRes.headers['mcp-session-id'] as string;
-
-			// Open SSE connection (will be kept open)
-			const sseReq = request(
+			const hangingPost = request(
 				{
 					hostname: '127.0.0.1',
 					port,
 					path: '/mcp',
-					method: 'GET',
-					headers: { 'mcp-session-id': sessionId },
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+						'content-length': '1024',
+					},
 				},
 				() => {}
 			);
-			sseReq.on('error', () => {});
-			sseReq.end();
+			hangingPost.on('error', () => {});
+			hangingPost.write('{');
 
-			// Wait a tick for SSE to establish
-			await new Promise((r) => setTimeout(r, 100));
+			await new Promise((r) => setTimeout(r, 50));
 
-			// stop() with a very short timeout — should still resolve
 			const stopPromise = transport.stop(100);
 			await expect(stopPromise).resolves.toBeUndefined();
 
-			// Clean up the SSE request
-			sseReq.destroy();
+			hangingPost.destroy();
 		});
 	});
 
@@ -533,7 +368,7 @@ describe('StreamableHttpTransport — coverage gaps', () => {
 	// _updateSessionMetrics with multiple sessions
 	// ═══════════════════════════════════════════════════════════════════
 	describe('session metrics tracking', () => {
-		it('expires an idle SSE session at the boundary and updates every observable count', async () => {
+		it('expires an idle session at the boundary and updates every observable count', async () => {
 			vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
 			vi.setSystemTime(new Date('2026-09-18T00:00:00.000Z'));
 			const metrics = createMockMetrics();
@@ -551,51 +386,20 @@ describe('StreamableHttpTransport — coverage gaps', () => {
 				body: jsonRpcBody(1, 'tools/list'),
 			});
 			const sessionId = postRes.headers['mcp-session-id'] as string;
-			await vi.advanceTimersByTimeAsync(40);
-
-			let resolveSseEnd: () => void;
-			const sseEnded = new Promise<void>((resolve) => {
-				resolveSseEnd = resolve;
-			});
-			const sseConnected = new Promise<void>((resolve, reject) => {
-				const sseRequest = request(
-					{
-						hostname: '127.0.0.1',
-						port,
-						path: '/mcp',
-						method: 'GET',
-						headers: { 'mcp-session-id': sessionId },
-					},
-					(response) => {
-						response.once('data', () => resolve());
-						response.once('end', () => resolveSseEnd());
-					}
-				);
-				sseRequest.on('error', reject);
-				sseRequest.end();
-			});
 
 			try {
-				await sseConnected;
 				await vi.advanceTimersByTimeAsync(49);
 				expect(transport.clientCount).toBe(1);
 
-				transport.broadcastToSession(sessionId, 'outbound', { ignored: true });
 				await vi.advanceTimersByTimeAsync(1);
 				expect(transport.clientCount).toBe(0);
-				await sseEnded;
 				const health = await httpRequest({ port, method: 'GET', path: '/health' });
 				expect(JSON.parse(health.body).sessions).toBe(0);
 
 				const activeSessionCalls = metrics.calls.filter(
 					(call) => call.method === 'gauge' && call.args[0] === 'streamable_http_active_sessions'
 				);
-				const streamCalls = metrics.calls.filter(
-					(call) =>
-						call.method === 'gauge' && call.args[0] === 'streamable_http_notification_streams'
-				);
 				expect(activeSessionCalls.at(-1)?.args[1]).toBe(0);
-				expect(streamCalls.at(-1)?.args[1]).toBe(0);
 
 				const expired = await httpRequest({
 					port,
@@ -632,55 +436,6 @@ describe('StreamableHttpTransport — coverage gaps', () => {
 			);
 			// The last gauge call should show 3
 			expect(sessionGaugeCalls[sessionGaugeCalls.length - 1]!.args[1]).toBe(3);
-		});
-
-		it('tracks notification streams across multiple sessions', async () => {
-			const metrics = createMockMetrics();
-			await startTransport({ metrics, stateful: true });
-
-			// Create 2 sessions and open SSE on each
-			const sessionIds: string[] = [];
-			for (let i = 0; i < 2; i++) {
-				const postRes = await httpRequest({
-					port,
-					headers: { 'content-type': 'application/json' },
-					body: jsonRpcBody(i + 1, 'tools/list'),
-				});
-				sessionIds.push(postRes.headers['mcp-session-id'] as string);
-			}
-
-			// Open SSE on both sessions
-			const sseRequests: ReturnType<typeof request>[] = [];
-			for (const sid of sessionIds) {
-				const req = request(
-					{
-						hostname: '127.0.0.1',
-						port,
-						path: '/mcp',
-						method: 'GET',
-						headers: { 'mcp-session-id': sid },
-					},
-					() => {}
-				);
-				req.on('error', () => {});
-				req.end();
-				sseRequests.push(req);
-			}
-
-			await new Promise((r) => setTimeout(r, 150));
-
-			const streamGaugeCalls = metrics.calls.filter(
-				(c) => c.method === 'gauge' && c.args[0] === 'streamable_http_notification_streams'
-			);
-			// Should have recorded a gauge showing 2 streams total
-			const lastStreamGauge = streamGaugeCalls[streamGaugeCalls.length - 1];
-			expect(lastStreamGauge).toBeDefined();
-			expect(lastStreamGauge!.args[1]).toBe(2);
-
-			// Clean up
-			for (const req of sseRequests) {
-				req.destroy();
-			}
 		});
 	});
 });
@@ -762,36 +517,28 @@ describe('StreamableHttpTransport — error handling coverage', () => {
 			const mcpServer = createMockMcpServer();
 			await transport.connect(mcpServer);
 
-			// Create a session
-			const postRes = await httpRequest({
-				port,
-				headers: { 'content-type': 'application/json' },
-				body: jsonRpcBody(1, 'tools/list'),
-			});
-			const sessionId = postRes.headers['mcp-session-id'] as string;
-
-			// Open a long-lived SSE connection to keep server.close() from completing
-			const sseReq = request(
+			const hangingPost = request(
 				{
 					hostname: '127.0.0.1',
 					port,
 					path: '/mcp',
-					method: 'GET',
-					headers: { 'mcp-session-id': sessionId },
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+						'content-length': '1024',
+					},
 				},
 				() => {}
 			);
-			sseReq.on('error', () => {});
-			sseReq.end();
+			hangingPost.on('error', () => {});
+			hangingPost.write('{');
 
-			await new Promise((r) => setTimeout(r, 100));
+			await new Promise((r) => setTimeout(r, 50));
 
-			// Stop with a very short timeout to trigger the force-close path
-			// The forceClose setTimeout fires before server.close() callback
 			const stopPromise = transport.stop(50);
 			await expect(stopPromise).resolves.toBeUndefined();
 
-			sseReq.destroy();
+			hangingPost.destroy();
 		});
 	});
 
@@ -832,24 +579,6 @@ describe('StreamableHttpTransport — error handling coverage', () => {
 		});
 	});
 
-	describe('broadcastToSession with unknown session', () => {
-		it('should be a no-op for unknown session ID', async () => {
-			transport = new StreamableHttpTransport({
-				port,
-				host: '127.0.0.1',
-				enableRateLimit: false,
-				stateful: true,
-			});
-			const mcpServer = createMockMcpServer();
-			await transport.connect(mcpServer);
-
-			// Should not throw for non-existent session
-			expect(() => {
-				transport.broadcastToSession('nonexistent-session', 'test', { hello: 'world' });
-			}).not.toThrow();
-		});
-	});
-
 	describe('stateless mode — GET /mcp returns 405', () => {
 		it('should reject GET /mcp in stateless mode', async () => {
 			transport = new StreamableHttpTransport({
@@ -867,8 +596,9 @@ describe('StreamableHttpTransport — error handling coverage', () => {
 				path: '/mcp',
 			});
 			expect(res.statusCode).toBe(405);
+			expect(res.headers.allow).toBe('POST');
 			const parsed = JSON.parse(res.body);
-			expect(parsed.error.message).toContain('stateless');
+			expect(parsed.error.message).toBe('Method not allowed');
 		});
 	});
 
@@ -1071,8 +801,8 @@ describe('StreamableHttpTransport — error handling coverage', () => {
 		});
 	});
 
-	describe('GET /mcp SSE with missing session header', () => {
-		it('should return 400 when GET /mcp has no Mcp-Session-Id', async () => {
+	describe('GET /mcp is not allowed in stateful mode', () => {
+		it('should return 405 for GET /mcp', async () => {
 			transport = new StreamableHttpTransport({
 				port,
 				host: '127.0.0.1',
@@ -1083,32 +813,10 @@ describe('StreamableHttpTransport — error handling coverage', () => {
 			await transport.connect(mcpServer);
 
 			const res = await httpRequest({ port, method: 'GET', path: '/mcp' });
-			expect(res.statusCode).toBe(400);
+			expect(res.statusCode).toBe(405);
+			expect(res.headers.allow).toBe('POST');
 			const parsed = JSON.parse(res.body);
-			expect(parsed.error.message).toContain('Missing Mcp-Session-Id');
-		});
-	});
-
-	describe('GET /mcp SSE with unknown session', () => {
-		it('should return 404 when GET /mcp has unknown Mcp-Session-Id', async () => {
-			transport = new StreamableHttpTransport({
-				port,
-				host: '127.0.0.1',
-				enableRateLimit: false,
-				stateful: true,
-			});
-			const mcpServer = createMockMcpServer();
-			await transport.connect(mcpServer);
-
-			const res = await httpRequest({
-				port,
-				method: 'GET',
-				path: '/mcp',
-				headers: { 'mcp-session-id': 'unknown-session-id' },
-			});
-			expect(res.statusCode).toBe(404);
-			const parsed = JSON.parse(res.body);
-			expect(parsed.error.message).toContain('Session not found');
+			expect(parsed.error.message).toBe('Method not allowed');
 		});
 	});
 });

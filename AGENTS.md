@@ -64,7 +64,7 @@ Import fan-in (src, tests excluded). No LSP / codegraph in this workspace. Sentr
 | `PersistenceBuffer` | class | `src/core/PersistenceBuffer.ts` | 1 | Write queue / barriers (~652L) |
 | `SessionLifecycleCoordinator` | class | `src/core/SessionLifecycleCoordinator.ts` | 4 | Admission + exclusive reset/evict |
 | `createPersistenceBackend` | fn | `src/persistence/PersistenceFactory.ts` | 1 | file / sqlite / memory / null |
-| `StreamableHttpTransport` | class | `src/transport/StreamableHttpTransport.ts` | 0 | Production HTTP MCP path (~990L); not a lib export |
+| `StreamableHttpTransport` | class | `src/transport/StreamableHttpTransport.ts` | 0 | Production HTTP MCP path (~847L); not a lib export |
 
 ## CONVENTIONS
 
@@ -86,7 +86,6 @@ Import fan-in (src, tests excluded). No LSP / codegraph in this workspace. Sentr
 - Forbidden sentrux edges: `transport→core`, `transport→registry`, `watchers→persistence`, `cluster→registry`, `persistence→transport`, `registry→core/HistoryManager.ts`.
 - `BaseTransport` currently imports `SESSION_ID_PATTERN` from `core/ids.ts` — do not add more `transport→core` imports.
 - Max CC 25, max function 100 lines (sentrux). `generateUlid` is not a real ULID — do not rename.
-- Do not resurrect SSE transport identifiers (`SseTransport`, `'sse'`, `SSE_PORT`).
 - Do not “fix” evaluator `type_diversity` divisor `log2(6)` without a scoring-compat decision.
 
 ## UNIQUE STYLES
@@ -104,7 +103,7 @@ Import fan-in (src, tests excluded). No LSP / codegraph in this workspace. Sentr
 - Coverage: branches 90 / functions 60 / lines 65 / statements 65.
 - Layers: types → crosscutting → config → core → domain → infrastructure → di → app → cli. `contracts/` and `utils.ts` are unlayered.
 - `ConnectionPool` is off CLI/DI. `HttpTransport` is a **library export**; CLI never selects it. `cluster/` does not exist (still a sentrux boundary).
-- Large files: `HistoryManager` 990, `StreamableHttpTransport` 990, `ThoughtProcessor` 890, `lib` 873, `errors` 867, `schema` 738, `PersistenceBuffer` 652, `ConnectionPool` 645.
+- Large files: `HistoryManager` 990, `ThoughtProcessor` 890, `lib` 873, `errors` 867, `StreamableHttpTransport` 847, `schema` 738, `PersistenceBuffer` 652, `ConnectionPool` 645.
 - Tests: `src/__tests__/` mirrors source; flags via constructor; `RUN_EVAL=1` for `*.eval.ts`.
 
 ## COMMANDS

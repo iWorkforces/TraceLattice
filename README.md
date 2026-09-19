@@ -202,7 +202,7 @@ Set `TRANSPORT_TYPE` to pick one:
 | `stdio` (default) | Local MCP clients | `tracelattice` |
 | `streamable-http` | Production deployments | `TRANSPORT_TYPE=streamable-http tracelattice` |
 
-The Streamable HTTP endpoint defaults to `POST /mcp` for JSON-RPC requests and supports stateful sessions via the `Mcp-Session-Id` header. In stateful mode, `GET /mcp` may expose `text/event-stream` notifications for that session. The library also exposes `HttpTransport` for stateless JSON-RPC over HTTP, but the CLI does not select it with `TRANSPORT_TYPE`.
+The Streamable HTTP endpoint defaults to `POST /mcp` for JSON-RPC requests and supports stateful sessions via the `Mcp-Session-Id` header. `GET /mcp` is not allowed. The library also exposes `HttpTransport` for stateless JSON-RPC over HTTP, but the CLI does not select it with `TRANSPORT_TYPE`.
 
 ### Stateless HTTP library API
 

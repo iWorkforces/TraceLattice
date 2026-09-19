@@ -12,7 +12,7 @@ MCP HTTP channels. Contract is `ITransport` in `src/contracts/transport.ts`: `ki
 ```
 transport/
 ├── BaseTransport.ts            # host allowlist, CORS, rate limit, health
-├── StreamableHttpTransport.ts  # ~990L production MCP path (not a lib export)
+├── StreamableHttpTransport.ts  # ~847L production MCP path (not a lib export)
 ├── HttpTransport.ts            # stateless JSON-RPC; library export; CLI does not select it
 ├── HttpHelpers.ts              # readRequestBody + shared writers
 └── HttpRequestLifecycle.ts     # PreDispatchTracker + AcceptedWorkTracker + ResponseFinalizer
@@ -22,7 +22,7 @@ transport/
 
 | Class | Endpoints | Mode | CLI |
 |-------|-----------|------|-----|
-| `StreamableHttpTransport` | POST/GET `/mcp` | stateful **default true**; `Mcp-Session-Id`; GET `/mcp` optional SSE | `TRANSPORT_TYPE=streamable-http` |
+| `StreamableHttpTransport` | POST `/mcp` | stateful **default true**; `Mcp-Session-Id`; GET `/mcp` is **405** | `TRANSPORT_TYPE=streamable-http` |
 | `HttpTransport` | POST `/messages` | always stateless | **not** selected |
 
 Shared GET: `/health`, `/ready`, `/metrics`.
